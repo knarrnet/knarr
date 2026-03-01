@@ -1,0 +1,11 @@
+name = "knarr-upnp"
+version = "0.1.0"
+handler = "handler:UPnPPlugin"
+description = "UPnP port mapping — discovers gateway and maps protocol/sidecar ports"
+
+[config]
+protocol_port = 0
+sidecar_port = 0
+discovery_timeout_ms = 2000
+renewal_interval_seconds = 300
+debug = false

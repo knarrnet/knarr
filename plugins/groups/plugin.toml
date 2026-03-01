@@ -1,0 +1,7 @@
+name = "knarr-groups"
+version = "0.22.0"
+handler = "handler:GroupsPlugin"
+
+[config]
+debug = false
+eval_interval = 300

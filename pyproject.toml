@@ -1,0 +1,35 @@
+[project]
+name = "knarr"
+version = "0.33.0"
+description = "Peer-to-peer exchange protocol for autonomous agents"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+
+dependencies = [
+    "pynacl>=1.5.0",
+    "cryptography>=42.0",
+]
+
+[project.scripts]
+knarr = "knarr.cli.main:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+]
+upnp = [
+    "miniupnpc>=2.0",
+]
+
+[tool.setuptools.package-data]
+"knarr.dashboard" = ["*.html", "*.js", "*.css"]
+"knarr.migrations" = ["*.sql"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

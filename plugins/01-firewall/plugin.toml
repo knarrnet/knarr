@@ -1,0 +1,18 @@
+name = "knarr-firewall"
+version = "2.0.0"
+handler = "handler:FirewallPlugin"
+description = "Cooperative backpressure firewall with adaptive rate limiting"
+
+[config]
+role = "leaf"
+pending_queue_size = 6000
+staleness_seconds = 20
+dedup_ttl_seconds = 300
+base_limit = 1500
+window_seconds = 60
+ban_duration_minutes = 5
+announce_pace_ms = 50
+warn_honor_minutes = 30
+block_honor_minutes = 5
+warn_cooldown_seconds = 10
+debug = true

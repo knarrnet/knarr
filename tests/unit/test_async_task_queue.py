@@ -1,0 +1,144 @@
+import asyncio
+import pytest
+import json
+import uuid
+import sys
+import hashlib
+from unittest.mock import patch, MagicMock, AsyncMock
+from knarr.dht.node import DHTNode
+from knarr.core.messages import TaskRequest, TaskStatus, TaskResult
+
+# Mock knarr.mail.tls
+mock_tls = MagicMock()
+mock_tls.resolve_cert_paths = MagicMock(return_value=("cert.pem", "key.pem"))
+sys.modules["knarr.mail.tls"] = mock_tls
+
+@pytest.mark.asyncio
+async def test_async_mode_returns_accepted():
+    node = DHTNode("127.0.0.1", 0)
+    node.register_handler("test", lambda d: {"ok": True})
+    await node.start()
+    await node.announce({"name": "test", "version": "1.0.0", "description": "test", "tags": ["test"], "input_schema": {}, "output_schema": {}})
+    
+    try:
+        req = node._sign(TaskRequest(
+            task_id="t1",
+            skill_name="test",
+            requester_node_id="req",
+            requester_host="127.0.0.1",
+            requester_port=9999,
+            mode="async"
+        ))
+        
+        # Simulate receiving request
+        resp = await node._handle_task_request(req)
+        
+        assert isinstance(resp, TaskStatus)
+        assert resp.status == "accepted"
+        assert resp.task_id is not None
+        assert resp.task_id != "t1" # Should be generated UUID
+        
+        # Verify job in storage
+        job = node.storage.get_async_job(resp.task_id)
+        assert job is not None
+        assert job["status"] == "queued"
+        
+    finally:
+        await node.stop()
+
+@pytest.mark.asyncio
+async def test_dedup_same_request_returns_existing():
+    node = DHTNode("127.0.0.1", 0)
+    node.register_handler("test", lambda d: {"ok": True})
+    await node.start()
+    await node.announce({"name": "test", "version": "1.0.0", "description": "test", "tags": ["test"], "input_schema": {}, "output_schema": {}})
+    
+    try:
+        req1 = node._sign(TaskRequest(
+            task_id="t1",
+            skill_name="test",
+            requester_node_id="req",
+            requester_host="127.0.0.1",
+            requester_port=9999,
+            input_data={"x": 1},
+            mode="async"
+        ))
+        
+        resp1 = await node._handle_task_request(req1)
+        assert resp1.status == "accepted"
+        job_id = resp1.task_id
+        
+        # Second request with same skill + input + requester
+        req2 = node._sign(TaskRequest(
+            task_id="t2",
+            skill_name="test",
+            requester_node_id="req",
+            requester_host="127.0.0.1",
+            requester_port=9999,
+            input_data={"x": 1},
+            mode="async"
+        ))
+        
+        resp2 = await node._handle_task_request(req2)
+        assert isinstance(resp2, TaskStatus)
+        assert resp2.task_id == job_id
+        assert resp2.status in ("queued", "running")  # V013-008: worker may have transitioned to running
+        
+    finally:
+        await node.stop()
+
+@pytest.mark.asyncio
+async def test_async_result_via_mail():
+    # Enable mail in config
+    config = {"mail": {"enabled": True}}
+    node = DHTNode("127.0.0.1", 0, config=config)
+    # We need knarr-mail to be registered
+    # It is registered in DHTNode.start()
+    
+    node.register_handler("test", lambda d: {"ok": True})
+    await node.start()
+    await node.register_system_skills(config)
+    await node.announce({"name": "test", "version": "1.0.0", "description": "test", "tags": ["test"], "input_schema": {}, "output_schema": {}})
+    
+    try:
+        # Mock call_local("knarr-mail", ...) to verify it's called
+        original_call_local = node.call_local
+        node.call_local = AsyncMock(side_effect=original_call_local)
+        
+        req = node._sign(TaskRequest(
+            task_id="t1",
+            skill_name="test",
+            requester_node_id="req",
+            requester_host="127.0.0.1",
+            requester_port=9999,
+            mode="async"
+        ))
+        
+        resp = await node._handle_task_request(req)
+        assert isinstance(resp, TaskStatus)
+        job_id = resp.task_id
+        
+        # Wait for worker to finish task
+        await asyncio.sleep(0.5)
+        
+        # Verify job status in storage
+        job = node.storage.get_async_job(job_id)
+        assert job["status"] == "completed"
+        assert job["result"] == {"ok": True}
+        
+        # Verify mail was enqueued in outbox
+        # to_node is derived from public key
+        to_node = hashlib.sha256(bytes.fromhex(node._public_key_hex)).hexdigest()
+        outbox = node.storage.get_pending_outbox(to_node, limit=10)
+        found_mail = False
+        for item in outbox:
+            body = json.loads(item["body_json"])
+            if body.get("msg_type") == "knarr/system/task_result":
+                if body["body"].get("job_id") == job_id:
+                    found_mail = True
+                    break
+        assert found_mail
+        
+    finally:
+        node.call_local = original_call_local
+        await node.stop()

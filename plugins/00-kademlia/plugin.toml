@@ -1,0 +1,14 @@
+name = "knarr-kademlia"
+version = "0.2.0"
+handler = "handler:KademliaPlugin"
+description = "Kademlia DHT — passive cache + active routing via PluginMessage"
+
+[config]
+mode = "passive"
+k = 20
+alpha = 3
+max_provider_records = 50000
+evict_interval_seconds = 60
+lookup_timeout_seconds = 5.0
+max_find_node_per_minute = 10
+debug = false
