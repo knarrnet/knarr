@@ -20,6 +20,9 @@ class SyncEngine:
         self._notified_stale: set = set()  # F20: dedup stale inbox alerts (capped)
         self._log = logger
         self._debug = node._config.get("mail", {}).get("debug", False)
+        self._receipt_skip_warned = False  # FIX-10: warn once if _write_receipt missing
+        # M-018: Per-peer delivery state tracking
+        self._peer_delivery_state: Dict[str, Dict[str, Any]] = {}  # node_id -> {last_attempt, consecutive_failures, next_retry_after, circuit_open}
 
     def register_handler(self, msg_type: str, handler: Callable):
         """Register a dispatch handler for a system mail msg_type."""
@@ -107,6 +110,34 @@ class SyncEngine:
             )
             if stored:
                 self._fire_mail_received(item, node_id, node_id)
+                # B4: mail_receive_receipt (stored) — self-delivery path
+                if hasattr(self._node, '_write_receipt'):
+                    import hashlib as _hashlib_self
+                    _body_self = item.get("body")
+                    _body_str_self = json.dumps(_body_self, sort_keys=True, separators=(',',':')) if isinstance(_body_self, (dict, list)) else str(_body_self) if _body_self is not None else ""
+                    _ph_self = "sha256:" + _hashlib_self.sha256(_body_str_self.encode("utf-8")).hexdigest()
+                    _pb_self = len(_body_str_self.encode("utf-8"))
+                    self._node._write_receipt(
+                        document_type="mail_receive_receipt",
+                        payload={
+                            "receiver": self._node.node_info.node_id,
+                            "sender": node_id,
+                            "message_id": item_id,
+                            "message_type": msg_type,
+                            "receipt": {
+                                "status": "stored",
+                                "payload_bytes": _pb_self,
+                                "payload_hash": _ph_self,
+                            },
+                        },
+                        counterparty=node_id,
+                        order_ref=item_id,
+                        proof_purpose="acknowledgment",
+                        sign=True,
+                    )
+                elif not self._receipt_skip_warned:
+                    self._log.warning("RECEIPT_SKIP: node missing _write_receipt — mail receipts disabled")
+                    self._receipt_skip_warned = True
                 if is_system:
                     asyncio.create_task(self._dispatch_system_item(item))
             delivered.append(item_id)
@@ -120,14 +151,33 @@ class SyncEngine:
                 self._log.info(f"MAIL_SELF_DELIVER count={len(delivered)}")
 
     async def _push_to_peer_inner(self, peer_node_id: str, peer_host: str, peer_port: int):
-        """Inner push logic — always called under singleflight guard."""
+        """Inner push logic — always called under singleflight guard.
+        
+        M-018: Implements exponential backoff and circuit breaker for dead peers.
+        """
+        # M-018: Check circuit breaker and backoff before attempting delivery
+        now = time.time()
+        state = self._peer_delivery_state.get(peer_node_id)
+        if state and state.get("circuit_open"):
+            if now < state.get("next_retry_after", 0):
+                self._log.warning(f"Circuit open for peer {peer_node_id[:16]}, next retry at {state['next_retry_after']}")
+                return
+            # Circuit cooldown expired, allow one retry attempt
+            state["circuit_open"] = False
+        
+        # M-018: Check backoff timing
+        if state and state.get("next_retry_after") and now < state["next_retry_after"]:
+            return  # Still in backoff period
+        
         # 1. Get pending items (limit 50)
         pending = self._node.storage.get_pending_outbox(peer_node_id, limit=50)
         if not pending:
             return
 
         item_ids = [item["item_id"] for item in pending]
-        
+        batch_start = now
+        consecutive_failures = state.get("consecutive_failures", 0) if state else 0
+
         # 2. Mark as sending
         await self._node._enqueue_write(self._node.storage.mark_outbox_sending, item_ids)
 
@@ -135,7 +185,6 @@ class SyncEngine:
         from nacl.public import SealedBox, PublicKey
         import base64
         items = []
-        # Look up peer encryption key once outside the loop
         peer_key = self._node.storage.get_peer_encryption_key(peer_node_id)
         sealed_box = None
         if peer_key:
@@ -146,21 +195,17 @@ class SyncEngine:
         blocked_ids = []
         for p in pending:
             item = json.loads(p["body_json"])
-
-            # Egress filter: check plaintext body before encryption
             body = item.get("body")
             if body:
                 body_str = json.dumps(body) if isinstance(body, dict) else str(body)
                 if not self._node._egress.check(body_str):
                     self._log.critical(f"EGRESS_FILTER_BLOCK mail item_id={p['item_id'][:8]} to={peer_node_id[:16]}")
-                    # v0.33.0: security.egress_blocked
                     _bus = getattr(self._node, 'bus', None)
                     if _bus:
-                        _bus.emit("security.egress_blocked", msg_type=item.get("msg_type", "mail"), target=peer_node_id)
+                        _bus.emit("security.egress_blocked", msg_type=item.get("msg_type", "mail"), target=peer_node_id, identity=self._node.node_info.node_id)
                     blocked_ids.append(p["item_id"])
-                    continue  # skip this item, don't send it
+                    continue
 
-            # Opportunistic encryption
             if sealed_box is not None:
                 try:
                     body_bytes = json.dumps(item["body"]).encode('utf-8')
@@ -172,36 +217,39 @@ class SyncEngine:
 
             items.append(item)
 
-        # Revert egress-blocked items from 'sending' back to 'pending'
         if blocked_ids:
             await self._node._enqueue_write(self._node.storage.mark_outbox_pending, blocked_ids)
             self._log.warning(f"EGRESS_BLOCK_REVERT count={len(blocked_ids)} to={peer_node_id[:16]}")
 
         if not items:
-            return  # all items were blocked
+            return
 
         msg = self._node._sign(MailSync(
             sender_node_id=self._node.node_info.node_id,
             items=items,
-            batch_seq=pending[-1]["batch_seq"] # Last one in batch
+            batch_seq=pending[-1]["batch_seq"]
         ))
-        
+
         if self._debug:
             self._log.info(f"MAIL_PUSH to={peer_node_id[:16]} items={len(items)} seq={pending[-1]['batch_seq']}")
-        
+
         # 4. Send via pool and process MailAck response
+        delivery_success = False
+        error_string = None
+        delivered_ids = []
+        push_host, push_port = self._node.resolve_peer(peer_node_id, peer_host, peer_port)
+        
         try:
-            push_host, push_port = self._node.resolve_peer(peer_node_id, peer_host, peer_port)
             resp = await self._node._pool.send(peer_node_id, push_host, push_port, msg)
             if resp is None:
-                self._log.warning(f"Failed to send MailSync to {peer_node_id[:16]}, reverting to pending")
+                error_string = "no_response"
                 await self._node._enqueue_write(self._node.storage.mark_outbox_pending, item_ids)
-                # v0.33.0: bus event for null-response delivery failure
                 _bus = getattr(self._node, 'bus', None)
                 if _bus:
-                    _bus.emit("mail.delivery_failed", to_node=peer_node_id, message_id=item_ids[0] if item_ids else "", batch_size=len(item_ids), error="no_response")
+                    _bus.emit("mail.delivery_failed", to_node=peer_node_id, message_id=item_ids[0] if item_ids else "", batch_size=len(item_ids), error="no_response", identity=self._node.node_info.node_id)
             elif isinstance(resp, MailAck) and resp.item_ids:
-                # V17-002: Process ACK inline — transition sending→delivered
+                delivery_success = True
+                delivered_ids = resp.item_ids
                 await self._node._enqueue_write(
                     self._node.storage.mark_outbox_delivered_for_peer,
                     resp.item_ids, peer_node_id
@@ -209,19 +257,90 @@ class SyncEngine:
                 if self._debug:
                     self._log.info(f"MAIL_ACK_RECV from={peer_node_id[:16]} confirmed={len(resp.item_ids)}")
             else:
-                # Unexpected response type — revert to retry next cycle
-                self._log.warning(f"Unexpected response from {peer_node_id[:16]}: {type(resp).__name__}")
+                error_string = f"unexpected_{type(resp).__name__}"
                 await self._node._enqueue_write(self._node.storage.mark_outbox_pending, item_ids)
                 _bus = getattr(self._node, 'bus', None)
                 if _bus:
-                    _bus.emit("mail.delivery_failed", to_node=peer_node_id, message_id=item_ids[0] if item_ids else "", batch_size=len(item_ids), error=f"unexpected_{type(resp).__name__}")
+                    _bus.emit("mail.delivery_failed", to_node=peer_node_id, message_id=item_ids[0] if item_ids else "", batch_size=len(item_ids), error=error_string, identity=self._node.node_info.node_id)
         except Exception as e:
+            error_string = str(e)[:200]
             self._log.error(f"Error during MailSync push to {peer_node_id[:16]}: {e}")
-            # v0.33.0: mail.delivery_failed
             _bus = getattr(self._node, 'bus', None)
             if _bus:
-                _bus.emit("mail.delivery_failed", to_node=peer_node_id, message_id=item_ids[0] if item_ids else "", batch_size=len(item_ids), error=str(e)[:200])
+                _bus.emit("mail.delivery_failed", to_node=peer_node_id, message_id=item_ids[0] if item_ids else "", batch_size=len(item_ids), error=error_string, identity=self._node.node_info.node_id)
             await self._node._enqueue_write(self._node.storage.mark_outbox_pending, item_ids)
+
+        # M-018: Update delivery state and write receipt
+        elapsed_ms = int((time.time() - batch_start) * 1000)
+        attempt = consecutive_failures + 1  # 1-indexed: first attempt = 1
+
+        # Initialize or update state
+        if peer_node_id not in self._peer_delivery_state:
+            self._peer_delivery_state[peer_node_id] = {
+                "last_attempt": now,
+                "consecutive_failures": 0,
+                "next_retry_after": None,
+                "circuit_open": False
+            }
+        state = self._peer_delivery_state[peer_node_id]
+
+        if delivery_success:
+            # Reset on success
+            state["consecutive_failures"] = 0
+            state["next_retry_after"] = None
+            state["circuit_open"] = False
+            state["last_attempt"] = now
+        else:
+            # Increment failures and compute backoff
+            state["consecutive_failures"] = consecutive_failures + 1
+            state["last_attempt"] = now
+            # Exponential backoff: 30s, 60s, 120s, 300s, 600s (cap at 10 min)
+            backoff_schedule = [30, 60, 120, 300, 600]
+            backoff_seconds = backoff_schedule[min(state["consecutive_failures"] - 1, 4)]
+            state["next_retry_after"] = now + backoff_seconds
+
+            # Circuit breaker: open after 5 consecutive failures
+            if state["consecutive_failures"] >= 5:
+                state["circuit_open"] = True
+                self._log.warning(f"Circuit breaker OPEN for peer {peer_node_id[:16]} after {state['consecutive_failures']} failures")
+
+        # B4: mail_delivery_receipt via centralized node._write_receipt()
+        if delivery_success:
+            _delivery_status = "ack"
+        elif state.get("circuit_open"):
+            _delivery_status = "term"
+        else:
+            _delivery_status = "nak"
+        _delivery_payload = {
+            "sender": self._node.node_info.node_id,
+            "recipient": peer_node_id,
+            "batch": {
+                "message_ids": item_ids,
+                "message_count": len(item_ids),
+            },
+            "delivery": {
+                "status": _delivery_status,
+                "attempt": attempt,
+                "endpoint": f"{peer_node_id[:8]}@tcp",
+                "duration_ms": elapsed_ms,
+            },
+        }
+        if delivery_success:
+            _delivery_payload["delivery"]["ack_item_ids"] = delivered_ids
+        else:
+            _delivery_payload["delivery"]["error"] = error_string
+        if hasattr(self._node, '_write_receipt'):
+            self._node._write_receipt(
+                document_type="mail_delivery_receipt",
+                payload=_delivery_payload,
+                counterparty=peer_node_id,
+                order_ref=item_ids[0] if item_ids else None,
+                proof_purpose="acknowledgment",
+                sign=True,
+            )
+        elif not self._receipt_skip_warned:
+            self._log.warning("RECEIPT_SKIP: node missing _write_receipt — mail receipts disabled")
+            self._receipt_skip_warned = True
 
     async def handle_mail_sync(self, msg: MailSync, peer_ip: str):
         """Handle incoming MailSync — store items, dispatch system mail, send MailAck."""
@@ -344,15 +463,65 @@ class SyncEngine:
                 # v0.33.0: mail.received (push path)
                 _bus = getattr(self._node, 'bus', None)
                 if _bus:
-                    _bus.emit("mail.received", from_node=msg.sender_node_id[:16], msg_type=str(msg_type)[:64], session_id=str(item.get("session_id", ""))[:64], bucket="system" if is_system else "inbox")
+                    _bus.emit("mail.received", from_node=msg.sender_node_id[:16], msg_type=str(msg_type)[:64], session_id=str(item.get("session_id", ""))[:64], bucket="system" if is_system else "inbox", identity=msg.sender_node_id)
+                # B4: mail_receive_receipt (stored) — local record that mail arrived
+                if hasattr(self._node, '_write_receipt'):
+                    import hashlib as _hashlib
+                    _body_str = json.dumps(item.get("body"), sort_keys=True, separators=(',',':')) if isinstance(item.get("body"), (dict, list)) else str(item.get("body")) if item.get("body") is not None else ""
+                    _payload_hash = "sha256:" + _hashlib.sha256(_body_str.encode("utf-8")).hexdigest()
+                    _payload_bytes = len(_body_str.encode("utf-8"))
+                    self._node._write_receipt(
+                        document_type="mail_receive_receipt",
+                        payload={
+                            "receiver": self._node.node_info.node_id,
+                            "sender": msg.sender_node_id,
+                            "message_id": item_id,
+                            "message_type": msg_type,
+                            "receipt": {
+                                "status": "stored",
+                                "payload_bytes": _payload_bytes,
+                                "payload_hash": _payload_hash,
+                            },
+                        },
+                        counterparty=msg.sender_node_id,
+                        order_ref=item_id,
+                        proof_purpose="acknowledgment",
+                        sign=True,
+                    )
+                elif not self._receipt_skip_warned:
+                    self._log.warning("RECEIPT_SKIP: node missing _write_receipt — mail receipts disabled")
+                    self._receipt_skip_warned = True
                 if self._debug:
                     self._log.info(f"MAIL_STORE id={item_id[:8]} type={item.get('msg_type','?')} from={msg.sender_node_id[:16]} system={is_system}")
                 if is_system:
                     # Run system dispatch in background task
                     asyncio.create_task(self._dispatch_system_item(item))
             else:
-                # Duplicate item_id
+                # Duplicate item_id — still confirm to sender
                 confirmed_ids.append(item_id)
+                # B4: mail_receive_receipt (duplicate) — dedup record
+                if hasattr(self._node, '_write_receipt'):
+                    self._node._write_receipt(
+                        document_type="mail_receive_receipt",
+                        payload={
+                            "receiver": self._node.node_info.node_id,
+                            "sender": msg.sender_node_id,
+                            "message_id": item_id,
+                            "message_type": item.get("msg_type", ""),
+                            "receipt": {
+                                "status": "duplicate",
+                                "payload_bytes": 0,
+                                "payload_hash": None,
+                            },
+                        },
+                        counterparty=msg.sender_node_id,
+                        order_ref=item_id,
+                        proof_purpose="acknowledgment",
+                        sign=True,
+                    )
+                elif not self._receipt_skip_warned:
+                    self._log.warning("RECEIPT_SKIP: node missing _write_receipt — mail receipts disabled")
+                    self._receipt_skip_warned = True
                 if self._debug:
                     self._log.info(f"MAIL_DEDUP id={item_id[:8]} from={msg.sender_node_id[:16]}")
 
@@ -461,11 +630,11 @@ class SyncEngine:
             if reverted:
                 self._log.warning(f"MAIL_STUCK_RECOVERED count={reverted}")
                 if _bus:
-                    _bus.emit("mail.outbox_stuck", recovered=reverted, failed=0, action="reverted")
+                    _bus.emit("mail.outbox_stuck", recovered=reverted, failed=0, action="reverted", identity=self._node.node_info.node_id)
             if failed:
                 self._log.warning(f"MAIL_STUCK_FAILED count={failed} (exceeded max retries)")
                 if _bus:
-                    _bus.emit("mail.outbox_stuck", recovered=0, failed=failed, action="abandoned")
+                    _bus.emit("mail.outbox_stuck", recovered=0, failed=failed, action="abandoned", identity=self._node.node_info.node_id)
         except Exception:
             pass  # storage method may not exist on older DBs
 
@@ -481,7 +650,7 @@ class SyncEngine:
                     if _mid in self._notified_stale:
                         continue  # already alerted
                     _bus.emit("mail.inbox_stale", from_node=(sm.get("from_node") or "")[:16], message_id=_mid,
-                              age_seconds=int(now - sm.get("timestamp", now)), bucket="inbox")
+                              age_seconds=int(now - sm.get("timestamp", now)), bucket="inbox", identity=self._node.node_info.node_id)
                     self._notified_stale.add(_mid)
                 # Cap dedup set at 1000 to prevent unbounded growth
                 if len(self._notified_stale) > 1000:
@@ -700,7 +869,35 @@ class SyncEngine:
                 # v0.33.0: mail.received (pull path)
                 _bus = getattr(self._node, 'bus', None)
                 if _bus:
-                    _bus.emit("mail.received", from_node=peer_node_id[:16], msg_type=str(msg_type)[:64], session_id=str(item.get("session_id", ""))[:64], bucket="system" if is_system else "inbox")
+                    _bus.emit("mail.received", from_node=peer_node_id[:16], msg_type=str(msg_type)[:64], session_id=str(item.get("session_id", ""))[:64], bucket="system" if is_system else "inbox", identity=peer_node_id)
+                # B4: mail_receive_receipt (stored) — pull path
+                if hasattr(self._node, '_write_receipt'):
+                    import hashlib as _hashlib_pull
+                    _body_pull = item.get("body")
+                    _body_str_pull = json.dumps(_body_pull, sort_keys=True, separators=(',',':')) if isinstance(_body_pull, (dict, list)) else str(_body_pull) if _body_pull is not None else ""
+                    _ph_pull = "sha256:" + _hashlib_pull.sha256(_body_str_pull.encode("utf-8")).hexdigest()
+                    _pb_pull = len(_body_str_pull.encode("utf-8"))
+                    self._node._write_receipt(
+                        document_type="mail_receive_receipt",
+                        payload={
+                            "receiver": self._node.node_info.node_id,
+                            "sender": peer_node_id,
+                            "message_id": item_id,
+                            "message_type": msg_type,
+                            "receipt": {
+                                "status": "stored",
+                                "payload_bytes": _pb_pull,
+                                "payload_hash": _ph_pull,
+                            },
+                        },
+                        counterparty=peer_node_id,
+                        order_ref=item_id,
+                        proof_purpose="acknowledgment",
+                        sign=True,
+                    )
+                elif not self._receipt_skip_warned:
+                    self._log.warning("RECEIPT_SKIP: node missing _write_receipt — mail receipts disabled")
+                    self._receipt_skip_warned = True
                 if is_system:
                     asyncio.create_task(self._dispatch_system_item(item))
 

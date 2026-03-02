@@ -41,32 +41,6 @@ def validate_credit_note(body: dict) -> tuple[bool, str | None]:
     return True, None
 
 
-def validate_signed_credit_note(body: dict) -> tuple[bool, str | None]:
-    """Validate a v0.32.0 signed credit note artifact (from receipts.py).
-
-    This is DIFFERENT from validate_credit_note() which validates unsigned
-    commerce messages. The signed note uses type="credit_note" (not
-    "knarr/commerce/credit_note") and has Ed25519 signature fields.
-    """
-    if body.get("type") != "credit_note":
-        return False, "wrong type (expected 'credit_note')"
-    if body.get("version") != 1:
-        return False, f"unsupported version: {body.get('version')}"
-    for field in ["note_type", "amount", "issuer", "recipient", "reference",
-                   "description", "timestamp", "signature"]:
-        if field not in body:
-            return False, f"missing required field: {field}"
-    if body["note_type"] not in ("debit", "credit", "zero"):
-        return False, f"invalid note_type: {body['note_type']}"
-    if not _is_finite(body["amount"]) or body["amount"] < 0:
-        return False, f"amount must be >= 0 and finite, got {body['amount']}"
-    if not isinstance(body["issuer"], str) or len(body["issuer"]) != 64:
-        return False, f"issuer must be 64-char hex"
-    if not isinstance(body["recipient"], str) or len(body["recipient"]) != 64:
-        return False, f"recipient must be 64-char hex"
-    return True, None
-
-
 def validate_settle_request(body: dict) -> tuple[bool, str | None]:
     """Validate a knarr/commerce/settle_request message body."""
     if body.get("type") != "knarr/commerce/settle_request":
