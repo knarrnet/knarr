@@ -1775,6 +1775,23 @@ class Storage:
         row = cursor.fetchone()
         return row[0] if row else None
 
+    def write_receipt(self, receipt_id: str, document_type: str, timestamp: str,
+                      identity: str, counterparty: str | None, order_ref: str | None,
+                      proof_purpose: str, payload_json: str, signature: str | None) -> None:
+        """Write a receipt to the append-only receipt_log. Silently ignores duplicates."""
+        conn = self._get_conn()
+        now = time.time()
+        conn.execute(
+            """INSERT OR IGNORE INTO receipt_log
+               (receipt_id, document_type, timestamp, identity, counterparty, order_ref,
+                proof_purpose, payload_json, signature, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (receipt_id, document_type, timestamp, identity, counterparty, order_ref,
+             proof_purpose, payload_json, signature, now)
+        )
+        conn.commit()
+        logger.debug(f"RECEIPT_LOG_WRITE receipt_id={receipt_id[:16]} type={document_type}")
+
     def update_receipt_quality(self, task_id: str, quality_rating: int):
         """Store quality_rating from commerce receipt in execution_log."""
         conn = self._get_conn()

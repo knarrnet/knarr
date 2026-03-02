@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 import dataclasses
+from datetime import datetime, timezone
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Set, Callable
@@ -371,6 +372,27 @@ class DHTNode:
             # V013-008: Transition to 'running' before execution
             job_id = msg.input_data.get("_job_id") or msg.task_id
             await self._enqueue_write(self.storage.update_async_job_status, job_id, "running")
+            # B3: task.started event
+            if self.bus:
+                caller_nid = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
+                self.bus.emit("task.started",
+                    skill_name=msg.skill_name, caller_node=caller_nid,
+                    task_id=job_id, identity=caller_nid,
+                    queue_wait_ms=int((time.time() - start_time) * 1000))
+            # B4: order_executing receipt — marks transition from queued to running
+            _caller_nid_oexe = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
+            self._write_receipt(
+                document_type="order_executing",
+                payload={
+                    "provider": self.node_info.node_id,
+                    "caller": _caller_nid_oexe,
+                    "skill_uri": f"knarr:///{msg.skill_name.lower()}",
+                    "queue_wait_ms": int((time.time() - start_time) * 1000),
+                },
+                order_ref=job_id,
+                proof_purpose="assertion",
+                sign=False,
+            )
             async with self._task_semaphore:  # Wait for available slot
                 self._active_workers += 1
                 try:
@@ -501,7 +523,7 @@ class DHTNode:
                     logger.critical(f"EGRESS_BLOCK_RESULT task={msg.task_id[:16]} skill={skill_name}")
                     # v0.33.0: security.egress_blocked
                     if self.bus:
-                        self.bus.emit("security.egress_blocked", skill_name=skill_name, target=caller_node_id)
+                        self.bus.emit("security.egress_blocked", skill_name=skill_name, target=caller_node_id, identity=caller_node_id)
                     result_data = {"error": "SECURITY_VIOLATION", "code": "EGRESS_FILTER_BLOCKED"}
 
             # Use job_id for updates (propagated from Task object)
@@ -518,7 +540,7 @@ class DHTNode:
 
             # v0.33.0: task.completed
             if self.bus:
-                self.bus.emit("task.completed", skill_name=skill_name, caller_node=caller_node_id, task_id=job_id_for_update, wall_ms=wall_ms, price=skill_price)
+                self.bus.emit("task.completed", skill_name=skill_name, caller_node=caller_node_id, task_id=job_id_for_update, wall_ms=wall_ms, price=skill_price, identity=caller_node_id)
 
             # E5: Check _billable flag — skip receipt + ledger if handler says not billable
             billable = True
@@ -542,6 +564,40 @@ class DHTNode:
                 )
                 await self._enqueue_write(self.storage.store_receipt, job_id_for_update, receipt_json)
 
+                # B4: execution_receipt (success) in receipt_log
+                from datetime import datetime, timezone as _tz_exec
+                _completed_at = datetime.now(_tz_exec.utc)
+                _completed_iso = _completed_at.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_completed_at.microsecond // 1000:03d}Z"
+                _started_at = _completed_at - __import__("datetime").timedelta(milliseconds=max(0, min(wall_ms, 86400000)))
+                _started_iso = _started_at.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_started_at.microsecond // 1000:03d}Z"
+                self._write_receipt(
+                    document_type="execution_receipt",
+                    payload={
+                        "provider": self.node_info.node_id,
+                        "caller": caller_node_id,
+                        "skill_uri": f"knarr:///{skill_name}",
+                        "order_ref": job_id_for_update,
+                        "execution": {
+                            "status": "completed",
+                            "started_at": _started_iso,
+                            "completed_at": _completed_iso,
+                            "duration_ms": wall_ms,
+                            "input_hash": f"sha256:{input_hash}" if input_hash else None,
+                            "output_hash": f"sha256:{output_hash}" if output_hash else None,
+                            "error": None,
+                        },
+                        "settlement": {
+                            "credit_note_ref": None,
+                            "amount": float(skill_price),
+                            "currency": "credits",
+                        },
+                    },
+                    counterparty=caller_node_id,
+                    order_ref=job_id_for_update,
+                    proof_purpose="assertion",
+                    sign=True,
+                )
+
                 # v0.32.0: Credit note (new format) — receipt before bus
                 try:
                     from ..commerce.receipts import create_credit_note as _create_credit_note
@@ -560,6 +616,23 @@ class DHTNode:
                         self.storage.store_credit_note,
                         caller_pubkey, job_id_for_update, credit_note_json
                     )
+                    # B4: credit_note receipt in receipt_log
+                    self._write_receipt(
+                        document_type="credit_note",
+                        payload={
+                            "note_type": _note_type,
+                            "amount": float(skill_price),
+                            "currency": "credits",
+                            "issuer": self.node_info.node_id,
+                            "recipient": caller_pubkey,
+                            "reference": job_id_for_update,
+                            "description": f"skill:{skill_name} execution",
+                        },
+                        counterparty=caller_node_id,
+                        order_ref=job_id_for_update,
+                        proof_purpose="assertion",
+                        sign=True,
+                    )
                     # E3: receipt.issued fires AFTER storage
                     self.bus.emit(
                         "receipt.issued",
@@ -567,6 +640,7 @@ class DHTNode:
                         counterparty=caller_node_id,
                         amount=skill_price,
                         reference=job_id_for_update,
+                        identity=caller_node_id,
                     )
                 except Exception as _cn_err:
                     logger.warning(f"CREDIT_NOTE_ISSUE_FAIL job={job_id_for_update[:8]}: {_cn_err}")
@@ -611,6 +685,7 @@ class DHTNode:
                     counterparty=getattr(msg, "public_key", ""),
                     amount=skill_price,
                     reference=job_id_for_update,
+                    identity=getattr(msg, "public_key", ""),
                 )
                 # v0.33.0: credit.restored on threshold crossing
                 if _old_balance is not None and _new_balance is not None:
@@ -640,7 +715,7 @@ class DHTNode:
             )
             # v0.33.0: task.failed
             if self.bus:
-                self.bus.emit("task.failed", skill_name=skill_name, caller_node=caller_node_id, task_id=job_id_for_update, error_type="TIMEOUT")
+                self.bus.emit("task.failed", skill_name=skill_name, caller_node=caller_node_id, task_id=job_id_for_update, error_type="TIMEOUT", identity=caller_node_id)
             is_async = getattr(msg, "mode", "sync") == "async"
             if is_async:
                 await self._enqueue_write(self.storage.update_async_job_status, job_id_for_update, "failed", None, err)
@@ -654,6 +729,35 @@ class DHTNode:
                     )
                 except Exception as mail_err:
                     logger.warning(f"Async error mail enqueue failed for {job_id_for_update}: {mail_err}")
+            # B4: execution_receipt (failed — TimeoutError) in receipt_log
+            from datetime import datetime, timezone as _tz_fail1
+            _fail1_now = datetime.now(_tz_fail1.utc)
+            _fail1_iso = _fail1_now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_fail1_now.microsecond // 1000:03d}Z"
+            _fail1_start = _fail1_now - __import__("datetime").timedelta(milliseconds=max(0, min(wall_ms, 86400000)))
+            _fail1_start_iso = _fail1_start.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_fail1_start.microsecond // 1000:03d}Z"
+            self._write_receipt(
+                document_type="execution_receipt",
+                payload={
+                    "provider": self.node_info.node_id,
+                    "caller": caller_node_id,
+                    "skill_uri": f"knarr:///{skill_name}",
+                    "order_ref": job_id_for_update,
+                    "execution": {
+                        "status": "failed",
+                        "started_at": _fail1_start_iso,
+                        "completed_at": _fail1_iso,
+                        "duration_ms": wall_ms,
+                        "input_hash": f"sha256:{input_hash}" if input_hash else None,
+                        "output_hash": None,
+                        "error": err.get("message", "timeout"),
+                    },
+                    "settlement": {"credit_note_ref": None, "amount": 0.0, "currency": "credits"},
+                },
+                counterparty=caller_node_id,
+                order_ref=job_id_for_update,
+                proof_purpose="assertion",
+                sign=True,
+            )
             result_msg = self._sign(TaskResult(task_id=msg.task_id, status="failed", error=err))
             asyncio.create_task(self._plugins.on_task_complete(
                 skill_name, job_id_for_update, caller_node_id, None, wall_ms))
@@ -669,7 +773,7 @@ class DHTNode:
             )
             # v0.33.0: task.failed
             if self.bus:
-                self.bus.emit("task.failed", skill_name=skill_name, caller_node=caller_node_id, task_id=job_id_for_update, error_type="MCP_TIMEOUT")
+                self.bus.emit("task.failed", skill_name=skill_name, caller_node=caller_node_id, task_id=job_id_for_update, error_type="MCP_TIMEOUT", identity=caller_node_id)
             is_async = getattr(msg, "mode", "sync") == "async"
             if is_async:
                 await self._enqueue_write(self.storage.update_async_job_status, job_id_for_update, "failed", None, err)
@@ -683,6 +787,35 @@ class DHTNode:
                     )
                 except Exception as mail_err:
                     logger.warning(f"Async error mail enqueue failed for {job_id_for_update}: {mail_err}")
+            # B4: execution_receipt (failed — MCPTimeoutError) in receipt_log
+            from datetime import datetime, timezone as _tz_fail2
+            _fail2_now = datetime.now(_tz_fail2.utc)
+            _fail2_iso = _fail2_now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_fail2_now.microsecond // 1000:03d}Z"
+            _fail2_start = _fail2_now - __import__("datetime").timedelta(milliseconds=max(0, min(wall_ms, 86400000)))
+            _fail2_start_iso = _fail2_start.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_fail2_start.microsecond // 1000:03d}Z"
+            self._write_receipt(
+                document_type="execution_receipt",
+                payload={
+                    "provider": self.node_info.node_id,
+                    "caller": caller_node_id,
+                    "skill_uri": f"knarr:///{skill_name}",
+                    "order_ref": job_id_for_update,
+                    "execution": {
+                        "status": "failed",
+                        "started_at": _fail2_start_iso,
+                        "completed_at": _fail2_iso,
+                        "duration_ms": wall_ms,
+                        "input_hash": f"sha256:{input_hash}" if input_hash else None,
+                        "output_hash": None,
+                        "error": err.get("message", "mcp_timeout"),
+                    },
+                    "settlement": {"credit_note_ref": None, "amount": 0.0, "currency": "credits"},
+                },
+                counterparty=caller_node_id,
+                order_ref=job_id_for_update,
+                proof_purpose="assertion",
+                sign=True,
+            )
             result_msg = self._sign(TaskResult(task_id=msg.task_id, status="failed", error=err))
             asyncio.create_task(self._plugins.on_task_complete(
                 skill_name, job_id_for_update, caller_node_id, None, wall_ms))
@@ -702,7 +835,7 @@ class DHTNode:
             )
             # v0.33.0: task.failed
             if self.bus:
-                self.bus.emit("task.failed", skill_name=skill_name, caller_node=caller_node_id, task_id=job_id_for_update, error_type="HANDLER_ERROR")
+                self.bus.emit("task.failed", skill_name=skill_name, caller_node=caller_node_id, task_id=job_id_for_update, error_type="HANDLER_ERROR", identity=caller_node_id)
             is_async = getattr(msg, "mode", "sync") == "async"
             if is_async:
                 await self._enqueue_write(self.storage.update_async_job_status, job_id_for_update, "failed", None, err)
@@ -716,6 +849,35 @@ class DHTNode:
                     )
                 except Exception as mail_err:
                     logger.warning(f"Async error mail enqueue failed for {job_id_for_update}: {mail_err}")
+            # B4: execution_receipt (failed — Exception) in receipt_log
+            from datetime import datetime, timezone as _tz_fail3
+            _fail3_now = datetime.now(_tz_fail3.utc)
+            _fail3_iso = _fail3_now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_fail3_now.microsecond // 1000:03d}Z"
+            _fail3_start = _fail3_now - __import__("datetime").timedelta(milliseconds=max(0, min(wall_ms, 86400000)))
+            _fail3_start_iso = _fail3_start.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_fail3_start.microsecond // 1000:03d}Z"
+            self._write_receipt(
+                document_type="execution_receipt",
+                payload={
+                    "provider": self.node_info.node_id,
+                    "caller": caller_node_id,
+                    "skill_uri": f"knarr:///{skill_name}",
+                    "order_ref": job_id_for_update,
+                    "execution": {
+                        "status": "failed",
+                        "started_at": _fail3_start_iso,
+                        "completed_at": _fail3_iso,
+                        "duration_ms": wall_ms,
+                        "input_hash": f"sha256:{input_hash}" if input_hash else None,
+                        "output_hash": None,
+                        "error": err.get("message", "handler_error"),
+                    },
+                    "settlement": {"credit_note_ref": None, "amount": 0.0, "currency": "credits"},
+                },
+                counterparty=caller_node_id,
+                order_ref=job_id_for_update,
+                proof_purpose="assertion",
+                sign=True,
+            )
             result_msg = self._sign(TaskResult(task_id=msg.task_id, status="failed", error=err))
             asyncio.create_task(self._plugins.on_task_complete(
                 skill_name, job_id_for_update, caller_node_id, None, wall_ms))
@@ -879,6 +1041,89 @@ class DHTNode:
         receipt_dict = {"data": payload_dict, "signature": base64.b64encode(signature).decode('utf-8')}
         return json.dumps(receipt_dict, sort_keys=True, separators=(',', ':'))
 
+    def _write_receipt(
+        self,
+        document_type: str,
+        payload: dict,
+        counterparty: Optional[str] = None,
+        order_ref: Optional[str] = None,
+        proof_purpose: str = "assertion",
+        sign: bool = False,
+    ) -> str:
+        """Write a receipt to the append-only receipt_log.
+
+        Single entry point for all receipt writes. Generates receipt_id,
+        stamps timestamp, enriches payload with W3C Data Integrity fields,
+        signs if requested, delegates to storage.write_receipt().
+
+        Args:
+            document_type:  e.g. "execution_receipt", "mail_delivery_receipt"
+            payload:        Domain fields dict. Mutated in-place with common fields.
+            counterparty:   Other party node_id hex, or None for local records.
+            order_ref:      Task/job ID this receipt tracks, or None.
+            proof_purpose:  "assertion" or "acknowledgment".
+            sign:           True to sign with this node's Ed25519 key.
+
+        Returns:
+            The generated receipt_id string.
+        """
+        import secrets as _secrets
+        from datetime import datetime, timezone as _tz
+
+        _prefix_map = {
+            "execution_receipt": "exec",
+            "credit_note": "cn",
+            "mail_delivery_receipt": "mdr",
+            "mail_receive_receipt": "mrr",
+            "order_ack": "oack",
+            "order_executing": "oexe",
+        }
+        type_prefix = _prefix_map.get(document_type, "rct")
+        receipt_id = f"{type_prefix}_{_secrets.token_hex(8)}"  # L-12: 64-bit entropy (collision at ~4B)
+
+        _now = datetime.now(_tz.utc)
+        timestamp = _now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_now.microsecond // 1000:03d}Z"
+
+        payload = dict(payload)  # FIX-03: don't mutate caller's dict
+        payload["document_type"] = document_type
+        payload["version"] = 1
+        payload["receipt_id"] = receipt_id
+        payload["timestamp"] = timestamp
+        if sign and self._signing_key:
+            payload["cryptosuite"] = "ed25519-jcs"
+        payload["proof_purpose"] = proof_purpose
+
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+        signature: Optional[str] = None
+        if sign and self._signing_key:
+            raw_sig = self._signing_key.sign(payload_json.encode("utf-8")).signature
+            signature = "ed25519:" + raw_sig.hex()
+
+        logger.debug(
+            f"RECEIPT_WRITE type={document_type} id={receipt_id} "
+            f"order={str(order_ref)[:8] if order_ref else 'none'} signed={sign}"
+        )
+
+        try:
+            self.storage.write_receipt(
+                receipt_id=receipt_id,
+                document_type=document_type,
+                timestamp=timestamp,
+                identity=self.node_info.node_id,
+                counterparty=counterparty,
+                order_ref=order_ref,
+                proof_purpose=proof_purpose,
+                payload_json=payload_json,
+                signature=signature,
+            )
+        except Exception as _exc:
+            logger.warning(f"RECEIPT_WRITE_FAIL type={document_type} id={receipt_id}: {_exc}")
+            if self.bus:
+                self.bus.emit("receipt.write_failed", document_type=document_type, receipt_id=receipt_id, error=str(_exc), identity=self.node_info.node_id)
+
+        return receipt_id
+
     def _init_group_engine(self):
         """Initialize GroupEngine from config. Plugin can override later."""
         from ..core.groups import DefaultGroupEngine
@@ -965,7 +1210,7 @@ class DHTNode:
     def _emit_task_rejected(self, skill: str, caller: str, task_id: str, reason: str):
         """v0.33.0: Helper to emit task.rejected from all 6 rejection paths."""
         if self.bus:
-            self.bus.emit("task.rejected", skill_name=skill, caller_node=caller, task_id=task_id, reason=reason)
+            self.bus.emit("task.rejected", skill_name=skill, caller_node=caller, task_id=task_id, reason=reason, identity=caller)
 
     def _check_credit_restored(self, peer_public_key: str, old_balance: float, new_balance: float):
         """v0.33.0: Emit credit.restored when peer moves from over-threshold to under-threshold."""
@@ -979,7 +1224,7 @@ class DHTNode:
         old_util = max(0.0, min(100.0, ((initial_credit - old_balance) / credit_range) * 100.0))
         new_util = max(0.0, min(100.0, ((initial_credit - new_balance) / credit_range) * 100.0))
         if old_util >= threshold and new_util < threshold:
-            self.bus.emit("credit.restored", counterparty=peer_public_key, new_utilization=new_util)
+            self.bus.emit("credit.restored", counterparty=peer_public_key, new_utilization=new_util, identity=peer_public_key)
 
     async def start(self):
         """Starts the server and background tasks."""
@@ -1879,9 +2124,94 @@ class DHTNode:
                             counterparty=resp.public_key,
                             amount=skill_price,
                             reference=task_id,
+                            identity=resp.public_key,
                         )
                     if resp.receipt:
                         await self._enqueue_write(self.storage.store_receipt, task_id, resp.receipt)
+                    
+                    # S-023: Sync path receipt parity — generate receipt and credit note like async path
+                    try:
+                        from ..commerce.receipts import create_credit_note as _create_credit_note
+                        import hashlib as _hl
+                        output_hash = hashlib.sha256(
+                            json.dumps(resp.output_data, sort_keys=True, separators=(',', ':')).encode()
+                        ).hexdigest() if resp.output_data else ""
+                        receipt_json = self._sign_receipt(
+                            task_id=task_id, skill_name=skill_name,
+                            consumer_node_id=self.node_info.node_id, credits_charged=skill_price,
+                            input_hash="", output_hash=output_hash, wall_ms=0,
+                            price_breakdown_json=None
+                        )
+                        await self._enqueue_write(self.storage.store_receipt, task_id, receipt_json)
+                        
+                        credit_note_json = _create_credit_note(
+                            note_type="debit" if skill_price > 0 else "zero",
+                            amount=float(skill_price),
+                            issuer=self._public_key_hex,
+                            recipient=resp.public_key,
+                            reference=task_id,
+                            description=f"skill:{skill_name} execution",
+                            signing_key=self._signing_key,
+                        )
+                        await self._enqueue_write(
+                            self.storage.store_credit_note,
+                            resp.public_key, task_id, credit_note_json
+                        )
+                        # FIX-04: Write to receipt_log via centralized helper (replaces uuid/base64 path)
+                        _note_type_sync = "debit" if skill_price > 0 else "zero"
+                        self._write_receipt(
+                            document_type="execution_receipt",
+                            payload={
+                                "provider": self.node_info.node_id,
+                                "caller": resp.public_key,
+                                "skill_uri": f"knarr:///{skill_name}",
+                                "order_ref": task_id,
+                                "execution": {
+                                    "status": "completed",
+                                    "duration_ms": 0,
+                                    "input_hash": None,
+                                    "output_hash": f"sha256:{output_hash}" if output_hash else None,
+                                    "error": None,
+                                },
+                                "settlement": {
+                                    "credit_note_ref": None,
+                                    "amount": float(skill_price),
+                                    "currency": "credits",
+                                },
+                            },
+                            counterparty=resp.public_key,
+                            order_ref=task_id,
+                            proof_purpose="assertion",
+                            sign=True,
+                        )
+                        self._write_receipt(
+                            document_type="credit_note",
+                            payload={
+                                "note_type": _note_type_sync,
+                                "amount": float(skill_price),
+                                "currency": "credits",
+                                "issuer": self.node_info.node_id,
+                                "recipient": resp.public_key,
+                                "reference": task_id,
+                                "description": f"skill:{skill_name} execution",
+                            },
+                            counterparty=resp.public_key,
+                            order_ref=task_id,
+                            proof_purpose="assertion",
+                            sign=True,
+                        )
+                        # E3: receipt.issued fires AFTER storage (sync path parity)
+                        if self.bus:
+                            self.bus.emit(
+                                "receipt.issued",
+                                note_type=_note_type_sync,
+                                counterparty=resp.public_key,
+                                amount=skill_price,
+                                reference=task_id,
+                                identity=resp.public_key,
+                            )
+                    except Exception as _cn_err:
+                        logger.warning(f"CREDIT_NOTE_ISSUE_FAIL (sync path) job={task_id[:8]}: {_cn_err}")
                 return resp
 
             if isinstance(resp, TaskStatus) and verify_message(resp):
@@ -1920,7 +2250,66 @@ class DHTNode:
                                     counterparty=result.public_key,
                                     amount=skill_price,
                                     reference=task_id,
+                                    identity=result.public_key,
                                 )
+                            
+                            # S-023: Sync queued path receipt parity — generate receipt and credit note
+                            try:
+                                from ..commerce.receipts import create_credit_note as _create_credit_note
+                                output_hash_q = hashlib.sha256(
+                                    json.dumps(result.output_data, sort_keys=True, separators=(',', ':')).encode()
+                                ).hexdigest() if result.output_data else ""
+                                receipt_json_q = self._sign_receipt(
+                                    task_id=task_id, skill_name=skill_name,
+                                    consumer_node_id=self.node_info.node_id, credits_charged=skill_price,
+                                    input_hash="", output_hash=output_hash_q, wall_ms=0,
+                                    price_breakdown_json=None
+                                )
+                                await self._enqueue_write(self.storage.store_receipt, task_id, receipt_json_q)
+                                
+                                credit_note_json_q = _create_credit_note(
+                                    note_type="debit" if skill_price > 0 else "zero",
+                                    amount=float(skill_price),
+                                    issuer=self._public_key_hex,
+                                    recipient=result.public_key,
+                                    reference=task_id,
+                                    description=f"skill:{skill_name} execution",
+                                    signing_key=self._signing_key,
+                                )
+                                await self._enqueue_write(
+                                    self.storage.store_credit_note,
+                                    result.public_key, task_id, credit_note_json_q
+                                )
+                                # Write to receipt_log (B1)
+                                import uuid as _uuid
+                                from datetime import datetime, timezone as _tz
+                                receipt_id_q = f"exec_{_uuid.uuid4().hex[:12]}"
+                                timestamp_q = datetime.now(_tz.utc).isoformat()
+                                import base64 as _b64
+                                canonical_q = json.dumps(json.loads(receipt_json_q), sort_keys=True, separators=(',', ':')).encode('utf-8')
+                                sig_q = _b64.b64encode(self._signing_key.sign(canonical_q).signature).decode('ascii') if hasattr(self, '_signing_key') else None
+                                self.storage.write_receipt(
+                                    receipt_id=receipt_id_q,
+                                    document_type="execution_receipt",
+                                    timestamp=timestamp_q,
+                                    identity=self._public_key_hex,
+                                    counterparty=result.public_key,
+                                    order_ref=task_id,
+                                    proof_purpose="assertion",
+                                    payload_json=receipt_json_q,
+                                    signature=sig_q
+                                )
+                                if self.bus:
+                                    self.bus.emit(
+                                        "receipt.issued",
+                                        note_type="debit" if skill_price > 0 else "zero",
+                                        counterparty=result.public_key,
+                                        amount=skill_price,
+                                        reference=task_id,
+                                        identity=result.public_key,
+                                    )
+                            except Exception as _cn_err_q:
+                                logger.warning(f"CREDIT_NOTE_ISSUE_FAIL (sync queued) job={task_id[:8]}: {_cn_err_q}")
                         else:
                             await self._enqueue_write(
                                 self.storage.update_task_status,
@@ -1954,7 +2343,7 @@ class DHTNode:
         if not await self._plugins.on_connect(peer_ip):
             # v0.33.0: firewall.blocked
             if self.bus:
-                self.bus.emit("firewall.blocked", from_node="unknown", msg_type="connect", reason="on_connect_rejected")
+                self.bus.emit("firewall.blocked", from_node="unknown", msg_type="connect", reason="on_connect_rejected", identity=self.node_info.node_id)
             writer.close()
             await writer.wait_closed()
             return
@@ -1966,6 +2355,31 @@ class DHTNode:
             return
         self._active_connections += 1
         try:
+            # S-027: HTTP-to-TCP port confusion fix — detect HTTP verbs before message parsing.
+            # HTTP GET/POST etc. to protocol port (9030) would be parsed as massive length prefix,
+            # triggering OOM-scale buffer allocation. Check before receive_message() reads 4-byte length.
+            http_verbs = (b'GET ', b'POST', b'PUT ', b'DELE', b'HEAD', b'OPTI', b'PATC')
+            peek_bytes = await asyncio.wait_for(reader.read(4), timeout=2.0)  # L-03: reduced from 5s
+            if peek_bytes and peek_bytes[:4].upper() in http_verbs:
+                logger.warning(f"HTTP_REJECTED: peer_ip={peer_ip} attempted HTTP to protocol port")
+                if self.bus:
+                    self.bus.emit("firewall.blocked", from_node="unknown", msg_type="HTTP", reason="http_to_protocol_port", identity=self.node_info.node_id)
+                writer.close()
+                await writer.wait_closed()
+                return
+            # Prepend peeked bytes back to stream for normal message parsing.
+            # PRIVATE API: asyncio.StreamReader._buffer — verify on Python upgrades (L-01).
+            # Short/empty reads safely fall through — no verb match, message parse will reject (L-02).
+            # Safe: knarr max msg size << 0x47455420; no false-positive overlap with HTTP verbs (L-04).
+            try:
+                reader._buffer[0:0] = peek_bytes
+            except AttributeError:
+                logger.warning("HTTP_PEEK: reader has no _buffer, closing connection")
+                writer.close()
+                await writer.wait_closed()
+                return
+
+            signer_id = ""  # FIX-02: init before loop; set properly after verify_node_id
             # Message loop: handle multiple messages per persistent connection.
             # Connection pooling on the client side keeps connections open for reuse.
             # The loop breaks on: EOF (client closed), timeout (idle), or error.
@@ -1981,7 +2395,7 @@ class DHTNode:
                         logger.warning(f"Dropping message with invalid signature: type={msg.type}")
                         # v0.33.0: security.signature_invalid
                         if self.bus:
-                            self.bus.emit("security.signature_invalid", msg_type=msg.type, from_ip=(peer_ip or "")[:20])
+                            self.bus.emit("security.signature_invalid", msg_type=msg.type, from_ip=(peer_ip or "")[:20], identity=signer_id if signer_id else peer_ip or "unknown")
                         break
 
                     if not verify_node_id(msg):
@@ -1989,7 +2403,7 @@ class DHTNode:
                         # v0.33.0: security.identity_mismatch
                         if self.bus:
                             claimed = getattr(msg, 'node_id', '') or getattr(msg, 'sender_node_id', '') or ''
-                            self.bus.emit("security.identity_mismatch", msg_type=msg.type, from_ip=(peer_ip or "")[:20], claimed_id=claimed[:16])
+                            self.bus.emit("security.identity_mismatch", msg_type=msg.type, from_ip=(peer_ip or "")[:20], claimed_id=claimed[:16], identity=signer_id if signer_id else peer_ip or "unknown")
                         break
 
                     # SA-ML6: Derive sender identity from signer (public_key), not self-asserted fields.
@@ -2012,7 +2426,7 @@ class DHTNode:
                     if not await self._plugins.on_inbound(msg, peer_ip):
                         # v0.33.0: firewall.blocked
                         if self.bus:
-                            self.bus.emit("firewall.blocked", from_node=signer_id or peer_ip, msg_type=msg.type, reason="on_inbound_rejected")
+                            self.bus.emit("firewall.blocked", from_node=signer_id or peer_ip, msg_type=msg.type, reason="on_inbound_rejected", identity=signer_id or peer_ip or "unknown")
                         continue  # Plugin suppressed — skip but keep connection open
 
                     # v0.17.0: Auto-populate address book cached tier (V17-004: after plugin gate)
@@ -2056,6 +2470,12 @@ class DHTNode:
 
     async def _process_message(self, msg: Message, peer_ip: str = "") -> Optional[Message]:
         """Processes a received message and returns a signed response."""
+        # L-06: reject messages with malformed public_key (odd-length hex crashes bytes.fromhex)
+        pk = getattr(msg, "public_key", None)
+        if pk and (len(pk) % 2 != 0 or not all(c in "0123456789abcdefABCDEF" for c in pk)):
+            logger.warning(f"MALFORMED_PUBKEY len={len(pk)} msg_type={type(msg).__name__}")
+            return self._sign(Ack(status="error", error_detail="Malformed public key", msg_id=getattr(msg, "msg_id", "")))
+
         if isinstance(msg, JoinRequest):
             if not self._validate_peer_fields(msg.node_id, msg.host, msg.port):
                 return self._sign(Ack(status="error", error_detail="Invalid peer fields", msg_id=msg.msg_id))
@@ -2065,7 +2485,7 @@ class DHTNode:
                 # v0.33.0: peer.added
                 if self.bus:
                     peer_count = len(self.storage.get_peers())
-                    self.bus.emit("peer.added", node_id=msg.node_id, host=msg.host, port=msg.port, peer_count=peer_count)
+                    self.bus.emit("peer.added", node_id=msg.node_id, host=msg.host, port=msg.port, peer_count=peer_count, identity=self.node_info.node_id)
             peers = self.storage.get_peers()
             peers.append(self.node_info)
             return self._sign(JoinResponse(peers=[asdict(p) for p in peers]))
@@ -2395,7 +2815,7 @@ class DHTNode:
 
         # v0.33.0: credit.warning — soft limit breach
         if self.bus:
-            self.bus.emit("credit.warning", counterparty=peer_public_key, utilization=utilization, threshold=threshold)
+            self.bus.emit("credit.warning", counterparty=peer_public_key, utilization=utilization, threshold=threshold, identity=peer_public_key)
 
         if not self.storage.should_send_tab_reminder(peer_public_key, cooldown=3600):
             return
@@ -2528,7 +2948,7 @@ class DHTNode:
             logger.debug(f"INSUFFICIENT_CREDIT: skill={skill_name} from={msg.public_key[:16]} balance={entry.balance:.1f}")
             # v0.33.0: credit.sanctioned — hard limit block
             if self.bus:
-                self.bus.emit("credit.sanctioned", counterparty=msg.public_key, limit_type="hard")
+                self.bus.emit("credit.sanctioned", counterparty=msg.public_key, limit_type="hard", identity=msg.public_key)
             self._emit_task_rejected(skill_name, msg.public_key, msg.task_id, "INSUFFICIENT_CREDIT")
             return self._sign(TaskResult(
                 task_id=msg.task_id,
@@ -2589,16 +3009,44 @@ class DHTNode:
             msg_with_job = replace(msg, task_id=job_id)
             try:
                 self._task_queue.put_nowait((msg_with_job, handler_fn, slow, input_size, start_time, result_future))
+                # B3: task.queued event
+                if self.bus:
+                    self.bus.emit("task.queued",
+                        skill_name=skill_name, caller_node=caller_node_id,
+                        task_id=job_id, identity=caller_node_id,
+                        queue_position=position)
+                # B4: order_ack receipt — async task accepted into queue
+                self._write_receipt(
+                    document_type="order_ack",
+                    payload={
+                        "provider": self.node_info.node_id,
+                        "caller": caller_node_id,
+                        "skill_uri": f"knarr:///{skill_name}",
+                        "queue": {"position": position, "estimated_wait_ms": None},
+                    },
+                    order_ref=job_id,
+                    proof_purpose="assertion",
+                    sign=False,
+                )
                 return self._sign(TaskStatus(task_id=job_id, status="accepted", position=position))
             except asyncio.QueueFull:
                 logger.debug(f"PROVIDER_BUSY: skill={skill_name} task={job_id[:8]} queue_full")
                 # v0.33.0: node.slots_exhausted + task.rejected
                 if self.bus:
-                    self.bus.emit("node.slots_exhausted", slots_used=self._active_workers, slots_total=self._task_slots)
+                    self.bus.emit("node.slots_exhausted", slots_used=self._active_workers, slots_total=self._task_slots, identity=self.node_info.node_id)
                 self._emit_task_rejected(skill_name, msg.public_key, job_id, "QUEUE_FULL")
                 err = {"code": "PROVIDER_BUSY", "message": "Provider queue full, try another provider"}
                 await self._enqueue_write(self.storage.update_task_status, job_id, "failed", None, err, input_size, 0)
                 await self._enqueue_write(self.storage.update_async_job_status, job_id, "failed", None, err)
+                # L-13: receipt for queue-full rejection
+                self._write_receipt(
+                    document_type="order_ack",
+                    payload={"skill_name": skill_name, "status": "rejected", "reason": "QUEUE_FULL"},
+                    counterparty=caller_node_id,
+                    order_ref=job_id,
+                    proof_purpose="assertion",
+                    sign=True,
+                )
                 return self._sign(TaskResult(task_id=msg.task_id, status="failed", error=err))
 
         # v0.33.0 C-track: configurable default timeout
@@ -2642,18 +3090,40 @@ class DHTNode:
             logger.debug(f"PROVIDER_BUSY: skill={skill_name} task={msg.task_id[:8]} queue_full")
             # v0.33.0: node.slots_exhausted + task.rejected
             if self.bus:
-                self.bus.emit("node.slots_exhausted", slots_used=self._active_workers, slots_total=self._task_slots)
+                self.bus.emit("node.slots_exhausted", slots_used=self._active_workers, slots_total=self._task_slots, identity=self.node_info.node_id)
             self._emit_task_rejected(skill_name, msg.public_key, msg.task_id, "QUEUE_FULL")
             err = {"code": "PROVIDER_BUSY", "message": "Provider queue full, try another provider"}
             await self._enqueue_write(
                 self.storage.update_task_status, msg.task_id, "failed",
                 None, err, input_size, 0
             )
+            # L-13: receipt for queue-full rejection
+            self._write_receipt(
+                document_type="order_ack",
+                payload={"skill_name": skill_name, "status": "rejected", "reason": "QUEUE_FULL"},
+                counterparty=msg.public_key,
+                order_ref=msg.task_id,
+                proof_purpose="assertion",
+                sign=True,
+            )
             return self._sign(TaskResult(task_id=msg.task_id, status="failed", error=err))
 
         # Workers saturated (slow task): return queued status with position
         if self._active_workers >= self._task_slots:
             position = self._task_queue.qsize()
+            # B4: order_ack receipt — sync task queued
+            self._write_receipt(
+                document_type="order_ack",
+                payload={
+                    "provider": self.node_info.node_id,
+                    "caller": caller_node_id,
+                    "skill_uri": f"knarr:///{skill_name}",
+                    "queue": {"position": position, "estimated_wait_ms": None},
+                },
+                order_ref=msg.task_id,
+                proof_purpose="assertion",
+                sign=False,
+            )
             return self._sign(TaskStatus(task_id=msg.task_id, status="queued", position=position))
 
         # Worker available: wait for result (fast) or return accepted (slow)
@@ -2748,7 +3218,7 @@ class DHTNode:
                     logger.critical(f"EGRESS_BLOCK_PROTOCOL type=PluginMessage to={peer.node_id[:16]}")
                     # v0.33.0: security.egress_blocked
                     if self.bus:
-                        self.bus.emit("security.egress_blocked", msg_type="PluginMessage", target=peer.node_id)
+                        self.bus.emit("security.egress_blocked", msg_type="PluginMessage", target=peer.node_id, identity=self.node_info.node_id)
                     return
             h, p = self.resolve_peer(peer.node_id, peer.host, peer.port)
             await self._pool.send(peer.node_id, h, p, msg, timeout=CONNECTION_TIMEOUT)
@@ -2953,14 +3423,14 @@ class DHTNode:
                     logger.warning(f"CREDIT_NOTE_SIG_FAIL job={job_id[:8]}: signature verification failed")
                     # v0.33.0: security.receipt_forgery
                     if self.bus:
-                        self.bus.emit("security.receipt_forgery", job_id=job_id, issuer=cn.get("issuer", "")[:16], reason="signature_invalid")
+                        self.bus.emit("security.receipt_forgery", job_id=job_id, issuer=cn.get("issuer", "")[:16], reason="signature_invalid", identity=provider_pubkey or self._public_key_hex)
                     credits_charged = 0.0
                 elif provider_pubkey and cn.get("issuer") != provider_pubkey:
                     logger.warning(f"CREDIT_NOTE_ISSUER_MISMATCH job={job_id[:8]}: "
                                    f"expected={provider_pubkey[:16]} got={cn.get('issuer', '?')[:16]}")
                     # v0.33.0: security.receipt_forgery
                     if self.bus:
-                        self.bus.emit("security.receipt_forgery", job_id=job_id, issuer=cn.get("issuer", "")[:16], reason="issuer_mismatch")
+                        self.bus.emit("security.receipt_forgery", job_id=job_id, issuer=cn.get("issuer", "")[:16], reason="issuer_mismatch", identity=provider_pubkey or self._public_key_hex)
                     credits_charged = 0.0
                 else:
                     credits_charged = float(cn.get("amount", 0.0))
@@ -2979,6 +3449,7 @@ class DHTNode:
                             counterparty=provider_pubkey,
                             amount=credits_charged,
                             reference=job_id,
+                            identity=provider_pubkey,
                         )
             except Exception as _cn_err:
                 logger.warning(f"CREDIT_NOTE_RECV_FAIL job={job_id[:8]}: {_cn_err}")
@@ -3017,6 +3488,7 @@ class DHTNode:
                             counterparty=provider_pubkey,
                             amount=credits_charged,
                             reference=job_id,
+                            identity=provider_pubkey,
                         )
                     # v0.33.0: credit.restored (consumer-side)
                     _balance_after = self.storage.get_ledger_balance(provider_pubkey)
@@ -3848,14 +4320,14 @@ class DHTNode:
                 logger.warning("No peers — attempting re-bootstrap")
                 # v0.33.0: node.rebootstrap
                 if self.bus:
-                    self.bus.emit("node.rebootstrap", reason="no_peers")
+                    self.bus.emit("node.rebootstrap", reason="no_peers", identity=self.node_info.node_id)
                 try:
                     await self.join(self._bootstrap_peers)
                 except Exception as e:
                     logger.warning(f"Re-bootstrap failed: {e}")
                     # v0.33.0: node.rebootstrap_failed
                     if self.bus:
-                        self.bus.emit("node.rebootstrap_failed", error=str(e))
+                        self.bus.emit("node.rebootstrap_failed", error=str(e), identity=self.node_info.node_id)
             return
 
         for peer in peers:
@@ -3914,7 +4386,7 @@ class DHTNode:
                             )
                             # v0.33.0: node.version_blocked
                             if self.bus:
-                                self.bus.emit("node.version_blocked", required_version=resp.min_protocol_version, current_version=__version__)
+                                self.bus.emit("node.version_blocked", required_version=resp.min_protocol_version, current_version=__version__, identity=self.node_info.node_id)
                     elif self._version_gated and resp.min_protocol_version:
                         self._version_gated = False
                         logger.info(f"Node version {__version__} meets minimum {resp.min_protocol_version} — skills resumed")
@@ -3925,7 +4397,7 @@ class DHTNode:
                             logger.info(f"New knarr version available: {resp.version} (running {__version__})")
                             # v0.33.0: node.upgrade_available
                             if self.bus:
-                                self.bus.emit("node.upgrade_available", current_version=__version__, available_version=resp.version)
+                                self.bus.emit("node.upgrade_available", current_version=__version__, available_version=resp.version, identity=self.node_info.node_id)
 
     async def _event_loop_watchdog(self):
         """Detects event loop blocking by measuring scheduling latency."""
@@ -3937,7 +4409,7 @@ class DHTNode:
                 logger.warning(f"Event loop blocked for {elapsed - 2.0:.1f}s")
                 # v0.33.0: node.event_loop_blocked
                 if self.bus:
-                    self.bus.emit("node.event_loop_blocked", blocked_seconds=round(elapsed - 2.0, 1))
+                    self.bus.emit("node.event_loop_blocked", blocked_seconds=round(elapsed - 2.0, 1), identity=self.node_info.node_id)
 
     async def _stale_task_watchdog(self):
         """Reaps tasks stuck in 'accepted' longer than 2x their timeout."""
@@ -3962,7 +4434,7 @@ class DHTNode:
                             # Retrieve skill_name from task record
                             task_row = conn.execute("SELECT skill_name FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
                             _skill = task_row[0] if task_row else "unknown"
-                            self.bus.emit("task.timeout", skill_name=_skill, task_id=task_id, age_seconds=round(age_seconds, 1))
+                            self.bus.emit("task.timeout", skill_name=_skill, task_id=task_id, age_seconds=round(age_seconds, 1), identity=self.node_info.node_id)
             except Exception as e:
                 logger.debug(f"Stale task watchdog error: {e}")
 
@@ -4075,7 +4547,7 @@ class DHTNode:
                     logger.info(f"PRUNE_PEERS removed={pruned} before={current_count} after={new_count}")
                     # v0.33.0: peer.removed (count-based since prune_stale_peers returns count)
                     if self.bus:
-                        self.bus.emit("peer.removed", node_id="batch", reason="stale", peer_count=new_count)
+                        self.bus.emit("peer.removed", node_id="batch", reason="stale", peer_count=new_count, identity=self.node_info.node_id)
                     if current_count > 0 and pruned / current_count > 0.2:
                         logger.warning(f"PRUNE_CASCADE_RISK dropped {pruned}/{current_count} ({pruned/current_count:.0%}) in one cycle")
 
@@ -4155,12 +4627,12 @@ class DHTNode:
                     logger.warning("UPGRADE installation failed (check_and_upgrade returned False), will retry next cycle")
                     # v0.33.0: node.upgrade_failed
                     if self.bus:
-                        self.bus.emit("node.upgrade_failed", from_version=__version__, to_version=latest, error="check_and_upgrade returned False")
+                        self.bus.emit("node.upgrade_failed", from_version=__version__, to_version=latest, error="check_and_upgrade returned False", identity=self.node_info.node_id)
             except Exception as e:
                 logger.error(f"UPGRADE error: {e}", exc_info=True)
                 # v0.33.0: node.upgrade_failed
                 if self.bus:
-                    self.bus.emit("node.upgrade_failed", from_version=__version__, to_version=getattr(self, '_notified_version', ''), error=str(e))
+                    self.bus.emit("node.upgrade_failed", from_version=__version__, to_version=getattr(self, '_notified_version', ''), error=str(e), identity=self.node_info.node_id)
             finally:
                 if not self._restart_requested:
                     self._upgrading = False
