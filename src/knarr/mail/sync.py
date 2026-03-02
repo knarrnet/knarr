@@ -114,7 +114,10 @@ class SyncEngine:
                 if hasattr(self._node, '_write_receipt'):
                     import hashlib as _hashlib_self
                     _body_self = item.get("body")
-                    _body_str_self = json.dumps(_body_self, sort_keys=True, separators=(',',':')) if isinstance(_body_self, (dict, list)) else str(_body_self) if _body_self is not None else ""
+                    try:
+                        _body_str_self = json.dumps(_body_self, sort_keys=True, separators=(',',':')) if isinstance(_body_self, (dict, list)) else str(_body_self) if _body_self is not None else ""
+                    except (TypeError, ValueError):
+                        _body_str_self = str(_body_self) if _body_self is not None else ""
                     _ph_self = "sha256:" + _hashlib_self.sha256(_body_str_self.encode("utf-8")).hexdigest()
                     _pb_self = len(_body_str_self.encode("utf-8"))
                     self._node._write_receipt(
@@ -467,7 +470,10 @@ class SyncEngine:
                 # B4: mail_receive_receipt (stored) — local record that mail arrived
                 if hasattr(self._node, '_write_receipt'):
                     import hashlib as _hashlib
-                    _body_str = json.dumps(item.get("body"), sort_keys=True, separators=(',',':')) if isinstance(item.get("body"), (dict, list)) else str(item.get("body")) if item.get("body") is not None else ""
+                    try:
+                        _body_str = json.dumps(item.get("body"), sort_keys=True, separators=(',',':')) if isinstance(item.get("body"), (dict, list)) else str(item.get("body")) if item.get("body") is not None else ""
+                    except (TypeError, ValueError):
+                        _body_str = str(item.get("body")) if item.get("body") is not None else ""
                     _payload_hash = "sha256:" + _hashlib.sha256(_body_str.encode("utf-8")).hexdigest()
                     _payload_bytes = len(_body_str.encode("utf-8"))
                     self._node._write_receipt(
@@ -874,7 +880,10 @@ class SyncEngine:
                 if hasattr(self._node, '_write_receipt'):
                     import hashlib as _hashlib_pull
                     _body_pull = item.get("body")
-                    _body_str_pull = json.dumps(_body_pull, sort_keys=True, separators=(',',':')) if isinstance(_body_pull, (dict, list)) else str(_body_pull) if _body_pull is not None else ""
+                    try:
+                        _body_str_pull = json.dumps(_body_pull, sort_keys=True, separators=(',',':')) if isinstance(_body_pull, (dict, list)) else str(_body_pull) if _body_pull is not None else ""
+                    except (TypeError, ValueError):
+                        _body_str_pull = str(_body_pull) if _body_pull is not None else ""
                     _ph_pull = "sha256:" + _hashlib_pull.sha256(_body_str_pull.encode("utf-8")).hexdigest()
                     _pb_pull = len(_body_str_pull.encode("utf-8"))
                     self._node._write_receipt(

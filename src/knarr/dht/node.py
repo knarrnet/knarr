@@ -568,7 +568,7 @@ class DHTNode:
                 from datetime import datetime, timezone as _tz_exec
                 _completed_at = datetime.now(_tz_exec.utc)
                 _completed_iso = _completed_at.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_completed_at.microsecond // 1000:03d}Z"
-                _started_at = _completed_at - __import__("datetime").timedelta(milliseconds=wall_ms)
+                _started_at = _completed_at - __import__("datetime").timedelta(milliseconds=max(0, min(wall_ms, 86400000)))
                 _started_iso = _started_at.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_started_at.microsecond // 1000:03d}Z"
                 self._write_receipt(
                     document_type="execution_receipt",
@@ -733,7 +733,7 @@ class DHTNode:
             from datetime import datetime, timezone as _tz_fail1
             _fail1_now = datetime.now(_tz_fail1.utc)
             _fail1_iso = _fail1_now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_fail1_now.microsecond // 1000:03d}Z"
-            _fail1_start = _fail1_now - __import__("datetime").timedelta(milliseconds=wall_ms)
+            _fail1_start = _fail1_now - __import__("datetime").timedelta(milliseconds=max(0, min(wall_ms, 86400000)))
             _fail1_start_iso = _fail1_start.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_fail1_start.microsecond // 1000:03d}Z"
             self._write_receipt(
                 document_type="execution_receipt",
@@ -791,7 +791,7 @@ class DHTNode:
             from datetime import datetime, timezone as _tz_fail2
             _fail2_now = datetime.now(_tz_fail2.utc)
             _fail2_iso = _fail2_now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_fail2_now.microsecond // 1000:03d}Z"
-            _fail2_start = _fail2_now - __import__("datetime").timedelta(milliseconds=wall_ms)
+            _fail2_start = _fail2_now - __import__("datetime").timedelta(milliseconds=max(0, min(wall_ms, 86400000)))
             _fail2_start_iso = _fail2_start.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_fail2_start.microsecond // 1000:03d}Z"
             self._write_receipt(
                 document_type="execution_receipt",
@@ -853,7 +853,7 @@ class DHTNode:
             from datetime import datetime, timezone as _tz_fail3
             _fail3_now = datetime.now(_tz_fail3.utc)
             _fail3_iso = _fail3_now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_fail3_now.microsecond // 1000:03d}Z"
-            _fail3_start = _fail3_now - __import__("datetime").timedelta(milliseconds=wall_ms)
+            _fail3_start = _fail3_now - __import__("datetime").timedelta(milliseconds=max(0, min(wall_ms, 86400000)))
             _fail3_start_iso = _fail3_start.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_fail3_start.microsecond // 1000:03d}Z"
             self._write_receipt(
                 document_type="execution_receipt",
@@ -1079,7 +1079,7 @@ class DHTNode:
             "order_executing": "oexe",
         }
         type_prefix = _prefix_map.get(document_type, "rct")
-        receipt_id = f"{type_prefix}_{_secrets.token_hex(6)}"
+        receipt_id = f"{type_prefix}_{_secrets.token_hex(8)}"  # L-12: 64-bit entropy (collision at ~4B)
 
         _now = datetime.now(_tz.utc)
         timestamp = _now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_now.microsecond // 1000:03d}Z"
@@ -1119,6 +1119,8 @@ class DHTNode:
             )
         except Exception as _exc:
             logger.warning(f"RECEIPT_WRITE_FAIL type={document_type} id={receipt_id}: {_exc}")
+            if self.bus:
+                self.bus.emit("receipt.write_failed", document_type=document_type, receipt_id=receipt_id, error=str(_exc), identity=self.node_info.node_id)
 
         return receipt_id
 
@@ -2357,7 +2359,7 @@ class DHTNode:
             # HTTP GET/POST etc. to protocol port (9030) would be parsed as massive length prefix,
             # triggering OOM-scale buffer allocation. Check before receive_message() reads 4-byte length.
             http_verbs = (b'GET ', b'POST', b'PUT ', b'DELE', b'HEAD', b'OPTI', b'PATC')
-            peek_bytes = await asyncio.wait_for(reader.read(4), timeout=5.0)
+            peek_bytes = await asyncio.wait_for(reader.read(4), timeout=2.0)  # L-03: reduced from 5s
             if peek_bytes and peek_bytes[:4].upper() in http_verbs:
                 logger.warning(f"HTTP_REJECTED: peer_ip={peer_ip} attempted HTTP to protocol port")
                 if self.bus:
@@ -2365,8 +2367,17 @@ class DHTNode:
                 writer.close()
                 await writer.wait_closed()
                 return
-            # Prepend peeked bytes back to stream for normal message parsing
-            reader._buffer[0:0] = peek_bytes
+            # Prepend peeked bytes back to stream for normal message parsing.
+            # PRIVATE API: asyncio.StreamReader._buffer — verify on Python upgrades (L-01).
+            # Short/empty reads safely fall through — no verb match, message parse will reject (L-02).
+            # Safe: knarr max msg size << 0x47455420; no false-positive overlap with HTTP verbs (L-04).
+            try:
+                reader._buffer[0:0] = peek_bytes
+            except AttributeError:
+                logger.warning("HTTP_PEEK: reader has no _buffer, closing connection")
+                writer.close()
+                await writer.wait_closed()
+                return
 
             signer_id = ""  # FIX-02: init before loop; set properly after verify_node_id
             # Message loop: handle multiple messages per persistent connection.
@@ -2459,6 +2470,12 @@ class DHTNode:
 
     async def _process_message(self, msg: Message, peer_ip: str = "") -> Optional[Message]:
         """Processes a received message and returns a signed response."""
+        # L-06: reject messages with malformed public_key (odd-length hex crashes bytes.fromhex)
+        pk = getattr(msg, "public_key", None)
+        if pk and (len(pk) % 2 != 0 or not all(c in "0123456789abcdefABCDEF" for c in pk)):
+            logger.warning(f"MALFORMED_PUBKEY len={len(pk)} msg_type={type(msg).__name__}")
+            return self._sign(Ack(status="error", error_detail="Malformed public key", msg_id=getattr(msg, "msg_id", "")))
+
         if isinstance(msg, JoinRequest):
             if not self._validate_peer_fields(msg.node_id, msg.host, msg.port):
                 return self._sign(Ack(status="error", error_detail="Invalid peer fields", msg_id=msg.msg_id))
@@ -3021,6 +3038,15 @@ class DHTNode:
                 err = {"code": "PROVIDER_BUSY", "message": "Provider queue full, try another provider"}
                 await self._enqueue_write(self.storage.update_task_status, job_id, "failed", None, err, input_size, 0)
                 await self._enqueue_write(self.storage.update_async_job_status, job_id, "failed", None, err)
+                # L-13: receipt for queue-full rejection
+                self._write_receipt(
+                    document_type="order_ack",
+                    payload={"skill_name": skill_name, "status": "rejected", "reason": "QUEUE_FULL"},
+                    counterparty=caller_node_id,
+                    order_ref=job_id,
+                    proof_purpose="assertion",
+                    sign=True,
+                )
                 return self._sign(TaskResult(task_id=msg.task_id, status="failed", error=err))
 
         # v0.33.0 C-track: configurable default timeout
@@ -3070,6 +3096,15 @@ class DHTNode:
             await self._enqueue_write(
                 self.storage.update_task_status, msg.task_id, "failed",
                 None, err, input_size, 0
+            )
+            # L-13: receipt for queue-full rejection
+            self._write_receipt(
+                document_type="order_ack",
+                payload={"skill_name": skill_name, "status": "rejected", "reason": "QUEUE_FULL"},
+                counterparty=msg.public_key,
+                order_ref=msg.task_id,
+                proof_purpose="assertion",
+                sign=True,
             )
             return self._sign(TaskResult(task_id=msg.task_id, status="failed", error=err))
 
