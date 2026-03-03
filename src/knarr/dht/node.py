@@ -1296,6 +1296,13 @@ class DHTNode:
 
         # v0.22.0: Pass group engine and storage path to plugin contexts
         storage_path_str = self.storage.db_path if hasattr(self.storage, 'db_path') else None  # F-2 fix
+        # v0.35.0: Create commerce bridge callbacks
+        _sign_cb = None
+        _query_cb = None
+        if self._signing_key:
+            from knarr.commerce.plugin_bridge import make_sign_callback, make_query_receipts_callback
+            _sign_cb = make_sign_callback(self._signing_key, self.node_info.node_id)
+            _query_cb = make_query_receipts_callback(self.storage)
         for plugin in self._plugins.plugins:
             ctx = plugin._ctx if hasattr(plugin, '_ctx') else None
             if ctx is not None:
@@ -1304,6 +1311,8 @@ class DHTNode:
                 if hasattr(self, '_sync'):
                     ctx.register_mail_handler = self._sync.register_handler
                     ctx.send_mail = self._sync.enqueue
+                ctx.sign_document = _sign_cb       # v0.35.0
+                ctx.query_receipts = _query_cb     # v0.35.0
                 # If plugin set itself as group_engine, pick it up
                 if ctx.group_engine is not None:
                     self._group_engine = ctx.group_engine

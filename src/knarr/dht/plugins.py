@@ -104,6 +104,8 @@ class PluginContext:
     subscribe_events: Optional[Callable] = None   # v0.32.0: (*patterns) -> Subscriber
     emit_event: Optional[Callable] = None         # v0.32.0: (event_type, **fields) -> None
     bus: Optional[Any] = None                     # v0.33.0: EventBus reference
+    sign_document: Optional[Callable] = None      # v0.35.0: sign dict per eddsa-jcs-2022
+    query_receipts: Optional[Callable] = None     # v0.35.0: query receipt_log with filters
 
 
 class PluginLoader:
