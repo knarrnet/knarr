@@ -167,6 +167,23 @@ class PluginLoader:
                 path_entry = str(plugin_path)
                 sys.path.insert(0, path_entry)
 
+                # V035-001: Pre-load sibling .py files with namespaced keys in
+                # sys.modules so that `from X import Y` inside handler code
+                # resolves to THIS plugin's copy, not a previously-loaded one.
+                _sibling_names = {f.stem for f in plugin_path.glob("*.py")}
+                _stashed_mods = {}
+                for _sn in _sibling_names:
+                    if _sn in sys.modules:
+                        _stashed_mods[_sn] = sys.modules.pop(_sn)
+                    # Pre-load this plugin's sibling module into sys.modules
+                    _sib_file = plugin_path / f"{_sn}.py"
+                    if _sib_file.is_file():
+                        _sib_spec = importlib.util.spec_from_file_location(_sn, str(_sib_file))
+                        if _sib_spec and _sib_spec.loader:
+                            _sib_mod = importlib.util.module_from_spec(_sib_spec)
+                            _sib_spec.loader.exec_module(_sib_mod)
+                            sys.modules[_sn] = _sib_mod
+
                 try:
                     spec = importlib.util.spec_from_file_location(module_name, handler_file)
                     if spec is None:
@@ -207,6 +224,10 @@ class PluginLoader:
                 except (ImportError, AttributeError, TypeError) as e:
                     log.warning(f"Failed to load handler for {plugin_path.name}: {e}")
                 finally:
+                    # V035-001: Remove bare-named modules loaded during this plugin
+                    for _n in _sibling_names:
+                        sys.modules.pop(_n, None)
+                    sys.modules.update(_stashed_mods)
                     # V015-009: Remove by value, not position
                     try:
                         sys.path.remove(path_entry)
