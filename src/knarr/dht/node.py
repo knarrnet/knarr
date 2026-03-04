@@ -101,6 +101,13 @@ class DHTNode:
         node_id = self._load_or_generate_node_id()
         self._init_encryption()
 
+        # v0.36.0 B6: Cockpit sub-identity keypair (SEPARATE from bearer token)
+        # DID fragment: did:knarr:{node_id}#cockpit-1
+        # Rotating the bearer token does NOT invalidate the cockpit signing identity.
+        self._cockpit_signing_key: Optional[SigningKey] = None
+        self._cockpit_verify_key = None
+        self._init_cockpit_keypair()
+
         # Migrate TOML pricing discounts to SQL (one-time, v0.28.0)
         toml_discounts = self._config.get("pricing", {}).get("discounts", {})
         if toml_discounts:
@@ -146,6 +153,9 @@ class DHTNode:
         self._task_queue: asyncio.Queue = asyncio.Queue(maxsize=_max_queue)
         self._task_semaphore = asyncio.Semaphore(self._task_slots)
         self._active_workers = 0
+
+        # v0.36.0 A2: Per-skill active count for max_concurrent enforcement
+        self._skill_active: Dict[str, int] = {}   # skill_name -> active count
 
         self._handlers: Dict[str, tuple[Callable, bool]] = {} # skill_name -> (handler_fn, slow)
         self._handler_specs: Dict[str, str] = {}   # skill_name -> handler spec string
@@ -393,12 +403,16 @@ class DHTNode:
                 proof_purpose="assertion",
                 sign=False,
             )
+            # v0.36.0 A2: Track per-skill active count
+            _sn_worker = msg.skill_name.lower()
             async with self._task_semaphore:  # Wait for available slot
+                self._skill_active[_sn_worker] = self._skill_active.get(_sn_worker, 0) + 1
                 self._active_workers += 1
                 try:
                     await self._execute_queued_task(msg, handler_fn, slow, input_size, start_time, result_future)
                 finally:
                     self._active_workers -= 1
+                    self._skill_active[_sn_worker] = max(0, self._skill_active.get(_sn_worker, 1) - 1)
 
     async def _execute_queued_task(self, msg: TaskRequest, handler_fn: Callable,
                                     slow: bool, input_size: int, start_time: float,
@@ -996,6 +1010,51 @@ class DHTNode:
         if getattr(self, "_enc_debug", False):
             logger.info(f"[ENC_INIT] Derived X25519 public key: {self._encryption_key_hex[:16]}...")
 
+    def _init_cockpit_keypair(self) -> None:
+        """Initialize or load the cockpit sub-identity keypair (B6).
+
+        The cockpit keypair is SEPARATE from the bearer token:
+        - Bearer token: authenticates HTTP sessions
+        - Cockpit keypair: signs settlement documents
+
+        DID fragment: did:knarr:{node_id}#cockpit-1
+        File: {config_dir}/cockpit_ed25519.key
+
+        Generates a new keypair if the file doesn't exist.
+        Degenerates gracefully (headless node) if config_dir is unavailable.
+        """
+        try:
+            config_dir_str = self._config.get("_config_dir", "")
+            if not config_dir_str:
+                logger.debug("COCKPIT_KEY_SKIP: no config_dir, cockpit keypair not initialized")
+                return
+
+            from pathlib import Path as _Path
+            config_dir = _Path(config_dir_str)
+            cockpit_key_path = config_dir / "cockpit_ed25519.key"
+
+            if cockpit_key_path.exists():
+                key_bytes = cockpit_key_path.read_bytes()
+                if len(key_bytes) == 32:
+                    self._cockpit_signing_key = SigningKey(key_bytes)
+                    logger.debug("COCKPIT_KEY_LOADED")
+                else:
+                    logger.warning(f"COCKPIT_KEY_INVALID: unexpected size {len(key_bytes)}")
+                    return
+            else:
+                self._cockpit_signing_key = SigningKey.generate()
+                cockpit_key_path.write_bytes(bytes(self._cockpit_signing_key))
+                logger.info(f"COCKPIT_KEY_GENERATED: {cockpit_key_path}")
+
+            self._cockpit_verify_key = self._cockpit_signing_key.verify_key
+            logger.debug(
+                f"COCKPIT_KEY_READY did:knarr:{self.node_info.node_id if hasattr(self, 'node_info') else '?'}#cockpit-1"
+            )
+        except Exception as exc:
+            logger.warning(f"COCKPIT_KEY_INIT_FAIL: {exc} — settlement will use node key only")
+            self._cockpit_signing_key = None
+            self._cockpit_verify_key = None
+
     def encrypt_for_peer(self, data: bytes, node_id: str) -> bytes:
         """Encrypts data for a peer using X25519 SealedBox."""
         if not self._signing_key:
@@ -1313,6 +1372,11 @@ class DHTNode:
                     ctx.send_mail = self._sync.enqueue
                 ctx.sign_document = _sign_cb       # v0.35.0
                 ctx.query_receipts = _query_cb     # v0.35.0
+                # v0.36.0: Prepaid balance query callback
+                ctx.query_prepaid_balance = (
+                    lambda peer_key: self.storage.get_ledger_balance(peer_key)
+                    if hasattr(self.storage, 'get_ledger_balance') else None
+                )
                 # If plugin set itself as group_engine, pick it up
                 if ctx.group_engine is not None:
                     self._group_engine = ctx.group_engine
@@ -1904,6 +1968,115 @@ class DHTNode:
         """Registers a handler for a skill."""
         self._handlers[skill_name.lower()] = (handler_fn, slow)
         logger.info(f"Registered {'slow' if slow else 'fast'} handler for skill '{skill_name}'")
+
+    def _get_skill_max_concurrent(self, skill_name: str) -> int:
+        """Return max_concurrent for a skill. Default: 1 (backward compatible).
+
+        Config:
+            [skills.my-skill]
+            max_concurrent = 4
+        """
+        skills_cfg = self._config.get("skills", {})
+        skill_cfg = skills_cfg.get(skill_name, {})
+        if isinstance(skill_cfg, dict):
+            val = skill_cfg.get("max_concurrent", 1)
+            try:
+                return max(1, int(val))
+            except (TypeError, ValueError):
+                return 1
+        return 1
+
+    async def _execute_fast_path(
+        self,
+        msg: "TaskRequest",
+        handler_fn: Callable,
+        slow: bool,
+        input_size: int,
+        start_time: float,
+        job_id: str,
+        caller_node_id: str,
+        skill_name: str,
+        result_future: "asyncio.Future",
+    ) -> "Message":
+        """Execute a local (same-node) task directly, bypassing the async queue.
+
+        v0.36.0 A1: Local skill fast path. Produces IDENTICAL receipts to the
+        async path — every write that _execute_queued_task would make is made here.
+        Admission gate already passed. Per-skill counter already incremented by caller.
+
+        Args:
+            msg:            The original TaskRequest.
+            handler_fn:     The skill handler callable.
+            slow:           Whether the skill is slow (returns accepted immediately).
+            input_size:     Byte size of input_data (pre-computed).
+            start_time:     Monotonic start timestamp.
+            job_id:         The job/task ID.
+            caller_node_id: SHA-256(public_key) of caller.
+            skill_name:     Lowercase skill name.
+            result_future:  Future to resolve on completion.
+
+        Returns:
+            TaskResult or TaskStatus message, signed.
+        """
+        # Emit order_executing receipt — same as async path
+        await self._enqueue_write(self.storage.update_async_job_status, job_id, "running")
+
+        if self.bus:
+            self.bus.emit(
+                "task.started",
+                skill_name=skill_name,
+                caller_node=caller_node_id,
+                task_id=job_id,
+                identity=caller_node_id,
+                queue_wait_ms=0,  # no queue wait on fast path
+            )
+
+        self._write_receipt(
+            document_type="order_executing",
+            payload={
+                "provider": self.node_info.node_id,
+                "caller": caller_node_id,
+                "skill_uri": f"knarr:///{skill_name}",
+                "queue_wait_ms": 0,
+                "fast_path": True,
+            },
+            order_ref=job_id,
+            proof_purpose="assertion",
+            sign=False,
+        )
+
+        # Delegate to the same execution logic as the async path
+        # We reuse _execute_queued_task to guarantee identical behavior
+        await self._execute_queued_task(
+            msg=msg,
+            handler_fn=handler_fn,
+            slow=slow,
+            input_size=input_size,
+            start_time=start_time,
+            result_future=result_future,
+        )
+
+        # For fast path sync skills: wait for result_future (same as the normal path)
+        if not slow:
+            try:
+                _default_timeout_s = float(self._config.get("skills", {}).get("default_timeout", 30))
+                max_timeout = self._config.get("node", {}).get("max_task_timeout", 3600)
+                _req_timeout_s = msg.timeout_ms / 1000.0 if msg.timeout_ms else _default_timeout_s
+                handler_timeout = min(_req_timeout_s, max_timeout) if max_timeout > 0 else _req_timeout_s
+
+                if not result_future.done():
+                    result_msg = await asyncio.wait_for(asyncio.shield(result_future), timeout=handler_timeout)
+                else:
+                    result_msg = result_future.result()
+                return result_msg
+            except asyncio.TimeoutError:
+                err = {"code": "TIMEOUT", "message": "Task timed out (fast path)"}
+                return self._sign(TaskResult(task_id=msg.task_id, status="failed", error=err))
+            except Exception:
+                err = {"code": "HANDLER_ERROR", "message": "Fast path execution failed"}
+                return self._sign(TaskResult(task_id=msg.task_id, status="failed", error=err))
+        else:
+            return self._sign(TaskStatus(task_id=msg.task_id, status="accepted"))
 
     async def register_system_skills(self, config: dict):
         """Register all system skills based on config.
@@ -2988,6 +3161,35 @@ class DHTNode:
         if is_async:
             job_id = str(uuid.uuid4())
 
+        # v0.36.0 A2: Per-skill max_concurrent check
+        # Must happen BEFORE global queue check (different reason code: SKILL_BUSY vs QUEUE_FULL)
+        _skill_max_concurrent = self._get_skill_max_concurrent(skill_name)
+        _skill_current = self._skill_active.get(skill_name, 0)
+        if _skill_current >= _skill_max_concurrent:
+            logger.debug(
+                f"SKILL_BUSY: skill={skill_name} active={_skill_current} "
+                f"max={_skill_max_concurrent} task={job_id[:8]}"
+            )
+            if self.bus:
+                self.bus.emit(
+                    "task.rejected",
+                    skill_name=skill_name,
+                    caller_node=caller_node_id,
+                    task_id=job_id,
+                    reason="SKILL_BUSY",
+                    identity=caller_node_id,
+                )
+            err = {
+                "code": "TASK_REJECTED",
+                "message": f"Skill '{skill_name}' at max concurrency ({_skill_max_concurrent})",
+                "reason": "SKILL_BUSY",
+            }
+            await self._enqueue_write(
+                self.storage.update_task_status if hasattr(self.storage, 'update_task_status') else (lambda *a: None),
+                job_id, "failed", None, err, 0, 0
+            )
+            return self._sign(TaskResult(task_id=msg.task_id, status="failed", error=err))
+
         task = Task(
             task_id=job_id,
             skill_name=skill_name,
@@ -3069,6 +3271,32 @@ class DHTNode:
 
         input_size = len(json.dumps(msg.input_data)) if msg.input_data else 0
         start_time = time.time()
+
+        # v0.36.0 A1: Local skill fast path — skip async queue for same-node calls.
+        # Admission gate, max_concurrent, receipts, and bus events still fire.
+        # The fast path MUST produce identical receipts to the async path (P-003).
+        if caller_node_id == self.node_info.node_id:
+            logger.debug(
+                f"FAST_PATH: skill={skill_name} task={msg.task_id[:8]} "
+                f"caller==self, skipping queue"
+            )
+            # Increment per-skill active counter (A2)
+            self._skill_active[skill_name] = self._skill_active.get(skill_name, 0) + 1
+            try:
+                result_msg = await self._execute_fast_path(
+                    msg=msg,
+                    handler_fn=handler_fn,
+                    slow=slow,
+                    input_size=input_size,
+                    start_time=start_time,
+                    job_id=job_id,
+                    caller_node_id=caller_node_id,
+                    skill_name=skill_name,
+                    result_future=result_future,
+                )
+                return result_msg
+            finally:
+                self._skill_active[skill_name] = max(0, self._skill_active.get(skill_name, 1) - 1)
 
         # Admission control: check worker saturation before queue depth
         # 1. Workers saturated + fast task → RETRY_AFTER (don't enqueue, consumer retries)

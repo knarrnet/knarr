@@ -82,6 +82,33 @@ class PluginHooks:
         """
         pass
 
+    # v0.36.0: Settlement hooks
+    async def on_settlement_review(self, prepared_tx: dict) -> Optional[dict]:
+        """Called when node has prepared a settlement for authority review.
+
+        prepared_tx is a signed Document (settlement_prepared, signed by #key-1).
+
+        Return countersigned Document to approve (call ctx.sign_document on it).
+        Return None to reject (settlement skipped this cycle).
+
+        Default: auto-approve (hotwire) — returns prepared_tx unchanged.
+        This means unsigned settlements in the degenerate case.
+        """
+        return prepared_tx
+
+    async def on_inbound_settlement(self, settle_request: dict) -> bool:
+        """Called when counterparty's settle_request arrives and passes validation.
+
+        settle_request contains: dual-signed settlement proposal, positions, amount.
+        Node has already validated both signatures and run sanity check.
+
+        Return True to accept (zero ledger, send confirmation).
+        Return False to reject (send rejection with reason).
+
+        Default: accept.
+        """
+        return True
+
 
 @dataclasses.dataclass
 class PluginContext:
@@ -106,6 +133,7 @@ class PluginContext:
     bus: Optional[Any] = None                     # v0.33.0: EventBus reference
     sign_document: Optional[Callable] = None      # v0.35.0: sign dict per eddsa-jcs-2022
     query_receipts: Optional[Callable] = None     # v0.35.0: query receipt_log with filters
+    query_prepaid_balance: Optional[Callable] = None  # v0.36.0: (peer_key) -> float
 
 
 class PluginLoader:
@@ -308,6 +336,30 @@ class PluginLoader:
             self._safe_run_plugin_hook(plugin.on_shutdown)
             for plugin in self.plugins
         ])
+
+    # v0.36.0: Settlement hook delegation
+    async def on_settlement_review(self, prepared_tx: dict) -> Optional[dict]:
+        """First plugin that returns non-None wins. If all return None, settlement rejected."""
+        for plugin in self.plugins:
+            try:
+                result = await plugin.on_settlement_review(prepared_tx)
+                if result is not None:
+                    return result
+            except Exception as e:
+                log.error(f"Plugin {plugin.__class__.__name__} failed in on_settlement_review: {e}")
+                return None  # fail-closed
+        return prepared_tx  # no plugin modified → auto-approve (hotwire)
+
+    async def on_inbound_settlement(self, settle_request: dict) -> bool:
+        """All plugins must agree. Any False → reject."""
+        for plugin in self.plugins:
+            try:
+                if not await plugin.on_inbound_settlement(settle_request):
+                    return False
+            except Exception as e:
+                log.error(f"Plugin {plugin.__class__.__name__} failed in on_inbound_settlement: {e}")
+                return False  # fail-closed
+        return True
 
     async def _safe_run_plugin_hook(self, hook_method: Callable, *args, **kwargs):
         """Helper to run plugin hooks, catching exceptions to prevent crashing the node."""
