@@ -252,11 +252,16 @@ class Storage:
                 input_hash TEXT,
                 asset_hash TEXT,
                 error TEXT,
-                created_at REAL
+                created_at REAL,
+                quality_rating INTEGER
             )
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_execlog_job ON execution_log(job_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_execlog_skill ON execution_log(skill_name)")
+        # #16: Ensure quality_rating column exists on DBs created before it was added
+        execlog_cols = {row[1] for row in cursor.execute("PRAGMA table_info(execution_log)").fetchall()}
+        if "quality_rating" not in execlog_cols:
+            cursor.execute("ALTER TABLE execution_log ADD COLUMN quality_rating INTEGER")
 
         # Async jobs (v0.13.0)
         cursor.execute("""
@@ -1928,7 +1933,8 @@ class Storage:
         """Check if there's already a pending settlement for this peer."""
         conn = self._get_conn()
         # B1/S-025: escape LIKE metacharacters to prevent injection
-        escaped_key = self._escape_like(peer_public_key[:32])
+        # v0.36.0: use full key — truncation to 32 chars risks prefix collisions
+        escaped_key = self._escape_like(peer_public_key)
         row = conn.execute(
             "SELECT 1 FROM settlement_queue WHERE status = 'pending' AND body LIKE ? ESCAPE '\\'",
             (f'%{escaped_key}%',)
@@ -2016,3 +2022,82 @@ class Storage:
 
     def close(self):
         self._keepalive_conn.close()
+
+
+class StorageStub:
+    """Minimal stub for unit tests. In-memory SQLite with receipt_log only.
+
+    Tests that need full Storage should use Storage(":memory:") instead.
+    This stub exists for receipt-focused tests that don't need the full schema.
+    """
+
+    _RECEIPT_LOG_DDL = """
+        CREATE TABLE IF NOT EXISTS receipt_log (
+            receipt_id      TEXT PRIMARY KEY,
+            document_type   TEXT NOT NULL,
+            timestamp       TEXT NOT NULL,
+            identity        TEXT NOT NULL,
+            counterparty    TEXT,
+            order_ref       TEXT,
+            proof_purpose   TEXT NOT NULL,
+            payload_json    TEXT NOT NULL,
+            signature       TEXT,
+            created_at      REAL NOT NULL
+        )
+    """
+
+    def __init__(self, db_path: str = ":memory:"):
+        self.db_path = db_path
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(self._RECEIPT_LOG_DDL)
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_log_type ON receipt_log(document_type)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_log_identity ON receipt_log(identity)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_log_ts ON receipt_log(timestamp)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_log_order ON receipt_log(order_ref)")
+        self._conn.commit()
+
+    def write_receipt(self, receipt_id, document_type, timestamp, identity,
+                      counterparty, order_ref, proof_purpose, payload_json, signature):
+        """INSERT OR IGNORE into receipt_log. Idempotent."""
+        self._conn.execute(
+            """INSERT OR IGNORE INTO receipt_log
+               (receipt_id, document_type, timestamp, identity, counterparty,
+                order_ref, proof_purpose, payload_json, signature, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (receipt_id, document_type, timestamp, identity, counterparty,
+             order_ref, proof_purpose, payload_json, signature, time.time()),
+        )
+        self._conn.commit()
+
+    def get_receipt(self, receipt_id):
+        cursor = self._conn.execute(
+            "SELECT receipt_id, document_type, timestamp, identity, counterparty, "
+            "order_ref, proof_purpose, payload_json, signature, created_at "
+            "FROM receipt_log WHERE receipt_id = ?", (receipt_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return dict(zip(["receipt_id", "document_type", "timestamp", "identity",
+                         "counterparty", "order_ref", "proof_purpose",
+                         "payload_json", "signature", "created_at"], row))
+
+    def get_receipts_by_type(self, document_type):
+        cursor = self._conn.execute(
+            "SELECT receipt_id, document_type, timestamp, identity, counterparty, "
+            "order_ref, proof_purpose, payload_json, signature, created_at "
+            "FROM receipt_log WHERE document_type = ? ORDER BY created_at ASC",
+            (document_type,))
+        cols = ["receipt_id", "document_type", "timestamp", "identity",
+                "counterparty", "order_ref", "proof_purpose",
+                "payload_json", "signature", "created_at"]
+        return [dict(zip(cols, r)) for r in cursor.fetchall()]
+
+    def count_receipts(self, document_type=None):
+        if document_type:
+            cursor = self._conn.execute(
+                "SELECT COUNT(*) FROM receipt_log WHERE document_type = ?",
+                (document_type,))
+        else:
+            cursor = self._conn.execute("SELECT COUNT(*) FROM receipt_log")
+        return cursor.fetchone()[0]

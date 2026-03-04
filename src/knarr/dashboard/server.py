@@ -463,6 +463,11 @@ class CockpitServer:
                         # v0.32.0: GET /api/receipts/{reference} — fetch credit note by job_id
                         reference = path[len("/api/receipts/"):]
                         await self._handle_receipt_fetch(writer, reference)
+                    # v0.36.0: Settlement cockpit endpoints
+                    elif path == "/api/positions":
+                        await self._handle_positions(writer)
+                    elif path == "/api/settlements":
+                        await self._handle_settlements(writer, query)
                     else:
                         try:
                             content, content_type = self._serve_static(path)
@@ -526,6 +531,10 @@ class CockpitServer:
                         # v0.32.0: P1 — on-demand upgrade trigger (auth required)
                         result = await self._handle_upgrade_check()
                         self._respond_json(writer, result)
+                    # v0.36.0: Manual settlement trigger
+                    elif path.startswith("/api/settle/"):
+                        peer_key = path[len("/api/settle/"):]
+                        await self._handle_manual_settle(writer, peer_key)
                     else:
                         self._respond_404(writer)
                 elif method == "PUT":
@@ -2186,6 +2195,214 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
             self._respond_json(writer, {"status": "ok", "credit_note": note_json})
         except Exception as e:
             logger.error(f"Receipt fetch error ref={reference}: {e}")
+            self._respond_error(writer, 500, "Internal error")
+
+    # ── v0.36.0: Settlement cockpit endpoints ──────────────────────────────
+
+    async def _handle_positions(self, writer) -> None:
+        """GET /api/positions — bilateral balances + utilization for all peers.
+
+        Source: storage.get_all_ledger_entries() + compute utilization.
+        Returns a list of position objects, one per peer.
+        """
+        try:
+            entries = self._node.storage.get_all_ledger_entries()
+            positions = []
+            for entry in entries:
+                pk = entry.get("peer_public_key", "")
+                balance = float(entry.get("balance", 0.0))
+                prepaid = float(entry.get("prepaid", 0.0))
+                pub_tab = float(entry.get("pub_tab", 0.0))
+                soft_limit = float(entry.get("soft_limit", -5.0))
+                hard_limit = float(entry.get("hard_limit", -10.0))
+
+                # Resolve credit limits from policy
+                try:
+                    ic, mb = self._node._resolve_policy(pk, "")
+                    credit_range = ic - mb
+                    utilization = (ic - balance) / credit_range if credit_range > 0 else 0.0
+                    effective_hard_limit = mb
+                    effective_soft_limit = ic
+                except Exception:
+                    credit_range = abs(hard_limit - soft_limit)
+                    utilization = abs(balance) / abs(hard_limit) if hard_limit != 0 else 0.0
+                    effective_hard_limit = hard_limit
+                    effective_soft_limit = soft_limit
+
+                import math
+                positions.append({
+                    "peer_key": pk,
+                    "balance": round(balance, 4),
+                    "prepaid": round(prepaid, 4),
+                    "pub_tab": round(pub_tab, 4),
+                    "utilization": round(utilization, 4) if math.isfinite(utilization) else 0.0,
+                    "soft_limit": round(effective_soft_limit, 4),
+                    "hard_limit": round(effective_hard_limit, 4),
+                    "credit_range": round(credit_range, 4),
+                })
+            self._respond_json(writer, {"positions": positions, "count": len(positions)})
+        except Exception as e:
+            logger.error(f"Positions endpoint error: {e}")
+            self._respond_error(writer, 500, "Internal error")
+
+    async def _handle_settlements(self, writer, query: dict) -> None:
+        """GET /api/settlements — settlement history from receipt_log.
+
+        Queries receipt_log for all settlement document types.
+        Optional query param: limit (default 50, max 200).
+        """
+        try:
+            import sqlite3
+            limit = min(int((query.get("limit", ["50"]) or ["50"])[0]), 200)
+
+            conn = self._node.storage._get_conn()
+            rows = conn.execute(
+                """
+                SELECT receipt_id, document_type, timestamp, counterparty,
+                       order_ref, payload_json, signature
+                FROM receipt_log
+                WHERE document_type IN (
+                    'settlement_prepared', 'settlement_accepted',
+                    'settlement_processed', 'settlement_confirmation'
+                )
+                ORDER BY rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+            settlements = []
+            for row in rows:
+                receipt_id, doc_type, ts, counterparty, order_ref, payload_json_str, sig = row
+                amount = None
+                try:
+                    payload = json.loads(payload_json_str) if payload_json_str else {}
+                    amount = payload.get("amount") or payload.get("amount_settled") or payload.get("amount_confirmed")
+                except Exception:
+                    payload = {}
+
+                settlements.append({
+                    "receipt_id": receipt_id,
+                    "document_type": doc_type,
+                    "counterparty": counterparty,
+                    "amount": amount,
+                    "timestamp": ts,
+                    "order_ref": order_ref,
+                    "signed": sig is not None,
+                })
+
+            self._respond_json(writer, {"settlements": settlements, "count": len(settlements)})
+        except Exception as e:
+            logger.error(f"Settlements endpoint error: {e}")
+            self._respond_error(writer, 500, "Internal error")
+
+    async def _handle_manual_settle(self, writer, peer_key: str) -> None:
+        """POST /api/settle/{peer_key} — manual settlement trigger.
+
+        Runs the settlement engine for the specified peer.
+        Returns the prepared_tx (settlement_prepared Document) for operator review.
+        The cockpit countersigns if a cockpit keypair exists.
+
+        Response: {prepared_doc, needs_countersign: bool, receipt_id}
+        """
+        try:
+            import math
+            from ..commerce.settlement_engine import SettlementInput, evaluate_settlement
+            from ..commerce.settlement_execution import prepare_settlement
+
+            if not peer_key or len(peer_key) < 16:
+                self._respond_error(writer, 400, "Invalid peer_key")
+                return
+
+            # Look up ledger entry for this peer
+            entries = self._node.storage.get_all_ledger_entries()
+            entry = next((e for e in entries if e.get("peer_public_key") == peer_key), None)
+            if not entry:
+                self._respond_error(writer, 404, f"No ledger entry for peer: {peer_key[:16]}")
+                return
+
+            balance = float(entry.get("balance", 0.0))
+            prepaid = float(entry.get("prepaid", 0.0))
+            pub_tab = float(entry.get("pub_tab", 0.0))
+
+            try:
+                ic, mb = self._node._resolve_policy(peer_key, "")
+                credit_range = ic - mb
+                utilization = (ic - balance) / credit_range if credit_range > 0 else 0.0
+            except Exception:
+                credit_range = 10.0
+                utilization = abs(balance) / 10.0 if balance else 0.0
+                ic = 0.0
+                mb = -10.0
+
+            economy_cfg = self._node._config.get("economy", {})
+            settlement_cfg = economy_cfg.get("settlement", {})
+
+            inp = SettlementInput(
+                peer_key=peer_key,
+                balance=balance,
+                prepaid=prepaid if math.isfinite(prepaid) else 0.0,
+                pub_tab=pub_tab if math.isfinite(pub_tab) else 0.0,
+                soft_limit=float(ic),
+                hard_limit=float(mb),
+                credit_limit=credit_range,
+                tasks_provided=0,
+                tasks_consumed=0,
+                utilization=utilization if math.isfinite(utilization) else 0.0,
+            )
+
+            output = evaluate_settlement(inp, settlement_cfg)
+
+            # Build prepared doc even if engine says "skip" (manual override)
+            formula = (
+                f"balance={balance:.2f} utilization={utilization:.1%} "
+                f"target={settlement_cfg.get('soft_target', 0.5):.1%}"
+            )
+            amount = output.amount if output.action == "settle" else balance
+
+            if not self._node._signing_key:
+                self._respond_error(writer, 503, "Node signing key not available")
+                return
+
+            prepared_doc = await prepare_settlement(
+                node_id=self._node.node_info.node_id,
+                peer_key=peer_key,
+                amount=amount,
+                formula=formula,
+                proposer_balance=balance,
+                counterparty_balance_claimed=-balance,
+                utilization=utilization if math.isfinite(utilization) else 0.0,
+                target_utilization=float(settlement_cfg.get("soft_target", 0.5)),
+                signing_key=self._node._signing_key,
+                storage=self._node.storage,
+                bus=getattr(self._node, "bus", None),
+            )
+
+            # Cockpit countersign if keypair available (B6)
+            needs_countersign = True
+            cockpit_key = getattr(self._node, "_cockpit_signing_key", None)
+            if cockpit_key:
+                try:
+                    from ..core.proof import sign_document as _sign_doc
+                    cockpit_vm = f"did:knarr:{self._node.node_info.node_id}#cockpit-1"
+                    # Sign the payload (without node proof) using cockpit key
+                    doc_payload = {k: v for k, v in prepared_doc.items() if k != "proof"}
+                    countersigned = _sign_doc(doc_payload, cockpit_key, cockpit_vm)
+                    # v0.36.0: Append cockpit proof as authority_proof — preserve node proof
+                    prepared_doc["authority_proof"] = countersigned["proof"]
+                    needs_countersign = False
+                except Exception as e:
+                    logger.warning(f"COCKPIT_COUNTERSIGN_FAIL: {e}")
+
+            self._respond_json(writer, {
+                "prepared_doc": prepared_doc,
+                "needs_countersign": needs_countersign,
+                "engine_action": output.action,
+                "engine_reason": output.reason,
+                "receipt_id": prepared_doc.get("receipt_id", ""),
+            })
+        except Exception as e:
+            logger.error(f"Manual settle error peer={peer_key[:16] if peer_key else '?'}: {e}")
             self._respond_error(writer, 500, "Internal error")
 
     async def _handle_upgrade_check(self) -> dict:

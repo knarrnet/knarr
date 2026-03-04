@@ -32,6 +32,26 @@ _TYPE_REGISTRY: Dict[str, Set[str]] = {
     "mail_receive_receipt": {"sender", "message_id"},
     "admission_decision": {"skill_name", "decision"},
     "price_calculation": {"skill_name", "inputs", "calculation", "output"},
+    # v0.36.0: Settlement document types
+    "settlement_prepared": {
+        "proposer", "counterparty", "amount", "formula",
+        "proposer_balance", "counterparty_balance_claimed",
+        "utilization", "target_utilization",
+    },
+    "settlement_accepted": {
+        "proposer", "counterparty", "amount",
+        "authority", "authority_method",
+        "prepared_receipt_id",
+    },
+    "settlement_processed": {
+        "proposer", "counterparty", "amount_settled",
+        "ledger_delta", "final_balance",
+        "accepted_receipt_id", "settle_request_ref",
+    },
+    "settlement_confirmation": {
+        "proposer", "counterparty", "amount_confirmed",
+        "own_final_balance", "processed_receipt_id",
+    },
 }
 
 # ── Prefix Map ─────────────────────────────────────────────────────────
@@ -46,6 +66,11 @@ _PREFIX_MAP: Dict[str, str] = {
     "mail_receive_receipt": "mrr",
     "admission_decision": "adm",
     "price_calculation": "prc",
+    # v0.36.0: Settlement document type prefixes
+    "settlement_prepared": "sp",
+    "settlement_accepted": "sa",
+    "settlement_processed": "spr",
+    "settlement_confirmation": "sc",
 }
 
 
@@ -175,4 +200,93 @@ def price_calculation(
     return Document("price_calculation", {
         "skill_name": skill_name, "inputs": inputs,
         "calculation": calculation, "output": output, **extra,
+    })
+
+
+# ── v0.36.0: Settlement Document Factories ──────────────────────────────
+
+
+def settlement_prepared(
+    proposer: str, counterparty: str, amount: float,
+    formula: str, proposer_balance: float,
+    counterparty_balance_claimed: float,
+    utilization: float, target_utilization: float,
+    **extra: Any,
+) -> Document:
+    """Factory for settlement_prepared document.
+
+    Created when node prepares a settlement for authority review.
+    """
+    return Document("settlement_prepared", {
+        "proposer": proposer,
+        "counterparty": counterparty,
+        "amount": amount,
+        "formula": formula,
+        "proposer_balance": proposer_balance,
+        "counterparty_balance_claimed": counterparty_balance_claimed,
+        "utilization": utilization,
+        "target_utilization": target_utilization,
+        **extra,
+    })
+
+
+def settlement_accepted(
+    proposer: str, counterparty: str, amount: float,
+    authority: str, authority_method: str,
+    prepared_receipt_id: str,
+    **extra: Any,
+) -> Document:
+    """Factory for settlement_accepted document.
+
+    Created when authority countersigns the prepared settlement.
+    """
+    return Document("settlement_accepted", {
+        "proposer": proposer,
+        "counterparty": counterparty,
+        "amount": amount,
+        "authority": authority,
+        "authority_method": authority_method,
+        "prepared_receipt_id": prepared_receipt_id,
+        **extra,
+    })
+
+
+def settlement_processed(
+    proposer: str, counterparty: str, amount_settled: float,
+    ledger_delta: float, final_balance: float,
+    accepted_receipt_id: str, settle_request_ref: str,
+    **extra: Any,
+) -> Document:
+    """Factory for settlement_processed document.
+
+    Created when counterparty confirms and ledger is zeroed.
+    """
+    return Document("settlement_processed", {
+        "proposer": proposer,
+        "counterparty": counterparty,
+        "amount_settled": amount_settled,
+        "ledger_delta": ledger_delta,
+        "final_balance": final_balance,
+        "accepted_receipt_id": accepted_receipt_id,
+        "settle_request_ref": settle_request_ref,
+        **extra,
+    })
+
+
+def settlement_confirmation(
+    proposer: str, counterparty: str, amount_confirmed: float,
+    own_final_balance: float, processed_receipt_id: str,
+    **extra: Any,
+) -> Document:
+    """Factory for settlement_confirmation document.
+
+    Created when counterparty accepts and confirms the settlement.
+    """
+    return Document("settlement_confirmation", {
+        "proposer": proposer,
+        "counterparty": counterparty,
+        "amount_confirmed": amount_confirmed,
+        "own_final_balance": own_final_balance,
+        "processed_receipt_id": processed_receipt_id,
+        **extra,
     })
