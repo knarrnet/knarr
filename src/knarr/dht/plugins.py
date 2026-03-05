@@ -160,15 +160,30 @@ class PluginLoader:
         self._delivery_cb = delivery_cb
         self.plugins: List[PluginHooks] = []
 
+    def _get_plugin_dirs(self) -> list[Path]:
+        """Collect plugin directories: user plugins first, then built-in package plugins."""
+        dirs = []
+        if self._plugin_root.is_dir():
+            dirs.extend(sorted(self._plugin_root.iterdir()))
+        # v0.37.1: Also scan built-in plugins shipped with the package
+        builtin = Path(__file__).resolve().parent.parent / "plugins"
+        if builtin.is_dir() and builtin != self._plugin_root.resolve():
+            seen = {d.name for d in dirs}
+            for p in sorted(builtin.iterdir()):
+                if p.name not in seen:
+                    dirs.append(p)
+        return dirs
+
     def load_plugins(self) -> None:
         """
         Scans for and loads plugins. Logs warnings for failures but continues startup.
         """
-        if not self._plugin_root.is_dir():
-            log.info(f"Plugin directory not found: {self._plugin_root}. No plugins loaded.")
+        plugin_dirs = self._get_plugin_dirs()
+        if not plugin_dirs:
+            log.info(f"No plugin directories found. No plugins loaded.")
             return
 
-        for plugin_path in sorted(self._plugin_root.iterdir()):
+        for plugin_path in plugin_dirs:
             if not plugin_path.is_dir():
                 continue
 

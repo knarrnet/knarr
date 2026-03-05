@@ -227,7 +227,7 @@ class DHTNode:
 
         # v0.37.0: Warehouse Manager — pre-bus gateway for external documents
         self._warehouse_manager = None
-        if self._config.get("warehouse_manager", {}).get("enabled", False):
+        if self._config.get("warehouse_manager", {}).get("enabled", True):
             from ..core.warehouse_manager import WarehouseManager
             wm_identity = self._build_identity_fragments()
             self._warehouse_manager = WarehouseManager(
@@ -1383,6 +1383,78 @@ class DHTNode:
                     logger.warning(f"WM recovery fail qid={item['id'][:16]}: {exc}")
         except Exception as exc:
             logger.warning(f"WM restart recovery failed: {exc}")
+
+    async def _process_settlement_queue_item(self, item: dict):
+        """v0.37.1: Process a single settlement queue item.
+
+        Reads the netting trigger, calls prepare_settlement, self-signs
+        with cockpit key as authority, then calls execute_settlement.
+        """
+        from ..commerce.settlement_execution import prepare_settlement, execute_settlement
+
+        body = item["body"]
+        peer_key = body.get("peer_public_key", "")
+        amount = body.get("settle_amount", 0.0)
+        utilization = body.get("utilization_pct", 0.0) / 100.0
+        target_util = body.get("target_utilization", 0.0)
+        reason = body.get("reason", "netting_trigger")
+
+        if not peer_key or amount <= 0:
+            logger.warning(f"SETTLEMENT_QUEUE_SKIP id={item['id']}: invalid peer/amount")
+            self.storage.mark_settlement_processed(item["id"], status="skipped")
+            return
+
+        # Get ledger state for this peer
+        entry = self.storage.get_or_create_ledger_entry(peer_key)
+        balance = entry["balance"]
+
+        # Step 1: Prepare (sign with node key)
+        signed_doc = await prepare_settlement(
+            node_id=self.node_info.node_id,
+            peer_key=peer_key,
+            amount=amount,
+            formula=reason,
+            proposer_balance=balance,
+            counterparty_balance_claimed=0.0,
+            utilization=utilization,
+            target_utilization=target_util,
+            signing_key=self._signing_key,
+            storage=self.storage,
+            bus=self.bus,
+        )
+
+        # Step 2: Countersign with cockpit key (self-authority)
+        from ..core.proof import sign_document
+        cockpit_key = getattr(self, "_cockpit_signing_key", None)
+        if cockpit_key is None:
+            logger.warning(f"SETTLEMENT_QUEUE_NO_AUTHORITY id={item['id']}: no cockpit key")
+            self.storage.mark_settlement_processed(item["id"], status="failed")
+            return
+
+        authority_method = f"did:knarr:{self.node_info.node_id}#cockpit-1"
+        payload = {k: v for k, v in signed_doc.items() if k != "proof"}
+        countersigned = sign_document(payload, cockpit_key, authority_method)
+
+        # Step 3: Execute (validate dual sigs, send settle_request mail)
+        async def _mail_fn(to_node, msg_type, body, **kw):
+            await self._sync.enqueue(to_node=to_node, msg_type=msg_type, body=body, system=True)
+
+        await execute_settlement(
+            prepared_doc=signed_doc,
+            countersigned_doc=countersigned,
+            node_verify_key=self._signing_key.verify_key,
+            authority_verify_key=cockpit_key.verify_key,
+            node_id=self.node_info.node_id,
+            signing_key=self._signing_key,
+            peer_key=peer_key,
+            storage=self.storage,
+            send_mail_fn=_mail_fn,
+            bus=self.bus,
+        )
+
+        # Step 4: Mark processed
+        self.storage.mark_settlement_processed(item["id"], status="processed")
+        logger.info(f"SETTLEMENT_QUEUE_DONE id={item['id']} peer={peer_key[:16]} amount={amount:.2f}")
 
     def wm_ingest_external(self, document: dict, originator_pubkey: bytes):
         """Public entry point for external-origin documents through WM.
@@ -3279,9 +3351,9 @@ class DHTNode:
             f"{msg.skill_name}:{canonical}:{caller_node_id}".encode()
         ).hexdigest()[:32]
 
-        # Check for existing job (poll/dedup)
+        # Check for existing job (poll/dedup) — only dedup active jobs
         existing = self.storage.get_async_job_by_hash(input_hash)
-        if existing:
+        if existing and existing["status"] not in ("failed", "rejected", "completed"):
             return self._sign(TaskStatus(
                 task_id=existing["job_id"],
                 status=existing["status"],
@@ -4655,6 +4727,18 @@ class DHTNode:
                 self._last_netting = time.time()
             except Exception as e:
                 logger.error(f"Netting cycle failed: {e}")
+
+        # v0.37.1: Process pending settlement queue items
+        try:
+            pending = self.storage.get_pending_settlements(limit=5)
+            for item in pending:
+                try:
+                    await self._process_settlement_queue_item(item)
+                except Exception as e:
+                    logger.warning(f"SETTLEMENT_QUEUE_FAIL id={item['id']}: {e}")
+                    self.storage.mark_settlement_processed(item["id"], status="failed")
+        except Exception as e:
+            logger.debug(f"Settlement queue check failed: {e}")
 
         # Selective heartbeat based on peer activity
         now = time.monotonic()

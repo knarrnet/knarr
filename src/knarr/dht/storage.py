@@ -1941,6 +1941,37 @@ class Storage:
         ).fetchone()
         return row is not None
 
+    def get_pending_settlements(self, limit: int = 10) -> list:
+        """Return pending settlement queue items, oldest first."""
+        import json as _json
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT id, item_type, from_node, body, priority, created_at "
+            "FROM settlement_queue WHERE status = 'pending' "
+            "ORDER BY priority DESC, created_at ASC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        result = []
+        for r in rows:
+            try:
+                body = _json.loads(r[3]) if isinstance(r[3], str) else r[3]
+            except (ValueError, TypeError):
+                body = {}
+            result.append({
+                "id": r[0], "item_type": r[1], "from_node": r[2],
+                "body": body, "priority": r[4], "created_at": r[5],
+            })
+        return result
+
+    def mark_settlement_processed(self, queue_id: int, status: str = "processed"):
+        """Mark a settlement queue item as processed or failed."""
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE settlement_queue SET status = ?, processed_at = ? WHERE id = ?",
+            (status, time.time(), queue_id)
+        )
+        conn.commit()
+
     def _escape_like(self, s: str) -> str:
         """Escape LIKE metacharacters to prevent SQL LIKE injection."""
         return s.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
