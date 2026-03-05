@@ -52,6 +52,32 @@ _TYPE_REGISTRY: Dict[str, Set[str]] = {
         "proposer", "counterparty", "amount_confirmed",
         "own_final_balance", "processed_receipt_id",
     },
+    # v0.37.0: BCW payment/wallet document types
+    "payment_received": {
+        "chain_id", "tx_hash", "tx_index", "from_address", "to_address",
+        "amount", "denom", "decimals", "confirmation",
+    },
+    "payment_finalized": {
+        "chain_id", "tx_hash", "amount", "denom",
+        "original_receipt_id", "finality",
+    },
+    "payment_executed": {
+        "chain_id", "tx_hash", "from_address", "to_address",
+        "amount", "denom", "decimals", "settlement_ref", "finality",
+    },
+    "wallet_transfer": {
+        "chain_id", "tx_hash", "from_address", "to_address",
+        "amount", "denom", "decimals", "transfer_type",
+    },
+    "wallet_withdrawal": {
+        "chain_id", "tx_hash", "from_address", "to_address",
+        "amount", "denom", "decimals",
+    },
+    # v0.37.0: Admin document types
+    "configuration_order": {"target", "operation", "changes"},
+    # v0.37.0: Disclosure document types
+    "punchhole_card": {"for_node", "for_access_level", "available", "not_available"},
+    "cache_object": {"object_key", "data", "granularity"},
 }
 
 # ── Prefix Map ─────────────────────────────────────────────────────────
@@ -71,6 +97,16 @@ _PREFIX_MAP: Dict[str, str] = {
     "settlement_accepted": "sa",
     "settlement_processed": "spr",
     "settlement_confirmation": "sc",
+    # v0.37.0: BCW payment/wallet prefixes
+    "payment_received": "prx",
+    "payment_finalized": "pfin",
+    "payment_executed": "pexe",
+    "wallet_transfer": "wtfr",
+    "wallet_withdrawal": "wwdr",
+    # v0.37.0: Admin + disclosure prefixes
+    "configuration_order": "cord",
+    "punchhole_card": "pcard",
+    "cache_object": "cobj",
 }
 
 
@@ -289,4 +325,107 @@ def settlement_confirmation(
         "own_final_balance": own_final_balance,
         "processed_receipt_id": processed_receipt_id,
         **extra,
+    })
+
+
+# ── v0.37.0: BCW Payment/Wallet Document Factories ──────────────────
+
+
+def payment_received(
+    chain_id: str, tx_hash: str, tx_index: int,
+    from_address: str, to_address: str,
+    amount: int, denom: str, decimals: int,
+    confirmation: dict, **extra: Any,
+) -> Document:
+    return Document("payment_received", {
+        "chain_id": chain_id, "tx_hash": tx_hash, "tx_index": tx_index,
+        "from_address": from_address, "to_address": to_address,
+        "amount": amount, "denom": denom, "decimals": decimals,
+        "confirmation": confirmation, **extra,
+    })
+
+
+def payment_finalized(
+    chain_id: str, tx_hash: str, amount: int, denom: str,
+    original_receipt_id: str, finality: dict, **extra: Any,
+) -> Document:
+    return Document("payment_finalized", {
+        "chain_id": chain_id, "tx_hash": tx_hash,
+        "amount": amount, "denom": denom,
+        "original_receipt_id": original_receipt_id,
+        "finality": finality, **extra,
+    })
+
+
+def payment_executed(
+    chain_id: str, tx_hash: str,
+    from_address: str, to_address: str,
+    amount: int, denom: str, decimals: int,
+    settlement_ref: dict, finality: dict, **extra: Any,
+) -> Document:
+    return Document("payment_executed", {
+        "chain_id": chain_id, "tx_hash": tx_hash,
+        "from_address": from_address, "to_address": to_address,
+        "amount": amount, "denom": denom, "decimals": decimals,
+        "settlement_ref": settlement_ref, "finality": finality, **extra,
+    })
+
+
+def wallet_transfer(
+    chain_id: str, tx_hash: str,
+    from_address: str, to_address: str,
+    amount: int, denom: str, decimals: int,
+    transfer_type: str, **extra: Any,
+) -> Document:
+    return Document("wallet_transfer", {
+        "chain_id": chain_id, "tx_hash": tx_hash,
+        "from_address": from_address, "to_address": to_address,
+        "amount": amount, "denom": denom, "decimals": decimals,
+        "transfer_type": transfer_type, **extra,
+    })
+
+
+def wallet_withdrawal(
+    chain_id: str, tx_hash: str,
+    from_address: str, to_address: str,
+    amount: int, denom: str, decimals: int, **extra: Any,
+) -> Document:
+    return Document("wallet_withdrawal", {
+        "chain_id": chain_id, "tx_hash": tx_hash,
+        "from_address": from_address, "to_address": to_address,
+        "amount": amount, "denom": denom, "decimals": decimals,
+        **extra,
+    })
+
+
+# ── v0.37.0: Admin Document Factories ────────────────────────────────
+
+
+def configuration_order(
+    target: str, operation: str, changes: dict, **extra: Any,
+) -> Document:
+    return Document("configuration_order", {
+        "target": target, "operation": operation, "changes": changes, **extra,
+    })
+
+
+# ── v0.37.0: Disclosure Document Factories ───────────────────────────
+
+
+def punchhole_card(
+    for_node: str, for_access_level: str,
+    available: list, not_available: list, **extra: Any,
+) -> Document:
+    return Document("punchhole_card", {
+        "for_node": for_node, "for_access_level": for_access_level,
+        "available": available, "not_available": not_available, **extra,
+    })
+
+
+def cache_object(
+    object_key: str, data: dict, granularity: dict, **extra: Any,
+) -> Document:
+    return Document("cache_object", {
+        "object_key": object_key, "data": data,
+        "granularity": granularity, **extra,
     })

@@ -152,7 +152,7 @@ class TestFastPathReceiptParity:
         import inspect
         from knarr.dht.node import DHTNode
         # Read the method source
-        src = inspect.getsource(DHTNode._execute_fast_path)
+        src = inspect.getsource(DHTNode._execute_local_fast_path)
         assert "order_executing" in src, "Fast path must write order_executing receipt"
         assert "_write_receipt" in src, "Fast path must call _write_receipt"
 
@@ -160,12 +160,12 @@ class TestFastPathReceiptParity:
         """The fast path should emit task.started bus event."""
         import inspect
         from knarr.dht.node import DHTNode
-        src = inspect.getsource(DHTNode._execute_fast_path)
+        src = inspect.getsource(DHTNode._execute_local_fast_path)
         assert "task.started" in src, "Fast path must emit task.started"
 
     def test_fast_path_delegates_to_execute_queued_task(self):
         """Fast path should call _execute_queued_task for identical behavior."""
         import inspect
         from knarr.dht.node import DHTNode
-        src = inspect.getsource(DHTNode._execute_fast_path)
+        src = inspect.getsource(DHTNode._execute_local_fast_path)
         assert "_execute_queued_task" in src, "Fast path must delegate to _execute_queued_task"

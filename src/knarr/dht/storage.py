@@ -2020,6 +2020,98 @@ class Storage:
         """, (max_entries,))
         conn.commit()
 
+    # ------------------------------------------------------------------
+    # v0.37.0: DMZ quarantine CRUD (Warehouse Manager)
+    # ------------------------------------------------------------------
+
+    def quarantine_store(
+        self,
+        id: str,
+        document_type: str,
+        document_json: str,
+        originator_pubkey: str,
+        status: str,
+        gate_results: str,
+        reason: str | None,
+    ) -> None:
+        """Insert a document into the DMZ quarantine table."""
+        conn = self._get_conn()
+        now = time.time()
+        conn.execute(
+            """INSERT OR REPLACE INTO dmz_quarantine
+               (id, document_type, document_json, originator_pubkey,
+                status, gate_results, reason, received_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (id, document_type, document_json, originator_pubkey,
+             status, gate_results, reason, now),
+        )
+        conn.commit()
+        logger.debug(f"DMZ_QUARANTINE_STORE id={id[:16]} type={document_type} status={status}")
+
+    def quarantine_get(self, id: str) -> Optional[Dict]:
+        """Retrieve a single quarantine entry by ID."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            """SELECT id, document_type, document_json, originator_pubkey,
+                      status, gate_results, reason, received_at,
+                      promoted_at, resolved_at
+               FROM dmz_quarantine WHERE id = ?""",
+            (id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return dict(zip(
+            ["id", "document_type", "document_json", "originator_pubkey",
+             "status", "gate_results", "reason", "received_at",
+             "promoted_at", "resolved_at"],
+            row,
+        ))
+
+    def quarantine_update_status(
+        self,
+        id: str,
+        status: str,
+        reason: str | None = None,
+        promoted_at: float | None = None,
+        resolved_at: float | None = None,
+    ) -> None:
+        """Update the status of a quarantine entry."""
+        conn = self._get_conn()
+        conn.execute(
+            """UPDATE dmz_quarantine
+               SET status = ?,
+                   reason = COALESCE(?, reason),
+                   promoted_at = COALESCE(?, promoted_at),
+                   resolved_at = COALESCE(?, resolved_at)
+               WHERE id = ?""",
+            (status, reason, promoted_at, resolved_at, id),
+        )
+        conn.commit()
+        logger.debug(f"DMZ_QUARANTINE_UPDATE id={id[:16]} status={status}")
+
+    def quarantine_list_pending(self) -> List[Dict]:
+        """Return all quarantine entries with status='pending'."""
+        return self.quarantine_list_by_status("pending")
+
+    def quarantine_list_by_status(self, status: str) -> List[Dict]:
+        """Return all quarantine entries matching the given status."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            """SELECT id, document_type, document_json, originator_pubkey,
+                      status, gate_results, reason, received_at,
+                      promoted_at, resolved_at
+               FROM dmz_quarantine WHERE status = ?
+               ORDER BY received_at ASC""",
+            (status,),
+        )
+        cols = [
+            "id", "document_type", "document_json", "originator_pubkey",
+            "status", "gate_results", "reason", "received_at",
+            "promoted_at", "resolved_at",
+        ]
+        return [dict(zip(cols, r)) for r in cursor.fetchall()]
+
     def close(self):
         self._keepalive_conn.close()
 
