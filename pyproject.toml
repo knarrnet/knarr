@@ -25,6 +25,7 @@ upnp = [
 [tool.setuptools.package-data]
 "knarr.dashboard" = ["*.html", "*.js", "*.css"]
 "knarr.migrations" = ["*.sql"]
+"*" = ["plugin.toml", "exposure_schema.toml"]
 
 [build-system]
 requires = ["setuptools>=68.0"]
