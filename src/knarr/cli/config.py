@@ -33,19 +33,19 @@ def merge_defaults(defaults: dict, overrides: dict) -> dict:
     return result
 
 def load_config(path: Path, explicit: bool = False) -> dict:
-    """Load and validate knarr.toml. Returns merged config with defaults."""
+    """Load and validate knarr.toml + knarr.skills.toml. Returns merged config."""
     if not path.exists():
         if explicit:
             print(f"Error: Config file not found: {path}", file=sys.stderr)
             print(f"  Check the path passed to --config.", file=sys.stderr)
             sys.exit(1)
         return DEFAULT_CONFIG
-    
+
     try:
         with open(path, "rb") as f:
             raw = tomllib.load(f)
         _warn_unknown_keys(raw, path)
-        return merge_defaults(DEFAULT_CONFIG, raw)
+        config = merge_defaults(DEFAULT_CONFIG, raw)
     except tomllib.TOMLDecodeError as e:
         print(f"Error: Invalid TOML in {path}: {e}", file=sys.stderr)
         sys.exit(1)
@@ -53,6 +53,19 @@ def load_config(path: Path, explicit: bool = False) -> dict:
         print(f"Error in {path}: {e}", file=sys.stderr)
         print("Check the configuration reference in the README.", file=sys.stderr)
         sys.exit(1)
+
+    # v0.37.0: Merge dynamic skills from knarr.skills.toml
+    config_dir = path.parent
+    dynamic_skills = load_dynamic_skills(config_dir)
+    if dynamic_skills:
+        existing = config.get("skills", {})
+        # Dynamic skills never overwrite static skills
+        for name, cfg in dynamic_skills.items():
+            if name not in existing:
+                existing[name] = cfg
+        config["skills"] = existing
+
+    return config
 
 _KNOWN_KEYS = {
     "node": {"port", "host", "storage", "advertise_host", "sidecar_port", "max_asset_size",
@@ -65,7 +78,9 @@ _KNOWN_KEYS = {
     "settlement": {"tab_reminder_threshold", "netting_interval"},
     "network": {"bootstrap", "upnp", "tls_cert", "tls_key", "max_connections", "connection_idle_timeout", "gossip_fanout", "heartbeat_silence_threshold", "peer_dead_timeout", "min_peers"},
     "sidecar": {"asset_dir"},
-    "policy": {"initial_credit", "min_balance", "tit_for_tat", "group", "skill"},
+    "policy": {"initial_credit", "min_balance", "tit_for_tat", "group", "skill",
+               "max_dynamic_skills", "dynamic_price_floor", "dynamic_price_ceiling",
+               "dynamic_ttl_hours", "dynamic_allowed_handlers", "dynamic_enabled"},
     "mail": {"accept_from", "default_ttl_hours", "max_messages", "whitelist", "price", "debug", "stale_inbox_hours", "max_inbox", "pull_interval", "max_pull_batch", "accept_groups"},
     "cockpit": {"port", "bind", "auth_token", "tls", "tls_cert", "tls_key", "allowed_ips"},
     "token": {"mint", "rpc_url"},
@@ -227,3 +242,196 @@ def _cleanup_handler_module(skill_name: str):
     to_remove = [key for key in sys.modules if key.startswith(f"knarr_skill_{skill_name}")]
     for key in to_remove:
         del sys.modules[key]
+
+
+# ── v0.37.0: Dynamic Skill Registration ────────────────────────────
+
+import logging as _logging
+import math as _math
+import time as _time
+
+_dyn_log = _logging.getLogger("knarr.dynamic_skills")
+
+_DYNAMIC_DEFAULTS = {
+    "max_dynamic_skills": 10,
+    "dynamic_price_floor": 0.5,
+    "dynamic_price_ceiling": 50.0,
+    "dynamic_ttl_hours": 24,
+    "dynamic_allowed_handlers": ["dynamic_facade.py"],
+    "dynamic_enabled": False,
+}
+
+
+def _toml_escape(s: str) -> str:
+    """Escape a string for safe inclusion in a TOML basic string (double-quoted)."""
+    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+
+
+def _safe_toml_key(s: str) -> bool:
+    """Check that a string is safe to use as a TOML bare key or section name."""
+    return bool(re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$', s))
+
+
+def _serialize_skills_toml(skills: dict) -> str:
+    """Serialize skills dict to TOML string with proper escaping."""
+    lines = []
+    for sname, scfg in skills.items():
+        if not _safe_toml_key(sname):
+            continue  # Skip skill with unsafe name
+        lines.append(f"[skills.{sname}]")
+        for k, v in scfg.items():
+            if not _safe_toml_key(k):
+                continue  # Skip key with unsafe name
+            if isinstance(v, bool):
+                lines.append(f'{k} = {"true" if v else "false"}')
+            elif isinstance(v, str):
+                lines.append(f'{k} = "{_toml_escape(v)}"')
+            elif isinstance(v, list):
+                items = ", ".join(
+                    f'"{_toml_escape(x)}"' if isinstance(x, str) else str(x)
+                    for x in v
+                )
+                lines.append(f"{k} = [{items}]")
+            else:
+                lines.append(f"{k} = {v}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def load_dynamic_skills(config_dir: Path) -> dict:
+    """Load knarr.skills.toml and return its skills section (or empty dict)."""
+    skills_path = config_dir / "knarr.skills.toml"
+    if not skills_path.is_file():
+        return {}
+    try:
+        with open(skills_path, "rb") as f:
+            raw = tomllib.load(f)
+        return raw.get("skills", {})
+    except Exception as exc:
+        _dyn_log.warning(f"Failed to load knarr.skills.toml: {exc}")
+        return {}
+
+
+def get_dynamic_policy(config: dict) -> dict:
+    """Extract dynamic skill policy from config, with defaults."""
+    policy = dict(_DYNAMIC_DEFAULTS)
+    for key in _DYNAMIC_DEFAULTS:
+        val = config.get("policy", {}).get(key)
+        if val is not None:
+            policy[key] = val
+    return policy
+
+
+def validate_dynamic_skill(
+    skill_name: str, skill_cfg: dict, policy: dict, existing_count: int,
+) -> tuple[bool, str]:
+    """Validate a dynamic skill config against operator guardrails.
+
+    Returns (ok, reason). Reason is empty string on success.
+    """
+    if not policy.get("dynamic_enabled", False):
+        return False, "dynamic skills disabled by operator"
+
+    if existing_count >= policy.get("max_dynamic_skills", 10):
+        return False, f"max dynamic skills reached ({existing_count})"
+
+    price = skill_cfg.get("price", 0)
+    if not isinstance(price, (int, float)) or not _math.isfinite(price):
+        return False, f"invalid price: {price!r}"
+
+    floor = policy.get("dynamic_price_floor", 0.5)
+    ceiling = policy.get("dynamic_price_ceiling", 50.0)
+    if price < floor:
+        return False, f"price {price} below floor {floor}"
+    if price > ceiling:
+        return False, f"price {price} above ceiling {ceiling}"
+
+    handler = skill_cfg.get("handler", "")
+    if ":" in handler:
+        handler_file = handler.split(":")[0]
+    else:
+        handler_file = handler
+    handler_basename = os.path.basename(handler_file)
+
+    allowed = policy.get("dynamic_allowed_handlers", ["dynamic_facade.py"])
+    if handler_basename not in allowed:
+        return False, f"handler {handler_basename!r} not in allowed list"
+
+    if not re.match(r'^[a-z0-9][a-z0-9-]*$', skill_name) or len(skill_name) > 64:
+        return False, f"invalid skill name: {skill_name!r}"
+
+    return True, ""
+
+
+def write_dynamic_skill(config_dir: Path, skill_name: str, skill_cfg: dict) -> bool:
+    """Write or update a single skill entry in knarr.skills.toml.
+
+    Returns True on success. Touches knarr.reload sentinel to trigger reload.
+    """
+    skills_path = config_dir / "knarr.skills.toml"
+
+    # Load existing
+    existing = {}
+    if skills_path.is_file():
+        try:
+            with open(skills_path, "rb") as f:
+                existing = tomllib.load(f)
+        except Exception:
+            pass
+
+    skills = existing.get("skills", {})
+    skill_cfg["dynamic"] = True
+    skill_cfg["created_at"] = skill_cfg.get("created_at", _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()))
+    skills[skill_name] = skill_cfg
+
+    # Write back as TOML
+    try:
+        skills_path.write_text(_serialize_skills_toml(skills), encoding="utf-8")
+    except Exception as exc:
+        _dyn_log.error(f"Failed to write knarr.skills.toml: {exc}")
+        return False
+
+    # Touch sentinel to trigger reload
+    sentinel = config_dir / "knarr.reload"
+    try:
+        sentinel.touch()
+    except Exception:
+        pass
+
+    _dyn_log.info(f"Registered dynamic skill: {skill_name}")
+    return True
+
+
+def remove_dynamic_skill(config_dir: Path, skill_name: str) -> bool:
+    """Remove a dynamic skill from knarr.skills.toml and touch sentinel."""
+    skills_path = config_dir / "knarr.skills.toml"
+    if not skills_path.is_file():
+        return False
+
+    try:
+        with open(skills_path, "rb") as f:
+            existing = tomllib.load(f)
+    except Exception:
+        return False
+
+    skills = existing.get("skills", {})
+    if skill_name not in skills:
+        return False
+
+    del skills[skill_name]
+
+    # Rewrite
+    try:
+        skills_path.write_text(_serialize_skills_toml(skills), encoding="utf-8")
+    except Exception as exc:
+        _dyn_log.error(f"Failed to rewrite knarr.skills.toml: {exc}")
+        return False
+
+    sentinel = config_dir / "knarr.reload"
+    try:
+        sentinel.touch()
+    except Exception:
+        pass
+
+    _dyn_log.info(f"Removed dynamic skill: {skill_name}")
+    return True

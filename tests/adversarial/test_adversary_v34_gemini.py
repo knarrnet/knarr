@@ -73,7 +73,7 @@ class FakeNode:
         proof_purpose: str = "assertion",
         sign: bool = False,
     ) -> str:
-        # VERBATIM from proposed-final/src/knarr/dht/node.py
+        # VERBATIM from src/knarr/dht/node.py
         import secrets as _secrets
         from datetime import datetime, timezone as _tz
         import logging
@@ -134,7 +134,7 @@ class FakeNode:
     def _sign_receipt(self, task_id, skill_name, consumer_node_id, credits_charged,
                       input_hash, output_hash, wall_ms,
                       price_breakdown_json=None) -> str:
-        # VERBATIM from proposed-final/src/knarr/dht/node.py (OLD FORMAT)
+        # VERBATIM from src/knarr/dht/node.py (OLD FORMAT)
         if not self._signing_key:
             return ""
         import base64

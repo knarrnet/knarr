@@ -95,3 +95,131 @@ def validate_tab_reminder(body: dict) -> tuple[bool, str | None]:
         if not isinstance(v, (int, float)) or not _is_finite(v):
             return False, f"{nf} must be a finite number, got {v!r}"
     return True, None
+
+
+# ── v0.37.0: BCW Document Validators ─────────────────────────────────
+
+
+def _validate_chain_tx(body: dict, required: list[str]) -> tuple[bool, str | None]:
+    """Shared validator for chain-event documents."""
+    for field in required:
+        if field not in body:
+            return False, f"missing required field: {field}"
+    if not isinstance(body.get("chain_id"), str) or not body["chain_id"]:
+        return False, "chain_id must be non-empty string"
+    if not isinstance(body.get("tx_hash"), str) or not body["tx_hash"]:
+        return False, "tx_hash must be non-empty string"
+    amt = body.get("amount")
+    if not isinstance(amt, (int, float)) or not _is_finite(amt) or amt <= 0:
+        return False, f"amount must be positive finite, got {amt!r}"
+    return True, None
+
+
+def validate_payment_received(body: dict) -> tuple[bool, str | None]:
+    ok, err = _validate_chain_tx(body, [
+        "chain_id", "tx_hash", "tx_index", "from_address", "to_address",
+        "amount", "denom", "decimals", "confirmation",
+    ])
+    if not ok:
+        return ok, err
+    if not isinstance(body.get("confirmation"), dict):
+        return False, "confirmation must be dict"
+    if not isinstance(body.get("decimals"), int) or isinstance(body.get("decimals"), bool):
+        return False, f"decimals must be int, got {type(body.get('decimals')).__name__}"
+    return True, None
+
+
+def validate_payment_finalized(body: dict) -> tuple[bool, str | None]:
+    ok, err = _validate_chain_tx(body, [
+        "chain_id", "tx_hash", "amount", "denom",
+        "original_receipt_id", "finality",
+    ])
+    if not ok:
+        return ok, err
+    fin = body.get("finality", {})
+    if not isinstance(fin, dict) or fin.get("level") != "finalized":
+        return False, "finality.level must be 'finalized'"
+    return True, None
+
+
+def validate_payment_executed(body: dict) -> tuple[bool, str | None]:
+    ok, err = _validate_chain_tx(body, [
+        "chain_id", "tx_hash", "from_address", "to_address",
+        "amount", "denom", "decimals", "settlement_ref", "finality",
+    ])
+    if not ok:
+        return ok, err
+    ref = body.get("settlement_ref", {})
+    if not isinstance(ref, dict):
+        return False, "settlement_ref must be dict"
+    if not isinstance(body.get("finality"), dict):
+        return False, f"finality must be dict, got {type(body.get('finality')).__name__}"
+    if not isinstance(body.get("decimals"), int) or isinstance(body.get("decimals"), bool):
+        return False, f"decimals must be int, got {type(body.get('decimals')).__name__}"
+    return True, None
+
+
+def validate_wallet_transfer(body: dict) -> tuple[bool, str | None]:
+    ok, err = _validate_chain_tx(body, [
+        "chain_id", "tx_hash", "from_address", "to_address",
+        "amount", "denom", "decimals", "transfer_type",
+    ])
+    if not ok:
+        return ok, err
+    valid_types = {"hot_to_cold", "cold_to_hot", "derived_to_master",
+                   "master_to_derived", "rebalance"}
+    if body.get("transfer_type") not in valid_types:
+        return False, f"invalid transfer_type: {body.get('transfer_type')}"
+    return True, None
+
+
+def validate_wallet_withdrawal(body: dict) -> tuple[bool, str | None]:
+    ok, err = _validate_chain_tx(body, [
+        "chain_id", "tx_hash", "from_address", "to_address",
+        "amount", "denom", "decimals",
+    ])
+    if not ok:
+        return ok, err
+    if not isinstance(body.get("decimals"), int) or isinstance(body.get("decimals"), bool):
+        return False, f"decimals must be int, got {type(body.get('decimals')).__name__}"
+    return True, None
+
+
+# ── v0.37.0: Admin Document Validators ───────────────────────────────
+
+
+def validate_configuration_order(body: dict) -> tuple[bool, str | None]:
+    for field in ["target", "operation", "changes"]:
+        if field not in body:
+            return False, f"missing required field: {field}"
+    valid_ops = {"upsert_object", "modify_access", "remove_object"}
+    if body.get("operation") not in valid_ops:
+        return False, f"invalid operation: {body.get('operation')}"
+    if not isinstance(body.get("changes"), dict):
+        return False, "changes must be dict"
+    return True, None
+
+
+# ── v0.37.0: Disclosure Document Validators ───────────────────────────
+
+
+def validate_punchhole_card(body: dict) -> tuple[bool, str | None]:
+    for field in ["for_node", "for_access_level", "available", "not_available"]:
+        if field not in body:
+            return False, f"missing required field: {field}"
+    if not isinstance(body.get("available"), list):
+        return False, "available must be list"
+    if not isinstance(body.get("not_available"), list):
+        return False, "not_available must be list"
+    return True, None
+
+
+def validate_cache_object(body: dict) -> tuple[bool, str | None]:
+    for field in ["object_key", "data", "granularity"]:
+        if field not in body:
+            return False, f"missing required field: {field}"
+    if not isinstance(body.get("data"), dict):
+        return False, "data must be dict"
+    if not isinstance(body.get("granularity"), dict):
+        return False, "granularity must be dict"
+    return True, None

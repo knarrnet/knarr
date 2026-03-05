@@ -134,6 +134,7 @@ class PluginContext:
     sign_document: Optional[Callable] = None      # v0.35.0: sign dict per eddsa-jcs-2022
     query_receipts: Optional[Callable] = None     # v0.35.0: query receipt_log with filters
     query_prepaid_balance: Optional[Callable] = None  # v0.36.0: (peer_key) -> float
+    register_dynamic_skill: Optional[Callable] = None  # v0.37.0: (skill_config: dict) -> bool
 
 
 class PluginLoader:

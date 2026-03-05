@@ -1,0 +1,10 @@
+name = "punchhole-frontend"
+version = "0.37.0"
+handler = "handler:PunchhholeFrontendPlugin"
+description = "Punchhole Cache Frontend — DMZ-side. Serves pre-signed cache objects to authenticated external requesters. Bus-only channel to backend. No signing, no file I/O, no DB access."
+
+[config]
+# disclosure_log path relative to plugin_dir — override only for testing
+disclosure_log = "disclosure.db"
+# debug logging
+debug = false
