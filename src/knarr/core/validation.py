@@ -1,4 +1,5 @@
 import json
+import math
 import re
 from typing import Dict, Any, List, Optional
 from .models import SkillSheet
@@ -98,10 +99,11 @@ def validate_skill_sheet(data: Dict[str, Any]) -> SkillSheet:
         price = data["price"]
         if not isinstance(price, (int, float)):
             raise ValidationError("Field 'price' must be a number")
-        if price < 0:
-            raise ValidationError("Field 'price' must not be negative")
-        if price > 1000.0:
-            raise ValidationError("Field 'price' must not exceed 1000.0")
+        if not math.isfinite(price):
+            raise ValidationError("Field 'price' must be finite")
+        # B1: Negative price = bounty (provider pays consumer). Magnitude capped at 1000.0
+        if abs(price) > 1000.0:
+            raise ValidationError("Field 'price' magnitude must not exceed 1000.0")
 
     # max_input_size validation
     if "max_input_size" in data:

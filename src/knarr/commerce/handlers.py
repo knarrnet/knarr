@@ -469,11 +469,303 @@ def make_commerce_handlers(node) -> dict:
         except Exception as exc:
             logger.warning(f"SETTLEMENT_PROCESSED_WRITE_FAIL: {exc}")
 
+    # ── v0.38.0 A5.6: Netting mail handlers ────────────────────────────
+    # FIX-004: Session store for netting lifecycle — tracks proposals we've sent
+    # Key: netting_id, Value: {amount, counterparty, timestamp, consumed}
+    _netting_sessions: dict = {}
+
+    async def handle_netting_reconcile(item: dict) -> None:
+        """Step 1b: counterparty receives reconcile, checks position, sends proposal."""
+        body = _parse_body(item)
+        if body is None:
+            return
+
+        from_node = item.get("from_node", "")
+        netting_id = body.get("netting_id", "")
+        their_net = body.get("proposed_net", None)
+        their_receipt_count = body.get("receipt_count", 0)
+        chain_id = body.get("chain_id", "")
+
+        if not netting_id or their_net is None:
+            logger.warning(f"NETTING_RECONCILE_INVALID from={from_node[:16]}")
+            return
+        if not math.isfinite(their_net):
+            logger.warning(f"NETTING_RECONCILE_BAD_NET from={from_node[:16]} net={their_net!r}")
+            return
+
+        # FIX-006: Validate chain_id from initiator
+        expected_chain = node._config.get("blockchain", {}).get("chain", "solana-devnet")
+        if not chain_id or chain_id != expected_chain:
+            logger.warning(
+                f"NETTING_RECONCILE_CHAIN_MISMATCH from={from_node[:16]} "
+                f"got={chain_id!r} expected={expected_chain!r}"
+            )
+            return
+
+        # Resolve our position for this peer
+        from_pubkey = _resolve_public_key(node, from_node)
+        if not from_pubkey:
+            logger.warning(f"NETTING_RECONCILE_UNRESOLVABLE from={from_node[:16]}")
+            return
+
+        our_balance = node.storage.get_ledger_balance(from_pubkey) or 0.0
+        # Our view of what they owe us (positive = they owe us)
+        # their view of what they owe us should be sign-flipped from our balance
+        # If our balance = -42 (they owe us 42), they see +42
+        our_view = -our_balance  # what we say they owe us (positive means they owe us)
+
+        # Tolerance check: allow 5% divergence
+        if abs(their_net) > 0:
+            divergence = abs(their_net - our_view) / max(abs(their_net), 1e-9)
+        else:
+            divergence = abs(our_view)
+
+        if divergence > 0.05:
+            logger.warning(
+                f"NETTING_RECONCILE_MISMATCH from={from_node[:16]} "
+                f"their_net={their_net:.2f} our_view={our_view:.2f} divergence={divergence:.1%}"
+            )
+            return
+
+        # Position matches — send proposal with our wallet as target
+        settlement_amount = abs(our_balance) if our_balance < 0 else abs(our_view)
+        if settlement_amount <= 0:
+            logger.info(f"NETTING_RECONCILE_ZERO from={from_node[:16]} — nothing to settle")
+            return
+
+        # Get our wallet address via punchhole
+        our_wallet = _get_own_wallet_address(node)
+        if not our_wallet:
+            logger.warning(f"NETTING_RECONCILE_NO_WALLET from={from_node[:16]}")
+            return
+
+        import secrets as _secrets
+        from datetime import datetime, timezone, timedelta
+        deadline = (datetime.now(timezone.utc) + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        token_mint = node._config.get("blockchain", {}).get("token_mint", "")
+
+        try:
+            await node._sync.enqueue(
+                to_node=from_node,
+                msg_type="knarr/commerce/netting_proposal",
+                body={
+                    "type": "knarr/commerce/netting_proposal",
+                    "netting_id": netting_id,
+                    "identity": node.node_info.node_id,
+                    "counterparty": from_node,
+                    "settlement_amount": round(settlement_amount, 6),
+                    "chain_id": chain_id,
+                    "token_mint": token_mint,
+                    "target_address": our_wallet,
+                    "deadline": deadline,
+                    "timestamp": time.time(),
+                },
+                system=True,
+            )
+            logger.info(
+                f"NETTING_PROPOSAL_SENT to={from_node[:16]} "
+                f"netting_id={netting_id[:12]} amount={settlement_amount:.2f}"
+            )
+        except Exception as exc:
+            logger.error(f"NETTING_PROPOSAL_SEND_FAIL: {exc}")
+
+    async def handle_netting_proposal(item: dict) -> None:
+        """Step 2b: initiator receives proposal, validates, sends acceptance."""
+        body = _parse_body(item)
+        if body is None:
+            return
+
+        from_node = item.get("from_node", "")
+        netting_id = body.get("netting_id", "")
+        proposal_ref = body.get("receipt_id", netting_id)
+        settlement_amount = body.get("settlement_amount", 0.0)
+        chain_id = body.get("chain_id", "")
+
+        if not netting_id:
+            logger.warning(f"NETTING_PROPOSAL_INVALID from={from_node[:16]}")
+            return
+        if not math.isfinite(settlement_amount) or settlement_amount <= 0:
+            logger.warning(f"NETTING_PROPOSAL_BAD_AMOUNT from={from_node[:16]} amount={settlement_amount!r}")
+            return
+
+        # FIX-006: Chain mismatch rejection — reject empty or mismatched chain_id
+        expected_chain = node._config.get("blockchain", {}).get("chain", "solana-devnet")
+        if not chain_id or chain_id != expected_chain:
+            logger.warning(
+                f"NETTING_PROPOSAL_CHAIN_MISMATCH from={from_node[:16]} "
+                f"got={chain_id!r} expected={expected_chain!r}"
+            )
+            return
+
+        # Get our source wallet
+        our_wallet = _get_own_wallet_address(node)
+        if not our_wallet:
+            logger.warning(f"NETTING_PROPOSAL_NO_WALLET from={from_node[:16]}")
+            return
+
+        # FIX-004/005: Record session before sending acceptance
+        _netting_sessions[netting_id] = {
+            "amount": round(settlement_amount, 6),
+            "counterparty": from_node,
+            "timestamp": time.time(),
+            "consumed": False,
+        }
+        try:
+            await node._sync.enqueue(
+                to_node=from_node,
+                msg_type="knarr/commerce/netting_acceptance",
+                body={
+                    "type": "knarr/commerce/netting_acceptance",
+                    "netting_id": netting_id,
+                    "proposal_ref": proposal_ref,
+                    "identity": node.node_info.node_id,
+                    "counterparty": from_node,
+                    "accepted_amount": round(settlement_amount, 6),
+                    "source_address": our_wallet,
+                    "timestamp": time.time(),
+                },
+                system=True,
+            )
+            logger.info(
+                f"NETTING_ACCEPTANCE_SENT to={from_node[:16]} "
+                f"netting_id={netting_id[:12]} amount={settlement_amount:.2f}"
+            )
+        except Exception as exc:
+            # Clean up session on send failure
+            _netting_sessions.pop(netting_id, None)
+            logger.error(f"NETTING_ACCEPTANCE_SEND_FAIL: {exc}")
+
+    async def handle_netting_acceptance(item: dict) -> None:
+        """Step 3b: counterparty receives acceptance, submits on-chain, sends executed."""
+        body = _parse_body(item)
+        if body is None:
+            return
+
+        from_node = item.get("from_node", "")
+        netting_id = body.get("netting_id", "")
+        proposal_ref = body.get("proposal_ref", "")
+        accepted_amount = body.get("accepted_amount", 0.0)
+        source_address = body.get("source_address", "")
+
+        if not netting_id or not math.isfinite(accepted_amount) or accepted_amount <= 0:
+            logger.warning(f"NETTING_ACCEPTANCE_INVALID from={from_node[:16]}")
+            return
+
+        # FIX-004: Verify this acceptance corresponds to a proposal WE sent
+        session = _netting_sessions.get(netting_id)
+        if not session:
+            logger.warning(
+                f"NETTING_ACCEPTANCE_NO_SESSION from={from_node[:16]} "
+                f"netting_id={netting_id[:12]} — no matching proposal found"
+            )
+            return
+        # FIX-005: Prevent replay — mark session consumed on first use
+        if session.get("consumed"):
+            logger.warning(
+                f"NETTING_ACCEPTANCE_REPLAY from={from_node[:16]} "
+                f"netting_id={netting_id[:12]} — already consumed"
+            )
+            return
+        # Verify counterparty matches
+        if session["counterparty"] != from_node:
+            logger.warning(
+                f"NETTING_ACCEPTANCE_WRONG_PEER from={from_node[:16]} "
+                f"expected={session['counterparty'][:16]}"
+            )
+            return
+        # Verify amount matches what we proposed (within rounding tolerance)
+        if abs(accepted_amount - session["amount"]) > 0.01:
+            logger.warning(
+                f"NETTING_ACCEPTANCE_AMOUNT_MISMATCH from={from_node[:16]} "
+                f"accepted={accepted_amount} expected={session['amount']}"
+            )
+            return
+        # Mark session consumed BEFORE executing (prevents replay during await)
+        session["consumed"] = True
+
+        # Submit on-chain transaction via wallet plugin (if available)
+        tx_hash = "pending"
+        chain_id = node._config.get("blockchain", {}).get("chain", "solana-devnet")
+        try:
+            # Try to submit via solana_rpc_plugin if registered
+            if hasattr(node, 'call_local'):
+                tx_result = await node.call_local(
+                    "solana-rpc",
+                    {"action": "send", "to": source_address, "amount": accepted_amount},
+                )
+                tx_hash = tx_result.get("tx_hash", "pending") if isinstance(tx_result, dict) else "pending"
+        except Exception as exc:
+            logger.warning(f"NETTING_ONCHAIN_SUBMIT_FAIL: {exc} — recording as pending")
+
+        # Send netting_executed to initiator
+        try:
+            await node._sync.enqueue(
+                to_node=from_node,
+                msg_type="knarr/commerce/netting_executed",
+                body={
+                    "type": "knarr/commerce/netting_executed",
+                    "netting_id": netting_id,
+                    "acceptance_ref": proposal_ref,
+                    "identity": node.node_info.node_id,
+                    "counterparty": from_node,
+                    "tx_hash": tx_hash,
+                    "chain_id": chain_id,
+                    "amount": round(accepted_amount, 6),
+                    "timestamp": time.time(),
+                },
+                system=True,
+            )
+            logger.info(
+                f"NETTING_EXECUTED_SENT to={from_node[:16]} "
+                f"netting_id={netting_id[:12]} tx_hash={tx_hash[:16]}"
+            )
+        except Exception as exc:
+            logger.error(f"NETTING_EXECUTED_SEND_FAIL: {exc}")
+
+    async def handle_netting_executed(item: dict) -> None:
+        """Step 4b: initiator receives executed notice, records tx_hash."""
+        body = _parse_body(item)
+        if body is None:
+            return
+
+        from_node = item.get("from_node", "")
+        netting_id = body.get("netting_id", "")
+        tx_hash = body.get("tx_hash", "")
+        amount = body.get("amount", 0.0)
+        chain_id = body.get("chain_id", "")
+
+        if not netting_id or not tx_hash:
+            logger.warning(f"NETTING_EXECUTED_INVALID from={from_node[:16]}")
+            return
+
+        # Record the execution — BCW will confirm independently
+        logger.info(
+            f"NETTING_EXECUTED_RECEIVED from={from_node[:16]} "
+            f"netting_id={netting_id[:12]} tx_hash={tx_hash[:16]} amount={amount}"
+        )
+
+        # Emit bus event for BCW to pick up
+        if node.bus:
+            node.bus.emit(
+                "netting.executed",
+                netting_id=netting_id,
+                tx_hash=tx_hash,
+                chain_id=chain_id,
+                amount=amount,
+                counterparty=from_node,
+                identity=node.node_info.node_id,
+            )
+
     return {
         "knarr/commerce/receipt": handle_receipt,
         "knarr/commerce/credit_note": handle_credit_note,
         "knarr/commerce/settle_request": handle_settle_request,
         "knarr/commerce/settlement_confirmation": handle_settlement_confirmation,
+        # v0.38.0 A5.6: netting exchange handlers
+        "knarr/commerce/netting_reconcile": handle_netting_reconcile,
+        "knarr/commerce/netting_proposal": handle_netting_proposal,
+        "knarr/commerce/netting_acceptance": handle_netting_acceptance,
+        "knarr/commerce/netting_executed": handle_netting_executed,
     }
 
 
@@ -561,5 +853,32 @@ def _resolve_verify_key_by_vm(node, verification_method: str):
             return _resolve_verify_key(node, node_id_part)
     except Exception:
         pass
+
+    return None
+
+
+def _get_own_wallet_address(node) -> str | None:
+    """Get own hot wallet Solana address.
+
+    Tries vault_get first (wallet plugin path), then falls back to
+    node._wallet attribute (legacy).
+    """
+    # Try wallet plugin path via vault
+    try:
+        vault = getattr(node, '_vault', None)
+        if vault and hasattr(vault, 'get'):
+            seed_hex = vault.get("__wallet__", "hot_seed")
+            if seed_hex:
+                from knarr.core.wallet import derive_solana_address
+                from nacl.signing import SigningKey
+                seed = bytes.fromhex(seed_hex)
+                return derive_solana_address(SigningKey(seed))
+    except Exception:
+        pass
+
+    # Fall back to node._wallet (legacy attribute)
+    wallet = getattr(node, '_wallet', None)
+    if wallet and isinstance(wallet, str) and wallet:
+        return wallet
 
     return None

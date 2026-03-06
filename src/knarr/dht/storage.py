@@ -1,4 +1,5 @@
 import json
+import math
 import sqlite3
 import time
 import logging
@@ -1070,20 +1071,42 @@ class Storage:
 
     # Ledger methods
     def get_or_create_ledger_entry(self, peer_public_key: str, initial_balance: float = 0.0, initial_trust: float = 0.3) -> LedgerEntry:
-        """Gets or creates a ledger entry. New entries get initial_balance and initial_trust."""
+        """Gets or creates a ledger entry.
+
+        v0.38.0 A1.2: New entries ALWAYS start at balance=0.0.
+        The initial_balance parameter is accepted for API compatibility but
+        ignored for new entry creation. Existing entries return their stored balance.
+        """
         conn = self._get_conn()
-        cursor = conn.execute(
-            "SELECT peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated "
-            "FROM ledger WHERE peer_public_key = ?", (peer_public_key,)
-        )
-        row = cursor.fetchone()
-        if row:
-            return LedgerEntry(
-                peer_public_key=row[0], balance=row[1],
-                tasks_provided=row[2], tasks_consumed=row[3],
-                first_seen=row[4], last_updated=row[5]
+        # FIX-007: fetch extended columns (prepaid, hard_limit) if they exist
+        try:
+            cursor = conn.execute(
+                "SELECT peer_public_key, balance, tasks_provided, tasks_consumed, "
+                "first_seen, last_updated, prepaid, hard_limit "
+                "FROM ledger WHERE peer_public_key = ?", (peer_public_key,)
             )
-        # Create new entry
+            row = cursor.fetchone()
+            if row:
+                return LedgerEntry(
+                    peer_public_key=row[0], balance=row[1],
+                    tasks_provided=row[2], tasks_consumed=row[3],
+                    first_seen=row[4], last_updated=row[5],
+                    prepaid=row[6], hard_limit=row[7],
+                )
+        except Exception:
+            # Pre-migration DB without extended columns — fall back to base query
+            cursor = conn.execute(
+                "SELECT peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated "
+                "FROM ledger WHERE peer_public_key = ?", (peer_public_key,)
+            )
+            row = cursor.fetchone()
+            if row:
+                return LedgerEntry(
+                    peer_public_key=row[0], balance=row[1],
+                    tasks_provided=row[2], tasks_consumed=row[3],
+                    first_seen=row[4], last_updated=row[5]
+                )
+        # Create new entry — A1.2: always start at 0.0
         now = time.time()
         # Cap ledger size
         count = conn.execute("SELECT COUNT(*) FROM ledger").fetchone()[0]
@@ -1096,18 +1119,79 @@ class Storage:
             """)
         conn.execute(
             "INSERT INTO ledger (peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated, trust) "
-            "VALUES (?, ?, 0, 0, ?, ?, ?)",
-            (peer_public_key, initial_balance, now, now, initial_trust)
+            "VALUES (?, 0.0, 0, 0, ?, ?, ?)",
+            (peer_public_key, now, now, initial_trust)
         )
         conn.commit()
         return LedgerEntry(
-            peer_public_key=peer_public_key, balance=initial_balance,
+            peer_public_key=peer_public_key, balance=0.0,
             tasks_provided=0, tasks_consumed=0, first_seen=now, last_updated=now
         )
 
+    def update_prepaid(self, peer_public_key: str, amount: float) -> None:
+        """A2: Update prepaid balance by delta amount.
+
+        Used at the token/credit boundary for deposits.
+        UPDATE ledger SET prepaid = prepaid + amount.
+        """
+        if not math.isfinite(amount) or amount < 0:
+            raise ValueError(f"update_prepaid: amount must be finite and non-negative, got {amount}")
+        conn = self._get_conn()
+        now = time.time()
+        conn.execute(
+            "UPDATE ledger SET prepaid = prepaid + ?, last_updated = ? "
+            "WHERE peer_public_key = ?",
+            (amount, now, peer_public_key),
+        )
+        conn.commit()
+
+    def run_v038_balance_migration(self, default_soft_limit: float = 3.0) -> int:
+        """A1.1: Apply v0.38.0 balance semantic migration.
+
+        Creates bilateral_positions_v037 backup, then adjusts all balances
+        by subtracting default_soft_limit.  Idempotent: uses a kv_meta
+        marker to track whether migration has already run.
+
+        Returns count of rows updated (0 if already migrated).
+        """
+        conn = self._get_conn()
+        # Ensure kv_meta table exists for migration tracking
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS kv_meta "
+            "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        # Idempotency check: marker present means migration already ran
+        row = conn.execute(
+            "SELECT value FROM kv_meta WHERE key = 'v038_balance_migrated'"
+        ).fetchone()
+        if row:
+            logger.debug("v0.38.0 balance migration already applied — skipping")
+            return 0
+        # Backup
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS bilateral_positions_v037 AS "
+                "SELECT * FROM ledger"
+            )
+        except Exception:
+            pass  # already exists
+        # Transform
+        cur = conn.execute(
+            "UPDATE ledger SET balance = balance - ?",
+            (default_soft_limit,)
+        )
+        # Set migration marker
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('v038_balance_migrated', '1')"
+        )
+        conn.commit()
+        logger.info(f"v0.38.0 balance migration applied: {cur.rowcount} rows shifted by -{default_soft_limit}")
+        return cur.rowcount
+
     def update_ledger_provider(self, peer_public_key: str, price: float):
         """Provider side: consumer spent credit. Decrement their balance, increment tasks_provided."""
-        # print(f"DEBUG: update_ledger_provider key={peer_public_key[:8]}... price={price}")
+        if not math.isfinite(price):
+            raise ValueError(f"update_ledger_provider: price must be finite, got {price}")
         conn = self._get_conn()
         now = time.time()
         cursor = conn.execute("""
@@ -1117,11 +1201,12 @@ class Storage:
                 last_updated = ?
             WHERE peer_public_key = ?
         """, (price, now, peer_public_key))
-        # print(f"DEBUG: updated {cursor.rowcount} rows")
         conn.commit()
 
     def update_ledger_consumer(self, peer_public_key: str, price: float):
         """Consumer side: provider earned credit. Increment their balance, increment tasks_consumed."""
+        if not math.isfinite(price):
+            raise ValueError(f"update_ledger_consumer: price must be finite, got {price}")
         conn = self._get_conn()
         now = time.time()
         conn.execute("""
@@ -1940,37 +2025,6 @@ class Storage:
             (f'%{escaped_key}%',)
         ).fetchone()
         return row is not None
-
-    def get_pending_settlements(self, limit: int = 10) -> list:
-        """Return pending settlement queue items, oldest first."""
-        import json as _json
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT id, item_type, from_node, body, priority, created_at "
-            "FROM settlement_queue WHERE status = 'pending' "
-            "ORDER BY priority DESC, created_at ASC LIMIT ?",
-            (limit,)
-        ).fetchall()
-        result = []
-        for r in rows:
-            try:
-                body = _json.loads(r[3]) if isinstance(r[3], str) else r[3]
-            except (ValueError, TypeError):
-                body = {}
-            result.append({
-                "id": r[0], "item_type": r[1], "from_node": r[2],
-                "body": body, "priority": r[4], "created_at": r[5],
-            })
-        return result
-
-    def mark_settlement_processed(self, queue_id: int, status: str = "processed"):
-        """Mark a settlement queue item as processed or failed."""
-        conn = self._get_conn()
-        conn.execute(
-            "UPDATE settlement_queue SET status = ?, processed_at = ? WHERE id = ?",
-            (status, time.time(), queue_id)
-        )
-        conn.commit()
 
     def _escape_like(self, s: str) -> str:
         """Escape LIKE metacharacters to prevent SQL LIKE injection."""

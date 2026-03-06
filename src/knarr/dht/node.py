@@ -64,12 +64,15 @@ class DHTNode:
                  config: Optional[Dict[str, Any]] = None, ephemeral: bool = False):
         self._main_loop = asyncio.get_event_loop()
         self.storage = Storage(storage_path)
+        economy_cfg = (config or {}).get("economy", {})
+        # v0.38.0 A1.1: Ledger Semantic Migration — shift balances to new zero-origin convention
+        default_soft = float(economy_cfg.get("default_soft_limit", 3.0))
+        self.storage.run_v038_balance_migration(default_soft)
         network_cfg = (config or {}).get("network", {})
         self._pool = ConnectionPool(max_connections=int(network_cfg.get("max_connections", 50)))
         self._connection_idle_timeout = float(network_cfg.get("connection_idle_timeout", 300))
         self._gossip_fanout = int(network_cfg.get("gossip_fanout", 3))
         self._bind_host = host
-        economy_cfg = (config or {}).get("economy", {})
         _soft = float(economy_cfg.get("default_soft_limit", -5.0))
         _hard = float(economy_cfg.get("default_hard_limit", -10.0))
         if not (math.isfinite(_soft) and math.isfinite(_hard)):
@@ -227,7 +230,7 @@ class DHTNode:
 
         # v0.37.0: Warehouse Manager — pre-bus gateway for external documents
         self._warehouse_manager = None
-        if self._config.get("warehouse_manager", {}).get("enabled", True):
+        if self._config.get("warehouse_manager", {}).get("enabled", False):
             from ..core.warehouse_manager import WarehouseManager
             wm_identity = self._build_identity_fragments()
             self._warehouse_manager = WarehouseManager(
@@ -581,7 +584,8 @@ class DHTNode:
 
             receipt_json = None
             credit_note_json = None
-            _note_type = "zero" if skill_price == 0 else "debit"
+            # B1: negative price = bounty → "credit" note (consumer earns)
+            _note_type = "zero" if skill_price == 0 else ("credit" if skill_price < 0 else "debit")
             if billable:
                 # v0.23.0: Execution receipts (old format, backward compat)
                 output_hash = hashlib.sha256(
@@ -635,7 +639,7 @@ class DHTNode:
                     caller_pubkey = getattr(msg, "public_key", "") or ""
                     credit_note_json = _create_credit_note(
                         note_type=_note_type,
-                        amount=float(skill_price),
+                        amount=abs(float(skill_price)),  # B1: credit notes use absolute amount
                         issuer=self._public_key_hex,
                         recipient=caller_pubkey,
                         reference=job_id_for_update,
@@ -652,7 +656,7 @@ class DHTNode:
                         document_type="credit_note",
                         payload={
                             "note_type": _note_type,
-                            "amount": float(skill_price),
+                            "amount": abs(float(skill_price)),  # B1: match credit note (absolute)
                             "currency": "credits",
                             "issuer": self.node_info.node_id,
                             "recipient": caller_pubkey,
@@ -707,7 +711,13 @@ class DHTNode:
             if billable:
                 # v0.33.0: read balance before update for threshold crossing check
                 _old_balance = self.storage.get_ledger_balance(msg.public_key)
-                await self._enqueue_write(self.storage.update_ledger_provider, msg.public_key, skill_price)
+                # v0.38.0 B1: sign-aware credit flow
+                if skill_price >= 0:
+                    # Normal: peer pays us — decrement their balance
+                    await self._enqueue_write(self.storage.update_ledger_provider, msg.public_key, skill_price)
+                else:
+                    # Bounty: we pay peer — increment their balance (they earn)
+                    await self._enqueue_write(self.storage.update_ledger_consumer, msg.public_key, abs(skill_price))
                 _new_balance = self.storage.get_ledger_balance(msg.public_key)
                 # E3: credit.change fires AFTER ledger update
                 self.bus.emit(
@@ -1152,15 +1162,12 @@ class DHTNode:
             self._wallet = self._solana_address
             logger.info(f"Solana wallet: {self._wallet} (auto-derived)")
 
-        # Token config (read-only in 12a)
-        token_cfg = self._config.get("token", {})
-        from ..core.constants import KNARR_MINT
-        # Deprecated: [token] mint config key. Ignored — KNARR_MINT is a protocol constant.
-        old_mint = token_cfg.get("mint", "")
-        if old_mint:
-            logger.warning("Config [token] mint is deprecated and ignored — KNARR_MINT is a protocol constant")
-        self._token_mint = KNARR_MINT
-        self._rpc_url = token_cfg.get("rpc_url", "") or None  # None = use default
+        # v0.38.0 A6: Chain selector — single source for chain config
+        from ..core.chain import get_chain_config
+        self._chain = get_chain_config(self._config)
+        self._token_mint = self._chain["token_mint"]
+        self._rpc_url = self._chain["rpc_url"] or None
+        self._chain_id = self._chain["chain_id"]
         self._token_balance: Optional[float] = None
         self._sol_balance: Optional[float] = None
         self._balance_last_refresh: float = 0.0
@@ -1383,78 +1390,6 @@ class DHTNode:
                     logger.warning(f"WM recovery fail qid={item['id'][:16]}: {exc}")
         except Exception as exc:
             logger.warning(f"WM restart recovery failed: {exc}")
-
-    async def _process_settlement_queue_item(self, item: dict):
-        """v0.37.1: Process a single settlement queue item.
-
-        Reads the netting trigger, calls prepare_settlement, self-signs
-        with cockpit key as authority, then calls execute_settlement.
-        """
-        from ..commerce.settlement_execution import prepare_settlement, execute_settlement
-
-        body = item["body"]
-        peer_key = body.get("peer_public_key", "")
-        amount = body.get("settle_amount", 0.0)
-        utilization = body.get("utilization_pct", 0.0) / 100.0
-        target_util = body.get("target_utilization", 0.0)
-        reason = body.get("reason", "netting_trigger")
-
-        if not peer_key or amount <= 0:
-            logger.warning(f"SETTLEMENT_QUEUE_SKIP id={item['id']}: invalid peer/amount")
-            self.storage.mark_settlement_processed(item["id"], status="skipped")
-            return
-
-        # Get ledger state for this peer
-        entry = self.storage.get_or_create_ledger_entry(peer_key)
-        balance = entry["balance"]
-
-        # Step 1: Prepare (sign with node key)
-        signed_doc = await prepare_settlement(
-            node_id=self.node_info.node_id,
-            peer_key=peer_key,
-            amount=amount,
-            formula=reason,
-            proposer_balance=balance,
-            counterparty_balance_claimed=0.0,
-            utilization=utilization,
-            target_utilization=target_util,
-            signing_key=self._signing_key,
-            storage=self.storage,
-            bus=self.bus,
-        )
-
-        # Step 2: Countersign with cockpit key (self-authority)
-        from ..core.proof import sign_document
-        cockpit_key = getattr(self, "_cockpit_signing_key", None)
-        if cockpit_key is None:
-            logger.warning(f"SETTLEMENT_QUEUE_NO_AUTHORITY id={item['id']}: no cockpit key")
-            self.storage.mark_settlement_processed(item["id"], status="failed")
-            return
-
-        authority_method = f"did:knarr:{self.node_info.node_id}#cockpit-1"
-        payload = {k: v for k, v in signed_doc.items() if k != "proof"}
-        countersigned = sign_document(payload, cockpit_key, authority_method)
-
-        # Step 3: Execute (validate dual sigs, send settle_request mail)
-        async def _mail_fn(to_node, msg_type, body, **kw):
-            await self._sync.enqueue(to_node=to_node, msg_type=msg_type, body=body, system=True)
-
-        await execute_settlement(
-            prepared_doc=signed_doc,
-            countersigned_doc=countersigned,
-            node_verify_key=self._signing_key.verify_key,
-            authority_verify_key=cockpit_key.verify_key,
-            node_id=self.node_info.node_id,
-            signing_key=self._signing_key,
-            peer_key=peer_key,
-            storage=self.storage,
-            send_mail_fn=_mail_fn,
-            bus=self.bus,
-        )
-
-        # Step 4: Mark processed
-        self.storage.mark_settlement_processed(item["id"], status="processed")
-        logger.info(f"SETTLEMENT_QUEUE_DONE id={item['id']} peer={peer_key[:16]} amount={amount:.2f}")
 
     def wm_ingest_external(self, document: dict, originator_pubkey: bytes):
         """Public entry point for external-origin documents through WM.
@@ -1930,7 +1865,8 @@ class DHTNode:
                 skill_sheet=skill_sheet.to_dict(),
                 sidecar_port=self._sidecar_port,
                 encryption_key=self._encryption_key_hex,
-                wallet=self._wallet,
+                # v0.38.0 A3.1: wallet address no longer broadcast — use has_wallet flag
+                has_wallet=bool(getattr(self, '_wallet', '')),
                 provider_host=self.node_info.host,
                 provider_port=self.node_info.port,
                 jurisdiction=self._node_jurisdiction_wire,
@@ -1976,7 +1912,8 @@ class DHTNode:
                 skill_sheet=skill_sheet.to_dict(),
                 sidecar_port=self._sidecar_port,
                 encryption_key=self._encryption_key_hex,
-                wallet=self._wallet,
+                # v0.38.0 A3.1: wallet address no longer broadcast — use has_wallet flag
+                has_wallet=bool(getattr(self, '_wallet', '')),
                 provider_host=self.node_info.host,
                 provider_port=self.node_info.port,
                 jurisdiction=self._node_jurisdiction_wire,
@@ -2495,8 +2432,14 @@ class DHTNode:
                 if resp.status == "completed":
                     _nid = hashlib.sha256(bytes.fromhex(resp.public_key)).hexdigest()
                     _trust = self._get_initial_trust(_nid)
-                    await self._enqueue_write(self.storage.get_or_create_ledger_entry, resp.public_key, self.policy.initial_credit, _trust)
-                    await self._enqueue_write(self.storage.update_ledger_consumer, resp.public_key, skill_price)
+                    # v0.38.0 A1.3: new entries start at 0.0 (not initial_credit)
+                    await self._enqueue_write(self.storage.get_or_create_ledger_entry, resp.public_key, 0.0, _trust)
+                    # v0.38.0 B1: sign-aware consumer credit flow
+                    if skill_price >= 0:
+                        await self._enqueue_write(self.storage.update_ledger_consumer, resp.public_key, skill_price)
+                    else:
+                        # Bounty: provider pays us — increment our own position
+                        await self._enqueue_write(self.storage.update_ledger_provider, resp.public_key, abs(skill_price))
                     # E3: credit.change fires after ledger update (sync path)
                     if self.bus:
                         self.bus.emit(
@@ -2525,9 +2468,11 @@ class DHTNode:
                         )
                         await self._enqueue_write(self.storage.store_receipt, task_id, receipt_json)
                         
+                        # B1: negative price = bounty → "credit" note (consumer earns)
+                        _note_type_sync = "zero" if skill_price == 0 else ("credit" if skill_price < 0 else "debit")
                         credit_note_json = _create_credit_note(
-                            note_type="debit" if skill_price > 0 else "zero",
-                            amount=float(skill_price),
+                            note_type=_note_type_sync,
+                            amount=abs(float(skill_price)),  # B1: credit notes use absolute amount
                             issuer=self._public_key_hex,
                             recipient=resp.public_key,
                             reference=task_id,
@@ -2569,7 +2514,7 @@ class DHTNode:
                             document_type="credit_note",
                             payload={
                                 "note_type": _note_type_sync,
-                                "amount": float(skill_price),
+                                "amount": abs(float(skill_price)),  # B1: match credit note (absolute)
                                 "currency": "credits",
                                 "issuer": self.node_info.node_id,
                                 "recipient": resp.public_key,
@@ -2621,8 +2566,13 @@ class DHTNode:
                             )
                             _nid2 = hashlib.sha256(bytes.fromhex(result.public_key)).hexdigest()
                             _trust2 = self._get_initial_trust(_nid2)
-                            await self._enqueue_write(self.storage.get_or_create_ledger_entry, result.public_key, self.policy.initial_credit, _trust2)
-                            await self._enqueue_write(self.storage.update_ledger_consumer, result.public_key, skill_price)
+                            # v0.38.0 A1.3: new entries start at 0.0 (not initial_credit)
+                            await self._enqueue_write(self.storage.get_or_create_ledger_entry, result.public_key, 0.0, _trust2)
+                            # v0.38.0 B1: sign-aware consumer credit flow
+                            if skill_price >= 0:
+                                await self._enqueue_write(self.storage.update_ledger_consumer, result.public_key, skill_price)
+                            else:
+                                await self._enqueue_write(self.storage.update_ledger_provider, result.public_key, abs(skill_price))
                             # E3: credit.change fires after ledger update (sync queued path)
                             if self.bus:
                                 self.bus.emit(
@@ -3315,45 +3265,60 @@ class DHTNode:
         initial_credit, min_balance = self._resolve_policy(msg.public_key, skill_name)
         peer_nid = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
         initial_trust = self._get_initial_trust(peer_nid)
+        # v0.38.0 A1.3: new entries start at 0.0 (not initial_credit)
         entry = await self._enqueue_write(
             self.storage.get_or_create_ledger_entry,
-            msg.public_key, initial_credit, initial_trust
+            msg.public_key, 0.0, initial_trust
         )
 
         # v0.25.0: Commerce Tab Reminder
         await self._maybe_send_tab_reminder(msg.public_key, entry.balance, initial_credit, min_balance)
 
-        # E2: Skip credit check for free skills — no balance impact
-        skill_price = skill_sheet.price if skill_sheet else 1.0
-        if not self.policy.tit_for_tat and skill_price > 0 and entry.balance < min_balance:
-            logger.debug(f"INSUFFICIENT_CREDIT: skill={skill_name} from={msg.public_key[:16]} balance={entry.balance:.1f}")
-            # v0.33.0: credit.sanctioned — hard limit block
-            if self.bus:
-                self.bus.emit("credit.sanctioned", counterparty=msg.public_key, limit_type="hard", identity=msg.public_key)
-            self._emit_task_rejected(skill_name, msg.public_key, msg.task_id, "INSUFFICIENT_CREDIT")
-            return self._sign(TaskResult(
-                task_id=msg.task_id,
-                status="failed",
-                error={"code": "INSUFFICIENT_CREDIT",
-                       "message": f"Balance {entry.balance:.1f} below minimum {min_balance:.1f}"}
-            ))
+        # v0.38.0 A1.4: Admission check using effective_balance = balance + prepaid
+        # v0.38.0 FIX: Skip economy gate for self-calls (issue #18)
+        is_self_call = peer_nid == self.node_info.node_id
+        skill_price_for_admission = skill_sheet.price if skill_sheet else 1.0
+        if not is_self_call and skill_price_for_admission >= 0:
+            # Normal positive-price skill: check effective credit
+            entry_prepaid = getattr(entry, 'prepaid', 0.0)
+            effective_balance = entry.balance + entry_prepaid
+            hard_limit = getattr(entry, 'hard_limit', min_balance)
+            if not self.policy.tit_for_tat and skill_price_for_admission > 0 and effective_balance - skill_price_for_admission < hard_limit:
+                logger.debug(
+                    f"INSUFFICIENT_CREDIT (effective): skill={skill_name} from={msg.public_key[:16]} "
+                    f"balance={entry.balance:.1f} prepaid={entry_prepaid:.1f} "
+                    f"effective={effective_balance:.1f} hard_limit={hard_limit:.1f}"
+                )
+                if self.bus:
+                    self.bus.emit("credit.sanctioned", counterparty=msg.public_key, limit_type="hard", identity=msg.public_key)
+                self._emit_task_rejected(skill_name, msg.public_key, msg.task_id, "INSUFFICIENT_CREDIT")
+                return self._sign(TaskResult(
+                    task_id=msg.task_id,
+                    status="failed",
+                    error={"code": "INSUFFICIENT_CREDIT",
+                           "message": f"Effective balance {effective_balance:.1f} below hard_limit {hard_limit:.1f}"}
+                ))
+        # B1: Negative price (bounty) — skip admission check, peer is earning
+        # (handled below in credit flow logic)
+
+        # v0.38.0: Stale balance-only check removed — effective_balance check above handles all cases
 
         # Compute dedup hash (H18/H19)
-        caller_node_id = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
+        caller_node_id = peer_nid  # already sha256(public_key) from line above
 
         # v0.36.0 A1: Local skill fast path
         # When caller == self, skip async queue and call handler directly
-        # MUST still write receipts, emit bus events, check admission gate, respect max_concurrent
-        is_local_call = caller_node_id == self.node_info.node_id
+        # MUST still write receipts, emit bus events, respect max_concurrent
+        is_local_call = is_self_call
 
         canonical = json.dumps(msg.input_data, sort_keys=True, separators=(',', ':'))
         input_hash = hashlib.sha256(
             f"{msg.skill_name}:{canonical}:{caller_node_id}".encode()
         ).hexdigest()[:32]
 
-        # Check for existing job (poll/dedup) — only dedup active jobs
+        # Check for existing job (poll/dedup)
         existing = self.storage.get_async_job_by_hash(input_hash)
-        if existing and existing["status"] not in ("failed", "rejected", "completed"):
+        if existing:
             return self._sign(TaskStatus(
                 task_id=existing["job_id"],
                 status=existing["status"],
@@ -3851,6 +3816,9 @@ class DHTNode:
                     credits_charged = 0.0
                 else:
                     credits_charged = float(cn.get("amount", 0.0))
+                    # B1: "credit" note = bounty — consumer earned, negate for ledger direction
+                    if cn.get("note_type") == "credit":
+                        credits_charged = -credits_charged
                     if not provider_pubkey:
                         provider_pubkey = cn.get("issuer", "")
                     # Store consumer's copy (receipt before bus)
@@ -3884,14 +3852,16 @@ class DHTNode:
                 pass
 
         # Consumer-side ledger update (applies regardless of credit_note format)
-        if credits_charged > 0 and math.isfinite(credits_charged) and credits_charged <= 1_000_000:
+        # B1: credits_charged < 0 for bounties (consumer earned)
+        if credits_charged != 0 and math.isfinite(credits_charged) and abs(credits_charged) <= 1_000_000:
             if provider_pubkey:
                 try:
                     _nid = hashlib.sha256(bytes.fromhex(provider_pubkey)).hexdigest()
                     _trust = self._get_initial_trust(_nid)
+                    # v0.38.0 A1.3: new entries start at 0.0 (not initial_credit)
                     await self._enqueue_write(
                         self.storage.get_or_create_ledger_entry,
-                        provider_pubkey, self.policy.initial_credit, _trust
+                        provider_pubkey, 0.0, _trust
                     )
                     await self._enqueue_write(
                         self.storage.update_ledger_consumer,
@@ -4727,18 +4697,6 @@ class DHTNode:
                 self._last_netting = time.time()
             except Exception as e:
                 logger.error(f"Netting cycle failed: {e}")
-
-        # v0.37.1: Process pending settlement queue items
-        try:
-            pending = self.storage.get_pending_settlements(limit=5)
-            for item in pending:
-                try:
-                    await self._process_settlement_queue_item(item)
-                except Exception as e:
-                    logger.warning(f"SETTLEMENT_QUEUE_FAIL id={item['id']}: {e}")
-                    self.storage.mark_settlement_processed(item["id"], status="failed")
-        except Exception as e:
-            logger.debug(f"Settlement queue check failed: {e}")
 
         # Selective heartbeat based on peer activity
         now = time.monotonic()

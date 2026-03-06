@@ -77,6 +77,16 @@ class CockpitServer:
         self._exposures = self._build_exposure_index(exposures or {})
         self._rate_limits: Dict[str, Dict[str, list]] = {}  # path -> {ip: [timestamps]}
         self._token_counters: Dict[str, Dict[str, dict]] = {}  # path -> {token: {count, day}}
+        # v0.38.0 A3.2: Wallet HMAC auth + spending caps
+        self._wallet_daily_spent: float = 0.0
+        self._wallet_daily_reset: float = time.time()
+        # FIX-002: HMAC replay guard — track seen signatures within timestamp window
+        self._seen_wallet_sigs: dict = {}  # {sig_hex: expiry_time}
+        self._sig_sweep_interval: float = 60.0
+        self._last_sig_sweep: float = time.time()
+        # FIX-003: Spend cap lock to prevent TOCTOU race
+        import asyncio as _asyncio
+        self._wallet_send_lock = _asyncio.Lock()
 
     @property
     def port(self) -> int:
@@ -468,6 +478,14 @@ class CockpitServer:
                         await self._handle_positions(writer)
                     elif path == "/api/settlements":
                         await self._handle_settlements(writer, query)
+                    # v0.38.0 A3.3: Wallet read endpoints (bearer auth only)
+                    elif path == "/api/wallet/balance":
+                        await self._handle_wallet_balance(writer)
+                    elif path == "/api/wallet/address":
+                        await self._handle_wallet_address(writer)
+                    # v0.38.0 A5.4: Netting query endpoint
+                    elif path == "/api/netting/query":
+                        await self._handle_netting_query(writer, query)
                     else:
                         try:
                             content, content_type = self._serve_static(path)
@@ -535,6 +553,9 @@ class CockpitServer:
                     elif path.startswith("/api/settle/"):
                         peer_key = path[len("/api/settle/"):]
                         await self._handle_manual_settle(writer, peer_key)
+                    # v0.38.0 A3.3: Wallet send (bearer + HMAC required)
+                    elif path == "/api/wallet/send":
+                        await self._handle_wallet_send(writer, body, headers)
                     else:
                         self._respond_404(writer)
                 elif method == "PUT":
@@ -1935,6 +1956,113 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
                 _bus.emit("security.auth_failed", source_ip=(source_ip or "")[:20], endpoint=(endpoint or "")[:40])
         return result
 
+    def _check_wallet_auth(
+        self, method: str, path: str, body: bytes | str, headers: dict
+    ) -> bool:
+        """v0.38.0 A3.2: HMAC authentication for wallet write operations.
+
+        Verifies X-Wallet-Signature header using:
+            HMAC-SHA256(send_secret, timestamp + "\\n" + method + "\\n" + path + "\\n" + body)
+
+        Also verifies X-Wallet-Timestamp is within ±30 seconds.
+        """
+        import hashlib as _hashlib
+        wallet_cfg = self._node._config.get("cockpit", {}).get("wallet", {})
+        send_secret = wallet_cfg.get("send_secret", "")
+        if not send_secret:
+            # No secret configured — reject all wallet write requests
+            logger.warning("WALLET_AUTH_FAIL: send_secret not configured")
+            return False
+
+        timestamp_window = int(wallet_cfg.get("timestamp_window_seconds", 30))
+
+        # Get and validate timestamp
+        ts_header = headers.get("x-wallet-timestamp", "")
+        if not ts_header:
+            logger.warning("WALLET_AUTH_FAIL: missing X-Wallet-Timestamp")
+            return False
+        try:
+            ts = int(ts_header)
+        except (ValueError, TypeError):
+            logger.warning(f"WALLET_AUTH_FAIL: unparseable timestamp {ts_header!r}")
+            return False
+
+        if abs(time.time() - ts) > timestamp_window:
+            logger.warning(
+                f"WALLET_AUTH_FAIL: timestamp {ts} outside window "
+                f"(now={int(time.time())} window={timestamp_window}s)"
+            )
+            return False
+
+        # Get signature from header
+        sig_header = headers.get("x-wallet-signature", "")
+        if not sig_header:
+            logger.warning("WALLET_AUTH_FAIL: missing X-Wallet-Signature")
+            return False
+
+        # Build body string for signing
+        if isinstance(body, bytes):
+            body_str = body.decode("utf-8", errors="replace")
+        else:
+            body_str = body or ""
+
+        # Compute expected HMAC
+        msg = f"{ts}\n{method}\n{path}\n{body_str}"
+        expected_sig = hmac.new(
+            send_secret.encode("utf-8"),
+            msg.encode("utf-8"),
+            _hashlib.sha256,
+        ).hexdigest()
+
+        # Constant-time compare
+        if not hmac.compare_digest(sig_header.encode(), expected_sig.encode()):
+            logger.warning("WALLET_AUTH_FAIL: signature mismatch")
+            return False
+
+        # FIX-002: Replay guard — reject duplicate (timestamp, signature) tuples
+        sig_key = f"{ts}:{sig_header}"
+        now_replay = time.time()
+        if sig_key in self._seen_wallet_sigs:
+            logger.warning("WALLET_AUTH_FAIL: replayed signature")
+            return False
+        # Record signature with expiry (window + margin)
+        self._seen_wallet_sigs[sig_key] = now_replay + timestamp_window + 5
+        # Periodic sweep of expired entries
+        if now_replay - self._last_sig_sweep > self._sig_sweep_interval:
+            self._seen_wallet_sigs = {
+                k: v for k, v in self._seen_wallet_sigs.items() if v > now_replay
+            }
+            self._last_sig_sweep = now_replay
+
+        return True
+
+    def _check_wallet_spend_cap(self, amount: float) -> tuple[bool, str]:
+        """v0.38.0 A3.3: Check per-tx and daily spending caps.
+
+        Returns (allowed, reason).
+        """
+        wallet_cfg = self._node._config.get("cockpit", {}).get("wallet", {})
+        max_per_tx = float(wallet_cfg.get("max_per_tx", 100.0))
+        max_daily = float(wallet_cfg.get("max_daily", 1000.0))
+
+        # Per-tx cap
+        if amount > max_per_tx:
+            return False, f"amount {amount} exceeds per-tx cap {max_per_tx}"
+
+        # Daily rolling cap: reset if > 24h since last reset
+        now = time.time()
+        if now - self._wallet_daily_reset > 86400:
+            self._wallet_daily_spent = 0.0
+            self._wallet_daily_reset = now
+
+        if self._wallet_daily_spent + amount > max_daily:
+            return False, (
+                f"daily cap exceeded: spent={self._wallet_daily_spent:.2f} "
+                f"+ requested={amount:.2f} > max={max_daily:.2f}"
+            )
+
+        return True, ""
+
     def _serve_static(self, path: str) -> tuple[bytes, str]:
         """Returns (content_bytes, content_type). Raises FileNotFoundError."""
         if path == "/" or path == "" or path == "/index.html":
@@ -2196,6 +2324,141 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
         except Exception as e:
             logger.error(f"Receipt fetch error ref={reference}: {e}")
             self._respond_error(writer, 500, "Internal error")
+
+    # ── v0.38.0: Wallet API endpoints ──────────────────────────────────────
+
+    async def _handle_wallet_balance(self, writer) -> None:
+        """GET /api/wallet/balance — return hot wallet token + SOL balance.
+
+        Bearer auth only (read). No HMAC required.
+        """
+        try:
+            # Try to fetch via solana-rpc skill
+            result = {}
+            try:
+                res = await self._node.call_local("solana-rpc", {"action": "get_balance"})
+                if isinstance(res, dict):
+                    result = res
+            except Exception:
+                pass
+            self._respond_json(writer, {
+                "status": "ok",
+                "token_balance": result.get("token_balance", 0.0),
+                "sol_balance": result.get("sol_balance", 0.0),
+                "address": result.get("address", ""),
+            })
+        except Exception as exc:
+            self._respond_error(writer, 500, str(exc))
+
+    async def _handle_wallet_address(self, writer) -> None:
+        """GET /api/wallet/address — return hot wallet address.
+
+        Bearer auth only (read). No HMAC required.
+        """
+        try:
+            vault = getattr(self._node, '_vault', None)
+            address = ""
+            if vault and hasattr(vault, 'get'):
+                seed_hex = vault.get("__wallet__", "hot_seed")
+                if seed_hex:
+                    from knarr.core.wallet import derive_solana_address
+                    from nacl.signing import SigningKey
+                    seed = bytes.fromhex(seed_hex)
+                    address = derive_solana_address(SigningKey(seed))
+            if not address:
+                address = getattr(self._node, '_wallet', '') or ""
+            self._respond_json(writer, {"status": "ok", "address": address})
+        except Exception as exc:
+            self._respond_error(writer, 500, str(exc))
+
+    async def _handle_wallet_send(self, writer, body: bytes, headers: dict) -> None:
+        """POST /api/wallet/send — submit a token transfer.
+
+        Requires bearer token + HMAC signature. Enforces per-tx and daily caps.
+        """
+        import math as _math
+
+        # HMAC auth check (mandatory — bearer alone is not sufficient)
+        if not self._check_wallet_auth("POST", "/api/wallet/send", body, headers):
+            self._respond_error(writer, 401, "WALLET_AUTH_FAILED")
+            return
+
+        try:
+            data = json.loads(body)
+        except Exception:
+            self._respond_error(writer, 400, "Invalid JSON body")
+            return
+
+        to_address = data.get("to", "")
+        amount_raw = data.get("amount", 0)
+
+        try:
+            amount = float(amount_raw)
+        except (TypeError, ValueError):
+            self._respond_error(writer, 400, "amount must be numeric")
+            return
+
+        if not _math.isfinite(amount) or amount <= 0:
+            self._respond_error(writer, 400, f"amount must be positive finite, got {amount!r}")
+            return
+
+        if not isinstance(to_address, str) or not to_address:
+            self._respond_error(writer, 400, "to must be non-empty string")
+            return
+
+        # FIX-003: Atomic spend cap check + send under lock to prevent TOCTOU
+        async with self._wallet_send_lock:
+            # Spending cap check
+            allowed, cap_reason = self._check_wallet_spend_cap(amount)
+            if not allowed:
+                self._respond_error(writer, 403, f"SPEND_CAP_EXCEEDED: {cap_reason}")
+                return
+
+            # Pre-reserve spend before yielding to send
+            self._wallet_daily_spent += amount
+
+        # Submit transaction (outside lock to avoid holding during RPC)
+        try:
+            tx_result = await self._node.call_local(
+                "solana-rpc",
+                {"action": "send", "to": to_address, "amount": amount},
+            )
+            if isinstance(tx_result, dict) and not tx_result.get("error"):
+                self._respond_json(writer, {"status": "ok", "tx_hash": tx_result.get("tx_hash", ""), "amount": amount})
+            else:
+                # Refund the pre-reserved amount on failure
+                self._wallet_daily_spent -= amount
+                self._respond_error(writer, 500, f"TX_FAILED: {tx_result}")
+        except Exception as exc:
+            # Refund the pre-reserved amount on exception
+            self._wallet_daily_spent -= amount
+            self._respond_error(writer, 500, f"TX_ERROR: {exc}")
+
+    # ── v0.38.0: Netting query endpoint ─────────────────────────────────────
+
+    async def _handle_netting_query(self, writer, query: dict) -> None:
+        """GET /api/netting/query?scope=book&raw=false
+
+        Returns settlement positions or proposals depending on raw flag.
+        """
+        scope = query.get("scope", ["book"])[0] if isinstance(query.get("scope"), list) else query.get("scope", "book")
+        raw_str = query.get("raw", ["false"])[0] if isinstance(query.get("raw"), list) else query.get("raw", "false")
+        raw = raw_str.lower() in ("true", "1", "yes")
+        target = query.get("target", [None])[0] if isinstance(query.get("target"), list) else query.get("target")
+
+        try:
+            from knarr.commerce.netting_query import query as nq_query
+            results = nq_query(
+                storage=self._node.storage,
+                scope=scope,
+                target=target,
+                raw=raw,
+                config=getattr(self._node, '_config', {}),
+                resolve_policy_fn=getattr(self._node, '_resolve_policy', None),
+            )
+            self._respond_json(writer, {"status": "ok", "scope": scope, "raw": raw, "results": results})
+        except Exception as exc:
+            self._respond_error(writer, 500, str(exc))
 
     # ── v0.36.0: Settlement cockpit endpoints ──────────────────────────────
 

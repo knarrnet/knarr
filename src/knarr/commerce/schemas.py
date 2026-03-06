@@ -223,3 +223,82 @@ def validate_cache_object(body: dict) -> tuple[bool, str | None]:
     if not isinstance(body.get("granularity"), dict):
         return False, "granularity must be dict"
     return True, None
+
+
+# ── v0.38.0: Netting Document Validators (A5.2) ───────────────────────
+
+
+def validate_netting_reconcile(body: dict) -> tuple[bool, str | None]:
+    """Validate a netting_reconcile document body."""
+    for field in ["netting_id", "identity", "counterparty",
+                  "proposed_net", "receipt_count", "chain_id"]:
+        if field not in body:
+            return False, f"missing required field: {field}"
+    if not isinstance(body.get("netting_id"), str) or not body["netting_id"]:
+        return False, "netting_id must be non-empty string"
+    if not isinstance(body.get("chain_id"), str) or not body["chain_id"]:
+        return False, "chain_id must be non-empty string"
+    if not _is_finite(body.get("proposed_net", float("nan"))):
+        return False, f"proposed_net must be finite number, got {body.get('proposed_net')!r}"
+    if not isinstance(body.get("receipt_count"), int) or isinstance(body.get("receipt_count"), bool):
+        return False, f"receipt_count must be int, got {type(body.get('receipt_count')).__name__}"
+    if body["receipt_count"] < 0:
+        return False, f"receipt_count must be >= 0, got {body['receipt_count']}"
+    return True, None
+
+
+def validate_netting_proposal(body: dict) -> tuple[bool, str | None]:
+    """Validate a netting_proposal document body."""
+    for field in ["netting_id", "identity", "counterparty",
+                  "settlement_amount", "chain_id", "token_mint",
+                  "target_address", "deadline"]:
+        if field not in body:
+            return False, f"missing required field: {field}"
+    if not isinstance(body.get("netting_id"), str) or not body["netting_id"]:
+        return False, "netting_id must be non-empty string"
+    if not isinstance(body.get("chain_id"), str) or not body["chain_id"]:
+        return False, "chain_id must be non-empty string"
+    if not isinstance(body.get("target_address"), str) or not body["target_address"]:
+        return False, "target_address must be non-empty string"
+    if not isinstance(body.get("deadline"), str) or not body["deadline"]:
+        return False, "deadline must be non-empty string"
+    amt = body.get("settlement_amount")
+    if not _is_finite(amt) or amt <= 0:
+        return False, f"settlement_amount must be positive finite, got {amt!r}"
+    return True, None
+
+
+def validate_netting_acceptance(body: dict) -> tuple[bool, str | None]:
+    """Validate a netting_acceptance document body."""
+    for field in ["netting_id", "proposal_ref", "identity", "counterparty",
+                  "accepted_amount", "source_address"]:
+        if field not in body:
+            return False, f"missing required field: {field}"
+    if not isinstance(body.get("netting_id"), str) or not body["netting_id"]:
+        return False, "netting_id must be non-empty string"
+    if not isinstance(body.get("proposal_ref"), str) or not body["proposal_ref"]:
+        return False, "proposal_ref must be non-empty string"
+    if not isinstance(body.get("source_address"), str) or not body["source_address"]:
+        return False, "source_address must be non-empty string"
+    amt = body.get("accepted_amount")
+    if not _is_finite(amt) or amt <= 0:
+        return False, f"accepted_amount must be positive finite, got {amt!r}"
+    return True, None
+
+
+def validate_netting_executed(body: dict) -> tuple[bool, str | None]:
+    """Validate a netting_executed document body."""
+    for field in ["netting_id", "acceptance_ref", "identity", "counterparty",
+                  "tx_hash", "chain_id", "amount"]:
+        if field not in body:
+            return False, f"missing required field: {field}"
+    if not isinstance(body.get("netting_id"), str) or not body["netting_id"]:
+        return False, "netting_id must be non-empty string"
+    if not isinstance(body.get("tx_hash"), str) or not body["tx_hash"]:
+        return False, "tx_hash must be non-empty string"
+    if not isinstance(body.get("chain_id"), str) or not body["chain_id"]:
+        return False, "chain_id must be non-empty string"
+    amt = body.get("amount")
+    if not _is_finite(amt) or amt <= 0:
+        return False, f"amount must be positive finite, got {amt!r}"
+    return True, None

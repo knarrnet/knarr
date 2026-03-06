@@ -72,3 +72,69 @@ def run_netting_cycle(node) -> int:
     if queued:
         logger.info(f"NETTING_CYCLE queued={queued} settlements")
     return queued
+
+
+async def initiate_netting(node, peer_key: str, chain_config: dict) -> bool:
+    """A5.6: Initiate a netting exchange with a specific peer.
+
+    Step 1 of the 5-step netting protocol: send netting_reconcile message.
+
+    Args:
+        node:         The KnarrNode instance.
+        peer_key:     Peer public key (hex).
+        chain_config: Chain config dict from get_chain_config().
+
+    Returns:
+        True if reconcile was sent successfully.
+    """
+    import secrets as _secrets
+
+    balance = node.storage.get_ledger_balance(peer_key) or 0.0
+    if balance == 0.0:
+        logger.info(f"NETTING_INITIATE_SKIP peer={peer_key[:16]} balance=0.0")
+        return False
+
+    # Count receipts for this peer (approximate via tasks provided+consumed)
+    entries = node.storage.get_all_ledger_entries()
+    receipt_count = 0
+    for e in entries:
+        if e.get("peer_public_key") == peer_key:
+            receipt_count = e.get("tasks_provided", 0) + e.get("tasks_consumed", 0)
+            break
+
+    # netting_id is a unique per-session ID
+    netting_id = _secrets.token_hex(16)
+    chain_id = chain_config.get("chain_id", "solana-devnet")
+
+    # proposed_net: what WE say THEY owe us (sign: positive = they owe us)
+    # Our balance is negative when they owe us → proposed_net = -balance
+    proposed_net = -balance
+
+    # Resolve counterparty node_id (SHA-256 of peer_key)
+    import hashlib as _hashlib
+    counterparty_node_id = _hashlib.sha256(bytes.fromhex(peer_key)).hexdigest()
+
+    try:
+        await node._sync.enqueue(
+            to_node=counterparty_node_id,
+            msg_type="knarr/commerce/netting_reconcile",
+            body={
+                "type": "knarr/commerce/netting_reconcile",
+                "netting_id": netting_id,
+                "identity": node.node_info.node_id,
+                "counterparty": counterparty_node_id,
+                "proposed_net": round(proposed_net, 6),
+                "receipt_count": receipt_count,
+                "chain_id": chain_id,
+                "timestamp": time.time(),
+            },
+            system=True,
+        )
+        logger.info(
+            f"NETTING_RECONCILE_SENT to={counterparty_node_id[:16]} "
+            f"netting_id={netting_id[:12]} proposed_net={proposed_net:.2f}"
+        )
+        return True
+    except Exception as exc:
+        logger.error(f"NETTING_INITIATE_FAIL peer={peer_key[:16]}: {exc}")
+        return False

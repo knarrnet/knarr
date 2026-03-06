@@ -98,22 +98,26 @@ def get_economy_summary(ledger_entries: List[Dict[str, Any]]) -> EconomySummary:
 
 
 def peer_economy_from_row(row: Dict[str, Any]) -> PeerEconomy:
-    """Convert a raw ledger row to a PeerEconomy dataclass."""
+    """Convert a raw ledger row to a PeerEconomy dataclass.
+
+    v0.38.0 A1.3: Updated utilization formula.
+    Utilization = how much of the negative (debt) range is used.
+    0% = no debt, 100% = at hard_limit.
+    """
+    import math
     balance = row.get("balance", 0.0) or 0.0
     credit_limit = row.get("credit_limit", 3.0) or 3.0
     soft_limit = row.get("soft_limit", -5.0) or -5.0
+    hard_limit = row.get("hard_limit", -10.0) or -10.0
 
-    # Utilization: how much of the credit range (credit_limit to soft_limit) is used
-    credit_range = credit_limit - soft_limit
-    if credit_range <= 0:
-        if credit_limit < soft_limit:
-            logger.warning(
-                f"ECONOMY_INVERTED_LIMITS peer={row.get('peer_public_key', '?')[:16]} "
-                f"credit_limit={credit_limit} < soft_limit={soft_limit}"
-            )
-    if credit_range > 0:
-        utilization = ((credit_limit - balance) / credit_range) * 100.0
+    # A1.3: new utilization formula — how much of the negative range is consumed
+    # 0% = balance >= 0 (no debt), 100% = balance == hard_limit
+    if hard_limit < 0:
+        utilization = (abs(min(balance, 0.0)) / abs(hard_limit)) * 100.0
     else:
+        utilization = 0.0
+
+    if not math.isfinite(utilization):
         utilization = 0.0
 
     return PeerEconomy(
@@ -122,7 +126,7 @@ def peer_economy_from_row(row: Dict[str, Any]) -> PeerEconomy:
         prepaid=row.get("prepaid", 0.0),
         pub_tab=row.get("pub_tab", 0.0),
         soft_limit=soft_limit,
-        hard_limit=row.get("hard_limit", -10.0),
+        hard_limit=hard_limit,
         credit_limit=credit_limit,
         tasks_provided=row.get("tasks_provided", 0),
         tasks_consumed=row.get("tasks_consumed", 0),

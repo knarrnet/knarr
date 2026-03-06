@@ -69,6 +69,11 @@ def _get_schema_validators() -> dict:
         validate_configuration_order,
         validate_punchhole_card,
         validate_cache_object,
+        # v0.38.0: netting types
+        validate_netting_reconcile,
+        validate_netting_proposal,
+        validate_netting_acceptance,
+        validate_netting_executed,
     )
     return {
         "credit_note": validate_credit_note,
@@ -88,6 +93,11 @@ def _get_schema_validators() -> dict:
         "configuration_order": validate_configuration_order,
         "punchhole_card": validate_punchhole_card,
         "cache_object": validate_cache_object,
+        # v0.38.0: netting types
+        "netting_reconcile": validate_netting_reconcile,
+        "netting_proposal": validate_netting_proposal,
+        "netting_acceptance": validate_netting_acceptance,
+        "netting_executed": validate_netting_executed,
     }
 
 
@@ -107,6 +117,11 @@ _DEFAULT_RULES = {
     "configuration_order":      {"gates": [1, 2, 3, 4, 5], "action": "hold_for_review"},
     "punchhole_card":           {"gates": [1, 3, 4], "action": "auto_promote"},
     "cache_object":             {"gates": [1, 3, 4], "action": "auto_promote"},
+    # v0.38.0: netting types (A5.3)
+    "netting_reconcile":        {"gates": [1, 2, 3, 4], "action": "auto_promote"},
+    "netting_proposal":         {"gates": [1, 2, 3, 4, 5], "action": "hold_for_review"},
+    "netting_acceptance":       {"gates": [1, 2, 3, 4, 5], "action": "hold_for_review"},
+    "netting_executed":         {"gates": [1, 2, 3, 4], "action": "auto_promote"},
     "_default":                 {"gates": [1, 2, 3, 4], "action": "hold_for_review"},
 }
 
