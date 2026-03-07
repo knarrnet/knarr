@@ -26,7 +26,7 @@ class JoinRequest(Message):
     ephemeral: bool = False
     type: str = "JOIN_REQUEST"
 
-SIGNATURE_EXCLUDED_FIELDS = {"signature", "hops", "ephemeral", "load", "sidecar_port", "version", "min_protocol_version", "mode", "peer_count", "batch_seq", "encryption_key", "receipt", "provider_host", "provider_port", "wallet", "has_wallet", "jurisdiction"}
+SIGNATURE_EXCLUDED_FIELDS = {"signature", "hops", "ephemeral", "load", "sidecar_port", "version", "min_protocol_version", "mode", "peer_count", "batch_seq", "encryption_key", "receipt", "provider_host", "provider_port", "wallet", "jurisdiction"}
 
 @dataclass(frozen=True)
 class JoinResponse(Message):
@@ -36,20 +36,14 @@ class JoinResponse(Message):
 
 @dataclass(frozen=True)
 class Announce(Message):
-    """Announce a skill to peers.
-
-    v0.38.0 A3.1: wallet field replaced by has_wallet boolean.
-    Wallet address is no longer broadcast in the DHT — it is served via
-    the punchhole wallet.address object (peer-tier access).
-    """
+    """Announce a skill to peers."""
     node_id: str = ""
     skill_key: str = ""
     skill_sheet: Dict[str, Any] = field(default_factory=dict)
     hops: int = 0
     sidecar_port: int = 0  # 0 = no sidecar available
     encryption_key: str = ""
-    wallet: str = ""              # DEPRECATED v0.38.0 — kept for wire compatibility
-    has_wallet: bool = False      # v0.38.0: True if node has a hot wallet
+    wallet: str = ""              # NEW: Solana monitoring address (Tier 1, base58)
     provider_host: str = ""  # Provider's advertise host (preserved through gossip)
     provider_port: int = 0   # Provider's protocol port (preserved through gossip)
     jurisdiction: str = ""   # e.g. "eu.ch", "eu.de" — for DHT-computed groups

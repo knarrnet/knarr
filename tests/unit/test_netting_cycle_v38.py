@@ -23,6 +23,7 @@ class TestNettingDocuments(unittest.TestCase):
             proposed_net=-42.0,
             receipt_count=73,
             chain_id="solana-devnet",
+            token="KNARR",
         )
         self.assertEqual(doc["netting_id"], "nr01")
         self.assertEqual(doc["proposed_net"], -42.0)
@@ -35,7 +36,7 @@ class TestNettingDocuments(unittest.TestCase):
             counterparty="node-b",
             settlement_amount=42.0,
             chain_id="solana-devnet",
-            token_mint="",
+            token="KNARR",
             target_address="solana-addr-1111",
             deadline="2026-03-07T00:00:00Z",
         )
@@ -50,6 +51,7 @@ class TestNettingDocuments(unittest.TestCase):
             counterparty="node-a",
             accepted_amount=42.0,
             source_address="solana-addr-2222",
+            token="KNARR",
         )
         self.assertEqual(doc["accepted_amount"], 42.0)
         self.assertTrue(doc["receipt_id"].startswith("na_"))
@@ -63,6 +65,7 @@ class TestNettingDocuments(unittest.TestCase):
             tx_hash="5xhash123",
             chain_id="solana-devnet",
             amount=42.0,
+            token="KNARR",
         )
         self.assertEqual(doc["tx_hash"], "5xhash123")
         self.assertTrue(doc["receipt_id"].startswith("ne_"))
@@ -78,6 +81,7 @@ class TestNettingSchemaValidators(unittest.TestCase):
             "proposed_net": -42.0,
             "receipt_count": 73,
             "chain_id": "solana-devnet",
+            "token": "KNARR",
         }
         ok, err = validate_netting_reconcile(body)
         self.assertTrue(ok)
@@ -92,7 +96,7 @@ class TestNettingSchemaValidators(unittest.TestCase):
     def test_reconcile_nan_proposed_net(self):
         body = {
             "netting_id": "nr01", "identity": "a", "counterparty": "b",
-            "proposed_net": float("nan"), "receipt_count": 1, "chain_id": "solana-devnet",
+            "proposed_net": float("nan"), "receipt_count": 1, "chain_id": "solana-devnet", "token": "KNARR",
         }
         ok, err = validate_netting_reconcile(body)
         self.assertFalse(ok)
@@ -100,7 +104,7 @@ class TestNettingSchemaValidators(unittest.TestCase):
     def test_reconcile_negative_receipt_count_fails(self):
         body = {
             "netting_id": "nr01", "identity": "a", "counterparty": "b",
-            "proposed_net": -10.0, "receipt_count": -1, "chain_id": "solana-devnet",
+            "proposed_net": -10.0, "receipt_count": -1, "chain_id": "solana-devnet", "token": "KNARR",
         }
         ok, err = validate_netting_reconcile(body)
         self.assertFalse(ok)
@@ -112,7 +116,7 @@ class TestNettingSchemaValidators(unittest.TestCase):
             "counterparty": "node-b",
             "settlement_amount": 42.0,
             "chain_id": "solana-devnet",
-            "token_mint": "",
+            "token": "KNARR",
             "target_address": "solana-addr",
             "deadline": "2026-03-07T00:00:00Z",
         }
@@ -122,7 +126,7 @@ class TestNettingSchemaValidators(unittest.TestCase):
     def test_proposal_zero_amount_fails(self):
         body = {
             "netting_id": "np01", "identity": "a", "counterparty": "b",
-            "settlement_amount": 0.0, "chain_id": "x", "token_mint": "",
+            "settlement_amount": 0.0, "chain_id": "x", "token": "KNARR",
             "target_address": "addr", "deadline": "2026-01-01",
         }
         ok, err = validate_netting_proposal(body)
@@ -131,7 +135,7 @@ class TestNettingSchemaValidators(unittest.TestCase):
     def test_proposal_negative_amount_fails(self):
         body = {
             "netting_id": "np01", "identity": "a", "counterparty": "b",
-            "settlement_amount": -5.0, "chain_id": "x", "token_mint": "",
+            "settlement_amount": -5.0, "chain_id": "x", "token": "KNARR",
             "target_address": "addr", "deadline": "2026-01-01",
         }
         ok, err = validate_netting_proposal(body)
@@ -145,6 +149,7 @@ class TestNettingSchemaValidators(unittest.TestCase):
             "counterparty": "node-a",
             "accepted_amount": 42.0,
             "source_address": "solana-addr",
+            "token": "KNARR",
         }
         ok, err = validate_netting_acceptance(body)
         self.assertTrue(ok)
@@ -152,7 +157,7 @@ class TestNettingSchemaValidators(unittest.TestCase):
     def test_acceptance_inf_amount_fails(self):
         body = {
             "netting_id": "na01", "proposal_ref": "ref", "identity": "b", "counterparty": "a",
-            "accepted_amount": float("inf"), "source_address": "addr",
+            "accepted_amount": float("inf"), "source_address": "addr", "token": "KNARR",
         }
         ok, err = validate_netting_acceptance(body)
         self.assertFalse(ok)
@@ -166,6 +171,7 @@ class TestNettingSchemaValidators(unittest.TestCase):
             "tx_hash": "abc123",
             "chain_id": "solana-devnet",
             "amount": 42.0,
+            "token": "KNARR",
         }
         ok, err = validate_netting_executed(body)
         self.assertTrue(ok)
@@ -174,7 +180,7 @@ class TestNettingSchemaValidators(unittest.TestCase):
         body = {
             "netting_id": "ne01", "acceptance_ref": "na_abc",
             "identity": "a", "counterparty": "b",
-            "chain_id": "x", "amount": 42.0,
+            "chain_id": "x", "amount": 42.0, "token": "KNARR",
         }
         ok, err = validate_netting_executed(body)
         self.assertFalse(ok)

@@ -494,6 +494,79 @@ class PunchholeBackendPlugin(PluginHooks):
             log.warning(f"punchhole-backend: skills read failed: {exc}")
             return []
 
+    def _read_schemas_skills(self) -> Dict[str, Any]:
+        """Read skill schemas from skill registry."""
+        if not self._ctx.storage_path:
+            return {"skills": []}
+        try:
+            conn = sqlite3.connect(self._ctx.storage_path, timeout=5)
+            cur = conn.execute("""
+                SELECT skill_key, skill_record_json FROM skills WHERE is_own = 1
+            """)
+            skills = []
+            for row in cur.fetchall():
+                try:
+                    rec = json.loads(row[1])
+                    skill_data = {
+                        "skill_name": row[0],
+                        "input_schema": rec.get("input_schema", {}),
+                        "output_schema": rec.get("output_schema", {}),
+                        "input_spec": rec.get("input_spec", ""),
+                    }
+                    skills.append(skill_data)
+                except Exception:
+                    pass
+            conn.close()
+            return {"skills": skills}
+        except Exception as exc:
+            log.warning(f"punchhole-backend: schemas.skills read failed: {exc}")
+            return {"skills": []}
+
+    def _read_schemas_documents(self) -> Dict[str, Any]:
+        """Read document schemas from commerce/documents.py."""
+        try:
+            from knarr.commerce.documents import _TYPE_REGISTRY, _PREFIX_MAP
+
+            documents = []
+            for doc_type, required_fields in _TYPE_REGISTRY.items():
+                doc_data = {
+                    "document_type": doc_type,
+                    "required_fields": list(required_fields),
+                    "prefix": _PREFIX_MAP.get(doc_type, "")
+                }
+                documents.append(doc_data)
+            return {"documents": documents}
+        except Exception as exc:
+            log.warning(f"punchhole-backend: schemas.documents read failed: {exc}")
+            return {"documents": []}
+
+    def _read_storefront_catalog(self) -> Dict[str, Any]:
+        config_dir = self._ctx.plugin_dir.parents[1]
+        expose_path = config_dir / "expose.toml"
+        try:
+            raw = tomllib.loads(expose_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {"catalog": []}
+        except Exception as exc:
+            log.warning(f"punchhole-backend: storefront.catalog read failed: {exc}")
+            return {"catalog": []}
+
+        catalog = []
+        for name, cfg in raw.items():
+            if not isinstance(cfg, dict):
+                continue
+            catalog.append({
+                "name": name,
+                "skill": cfg.get("skill", name),
+                "path": cfg.get("path", name),
+                "price": cfg.get("payment_amount", cfg.get("price", "")),
+                "payment": cfg.get("payment", "none"),
+                "payment_asset": cfg.get("payment_asset", ""),
+                "payment_network": cfg.get("payment_network", ""),
+            })
+        catalog.sort(key=lambda item: (str(item.get("path", "")), str(item.get("name", ""))))
+        return {"catalog": catalog}
+
     # ------------------------------------------------------------------
     # Cache object builder
     # ------------------------------------------------------------------
@@ -508,6 +581,12 @@ class PunchholeBackendPlugin(PluginHooks):
             return self._read_economy_bilateral(requester_node_id or "")
         if object_key == "skills":
             return {"skills": self._read_skills()}
+        if object_key == "schemas.skills":
+            return self._read_schemas_skills()
+        if object_key == "schemas.documents":
+            return self._read_schemas_documents()
+        if object_key == "storefront.catalog":
+            return self._read_storefront_catalog()
         # Fallback for unknown objects
         return {}
 
@@ -536,6 +615,8 @@ class PunchholeBackendPlugin(PluginHooks):
         if object_key == "skills" and "skills" in raw:
             # Apply list granularity to the skills list
             data = {"skills": _apply_granularity(raw["skills"], "list")}
+        elif object_key == "storefront.catalog" and "catalog" in raw:
+            data = {"catalog": raw["catalog"]}
         else:
             data = _build_data_dict(raw, fields, granularity)
 
@@ -689,8 +770,9 @@ class PunchholeBackendPlugin(PluginHooks):
     _STALE_MAP: Dict[str, List[str]] = {
         "credit.change": ["economy.summary", "economy.bilateral"],
         "receipt.issued": ["economy.summary"],
-        "skill.registered": ["skills"],
-        "skill.removed": ["skills"],
+        "skill.registered": ["skills", "schemas.skills"],
+        "skill.removed": ["skills", "schemas.skills"],
+        "exposure.changed": ["storefront.catalog"],
         "configuration.order": [],  # handled below — stales card + affected objects
     }
 

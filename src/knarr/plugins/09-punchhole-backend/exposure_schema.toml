@@ -55,3 +55,21 @@ fields = ["skill_name", "price", "visibility"]
 skill_name  = "list"
 price       = "exact"
 visibility  = "exact"
+
+[objects."schemas.skills"]
+access = "all_signed"
+description = "Input/output schemas for published skills"
+source = "skill_registry"
+fields = ["skill_name", "input_schema", "output_schema", "input_spec"]
+
+[objects."schemas.documents"]
+access = "all_signed"
+description = "Protocol document type definitions"
+source = "document_registry"
+fields = ["document_type", "required_fields", "prefix"]
+
+[objects."storefront.catalog"]
+access = "all_signed"
+description = "Published storefront exposure catalog"
+source = "exposure_config"
+fields = ["name", "skill", "path", "price", "payment", "payment_asset", "payment_network"]

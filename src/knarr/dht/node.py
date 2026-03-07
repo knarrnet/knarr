@@ -27,7 +27,7 @@ from ..core.messages import (
     sign_message, verify_message, verify_node_id
 )
 from ..core.validation import validate_skill_sheet, validate_task_input, ValidationError
-from ..core.pricing import RealmConfig
+from ..core.pricing import RealmConfig, PriceBreakdown
 from .storage import Storage
 from .protocol import send_message, receive_message, request_response, ProtocolError
 from .sidecar import AssetSidecar, TaskContext
@@ -64,15 +64,12 @@ class DHTNode:
                  config: Optional[Dict[str, Any]] = None, ephemeral: bool = False):
         self._main_loop = asyncio.get_event_loop()
         self.storage = Storage(storage_path)
-        economy_cfg = (config or {}).get("economy", {})
-        # v0.38.0 A1.1: Ledger Semantic Migration — shift balances to new zero-origin convention
-        default_soft = float(economy_cfg.get("default_soft_limit", 3.0))
-        self.storage.run_v038_balance_migration(default_soft)
         network_cfg = (config or {}).get("network", {})
         self._pool = ConnectionPool(max_connections=int(network_cfg.get("max_connections", 50)))
         self._connection_idle_timeout = float(network_cfg.get("connection_idle_timeout", 300))
         self._gossip_fanout = int(network_cfg.get("gossip_fanout", 3))
         self._bind_host = host
+        economy_cfg = (config or {}).get("economy", {})
         _soft = float(economy_cfg.get("default_soft_limit", -5.0))
         _hard = float(economy_cfg.get("default_hard_limit", -10.0))
         if not (math.isfinite(_soft) and math.isfinite(_hard)):
@@ -153,12 +150,10 @@ class DHTNode:
         self._handlers: Dict[str, tuple[Callable, bool]] = {} # skill_name -> (handler_fn, slow)
         self._handler_specs: Dict[str, str] = {}   # skill_name -> handler spec string
         self._handler_mtimes: Dict[str, float] = {} # skill_name -> handler file mtime
-        # v0.36.0: Per-skill max_concurrent tracking
-        self._skill_max_concurrent: Dict[str, int] = {}  # skill_name -> max_concurrent (from config)
-        self._skill_active: Dict[str, int] = {}  # skill_name -> current active count
         self._task_events: Dict[str, asyncio.Event] = {}
         self._task_results: Dict[str, TaskResult] = {}
         self._task_expected_provider: Dict[str, str] = {}  # task_id -> expected provider public_key
+        self._admission_cache: Dict[str, Dict[str, Any]] = {}
 
         self._mcp_bridges: List[Any] = []
         self._active_connections: int = 0  # SA-02: accept-level connection tracking
@@ -227,21 +222,6 @@ class DHTNode:
         _bus_debug = bool(self._config.get("node", {}).get("event_bus_debug", False))
         _bus_size = int(self._config.get("node", {}).get("event_bus_size", 256))
         self.bus = EventBus(size=_bus_size, debug=_bus_debug)
-
-        # v0.37.0: Warehouse Manager — pre-bus gateway for external documents
-        self._warehouse_manager = None
-        if self._config.get("warehouse_manager", {}).get("enabled", False):
-            from ..core.warehouse_manager import WarehouseManager
-            wm_identity = self._build_identity_fragments()
-            self._warehouse_manager = WarehouseManager(
-                node_id=self.node_info.node_id,
-                identity_fragments=wm_identity,
-                bus=self.bus,
-                storage=self.storage,
-                config=self._config.get("warehouse_manager", {}),
-                write_receipt_cb=self._write_receipt,
-            )
-            logger.info(f"WarehouseManager enabled with {len(wm_identity)} identity fragments")
 
         # V015: Plugin system
         config_dir = Path(self._config.get("_config_dir", os.getcwd()))
@@ -390,49 +370,36 @@ class DHTNode:
                 continue
 
             msg, handler_fn, slow, input_size, start_time, result_future = work_item
-            skill_name = msg.skill_name.lower()
-
-            # v0.36.0 A2: Per-skill max_concurrent tracking
-            # Check and increment per-skill active count before execution
-            max_conc = self._skill_max_concurrent.get(skill_name, 1)
-            while self._skill_active.get(skill_name, 0) >= max_conc:
-                await asyncio.sleep(0.1)  # Wait for slot to become available
-
-            self._skill_active[skill_name] = self._skill_active.get(skill_name, 0) + 1
-            try:
-                # V013-008: Transition to 'running' before execution
-                job_id = msg.input_data.get("_job_id") or msg.task_id
-                await self._enqueue_write(self.storage.update_async_job_status, job_id, "running")
-                # B3: task.started event
-                if self.bus:
-                    caller_nid = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
-                    self.bus.emit("task.started",
-                        skill_name=msg.skill_name, caller_node=caller_nid,
-                        task_id=job_id, identity=caller_nid,
-                        queue_wait_ms=int((time.time() - start_time) * 1000))
-                # B4: order_executing receipt — marks transition from queued to running
-                _caller_nid_oexe = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
-                self._write_receipt(
-                    document_type="order_executing",
-                    payload={
-                        "provider": self.node_info.node_id,
-                        "caller": _caller_nid_oexe,
-                        "skill_uri": f"knarr:///{msg.skill_name.lower()}",
-                        "queue_wait_ms": int((time.time() - start_time) * 1000),
-                    },
-                    order_ref=job_id,
-                    proof_purpose="assertion",
-                    sign=False,
-                )
-                async with self._task_semaphore:  # Wait for available slot
-                    self._active_workers += 1
-                    try:
-                        await self._execute_queued_task(msg, handler_fn, slow, input_size, start_time, result_future)
-                    finally:
-                        self._active_workers -= 1
-            finally:
-                # v0.36.0 A2: Decrement per-skill active count
-                self._skill_active[skill_name] = max(0, self._skill_active.get(skill_name, 0) - 1)
+            # V013-008: Transition to 'running' before execution
+            job_id = msg.input_data.get("_job_id") or msg.task_id
+            await self._enqueue_write(self.storage.update_async_job_status, job_id, "running")
+            # B3: task.started event
+            if self.bus:
+                caller_nid = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
+                self.bus.emit("task.started",
+                    skill_name=msg.skill_name, caller_node=caller_nid,
+                    task_id=job_id, identity=caller_nid,
+                    queue_wait_ms=int((time.time() - start_time) * 1000))
+            # B4: order_executing receipt — marks transition from queued to running
+            _caller_nid_oexe = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
+            self._write_receipt(
+                document_type="order_executing",
+                payload={
+                    "provider": self.node_info.node_id,
+                    "caller": _caller_nid_oexe,
+                    "skill_uri": f"knarr:///{msg.skill_name.lower()}",
+                    "queue_wait_ms": int((time.time() - start_time) * 1000),
+                },
+                order_ref=job_id,
+                proof_purpose="assertion",
+                sign=False,
+            )
+            async with self._task_semaphore:  # Wait for available slot
+                self._active_workers += 1
+                try:
+                    await self._execute_queued_task(msg, handler_fn, slow, input_size, start_time, result_future)
+                finally:
+                    self._active_workers -= 1
 
     async def _execute_queued_task(self, msg: TaskRequest, handler_fn: Callable,
                                     slow: bool, input_size: int, start_time: float,
@@ -441,15 +408,24 @@ class DHTNode:
         from .mcp_bridge import MCPTimeoutError
         skill_name = msg.skill_name.lower()
         skill_sheet = self._own_skills.get(skill_name)
-        skill_price = skill_sheet.price if skill_sheet else 1.0
-
-        # v0.28.0: Structured pricing with breakdown
-        caller_nid = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
-        skill_price, price_breakdown = self._resolve_price(caller_nid, skill_price, skill_name)
 
         # H21-prep: Job ID propagation
         # For async jobs, msg.task_id is the generated job_id (sent in TaskStatus)
         job_id = msg.input_data.get("_job_id") or msg.task_id
+        caller_nid = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
+
+        admission_meta = self._admission_cache.pop(job_id, None)
+        prepaid_action = "skip"
+        prepaid_amount = 0.0
+        if admission_meta:
+            skill_price = float(admission_meta.get("price", skill_sheet.price if skill_sheet else 1.0))
+            breakdown_dict = admission_meta.get("breakdown") or {}
+            price_breakdown = PriceBreakdown(**breakdown_dict)
+            prepaid_action = str(admission_meta.get("prepaid_action", "skip"))
+            prepaid_amount = float(admission_meta.get("prepaid_amount", 0.0) or 0.0)
+        else:
+            skill_price = skill_sheet.price if skill_sheet else 1.0
+            skill_price, price_breakdown = self._resolve_price(caller_nid, skill_price, skill_name)
 
         # v0.33.0 C-track: configurable default timeout
         _default_timeout_s = float(self._config.get("skills", {}).get("default_timeout", 30))
@@ -584,8 +560,7 @@ class DHTNode:
 
             receipt_json = None
             credit_note_json = None
-            # B1: negative price = bounty → "credit" note (consumer earns)
-            _note_type = "zero" if skill_price == 0 else ("credit" if skill_price < 0 else "debit")
+            _note_type = "zero" if skill_price == 0 else "debit"
             if billable:
                 # v0.23.0: Execution receipts (old format, backward compat)
                 output_hash = hashlib.sha256(
@@ -639,7 +614,7 @@ class DHTNode:
                     caller_pubkey = getattr(msg, "public_key", "") or ""
                     credit_note_json = _create_credit_note(
                         note_type=_note_type,
-                        amount=abs(float(skill_price)),  # B1: credit notes use absolute amount
+                        amount=float(skill_price),
                         issuer=self._public_key_hex,
                         recipient=caller_pubkey,
                         reference=job_id_for_update,
@@ -656,7 +631,7 @@ class DHTNode:
                         document_type="credit_note",
                         payload={
                             "note_type": _note_type,
-                            "amount": abs(float(skill_price)),  # B1: match credit note (absolute)
+                            "amount": float(skill_price),
                             "currency": "credits",
                             "issuer": self.node_info.node_id,
                             "recipient": caller_pubkey,
@@ -709,28 +684,58 @@ class DHTNode:
                         logger.warning(f"Async result mail enqueue failed for {job_id_for_update}: {mail_err}")
 
             if billable:
-                # v0.33.0: read balance before update for threshold crossing check
-                _old_balance = self.storage.get_ledger_balance(msg.public_key)
-                # v0.38.0 B1: sign-aware credit flow
-                if skill_price >= 0:
-                    # Normal: peer pays us — decrement their balance
-                    await self._enqueue_write(self.storage.update_ledger_provider, msg.public_key, skill_price)
+                if prepaid_action == "deduct":
+                    await self._enqueue_write(
+                        self.storage.deduct_prepaid,
+                        msg.public_key,
+                        prepaid_amount or max(skill_price, 0.0),
+                    )
+                elif skill_price < 0:
+                    # v0.39.0 F2: Bounty (negative price = provider pays caller)
+                    _skill_rt_cfg = self._get_skill_runtime_config(skill_name)
+                    _qg_skill = _skill_rt_cfg.get("quality_gate", "")
+                    if _qg_skill:
+                        # Quality gate configured — hold funds, emit event for plugin evaluation.
+                        # Plugin calls release_held() or return_held() via commerce API.
+                        _hold_amt = abs(skill_price)
+                        await self._enqueue_write(self.storage.hold_balance, msg.public_key, _hold_amt)
+                        if self.bus:
+                            self.bus.emit(
+                                "bounty.pending_review",
+                                task_id=job_id_for_update, skill=skill_name,
+                                peer=msg.public_key, amount=_hold_amt,
+                                output=result_data, quality_gate=_qg_skill,
+                            )
+                        logger.info(f"BOUNTY_HELD task={job_id_for_update[:8]} amount={_hold_amt} gate={_qg_skill}")
+                    else:
+                        # No quality gate — direct credit
+                        _old_balance = self.storage.get_ledger_balance(msg.public_key)
+                        await self._enqueue_write(self.storage.update_ledger_provider, msg.public_key, skill_price)
+                        _new_balance = self.storage.get_ledger_balance(msg.public_key)
+                        if self.bus:
+                            self.bus.emit("credit.change", direction="provider", counterparty=getattr(msg, "public_key", ""),
+                                          amount=skill_price, reference=job_id_for_update, identity=getattr(msg, "public_key", ""))
+                        if _old_balance is not None and _new_balance is not None:
+                            self._check_credit_restored(msg.public_key, _old_balance, _new_balance)
                 else:
-                    # Bounty: we pay peer — increment their balance (they earn)
-                    await self._enqueue_write(self.storage.update_ledger_consumer, msg.public_key, abs(skill_price))
-                _new_balance = self.storage.get_ledger_balance(msg.public_key)
-                # E3: credit.change fires AFTER ledger update
-                self.bus.emit(
-                    "credit.change",
-                    direction="provider",
-                    counterparty=getattr(msg, "public_key", ""),
-                    amount=skill_price,
-                    reference=job_id_for_update,
-                    identity=getattr(msg, "public_key", ""),
-                )
-                # v0.33.0: credit.restored on threshold crossing
-                if _old_balance is not None and _new_balance is not None:
-                    self._check_credit_restored(msg.public_key, _old_balance, _new_balance)
+                    # v0.33.0: read balance before update for threshold crossing check
+                    _old_balance = self.storage.get_ledger_balance(msg.public_key)
+                    await self._enqueue_write(self.storage.update_ledger_provider, msg.public_key, skill_price)
+                    _new_balance = self.storage.get_ledger_balance(msg.public_key)
+                    # E3: credit.change fires AFTER ledger update
+                    self.bus.emit(
+                        "credit.change",
+                        direction="provider",
+                        counterparty=getattr(msg, "public_key", ""),
+                        amount=skill_price,
+                        reference=job_id_for_update,
+                        identity=getattr(msg, "public_key", ""),
+                    )
+                    # v0.33.0: credit.restored on threshold crossing
+                    if _old_balance is not None and _new_balance is not None:
+                        self._check_credit_restored(msg.public_key, _old_balance, _new_balance)
+            # Meter counts ALL executions (including non-billable) — rate limits protect compute, not revenue
+            await self._enqueue_write(self.storage.meter_increment, caller_node_id, skill_name, "", 0)
             result_msg = self._sign(TaskResult(task_id=msg.task_id, status="completed", output_data=result_data, receipt=receipt_json))
             # M-016: Notify plugins of task completion
             asyncio.create_task(self._plugins.on_task_complete(
@@ -936,182 +941,6 @@ class DHTNode:
             except Exception as e:
                 logger.warning(f"Failed to send slow task result to {msg.requester_host}:{msg.requester_port}: {e}")
 
-    async def _execute_local_fast_path(
-        self, msg: TaskRequest, handler_fn: Callable, slow: bool,
-        skill_name: str, skill_price: float,
-        caller_node_id: str, job_id: str, input_hash: str,
-    ) -> Message:
-        """v0.36.0 A1: Execute local task directly without queue.
-
-        MUST still write receipts, emit bus events, check admission gate.
-        This is the fast path for self-calls (caller == self.node_info.node_id).
-        """
-        from .mcp_bridge import MCPTimeoutError
-        import inspect
-        from ..static.handler import TaskContext
-
-        start_time = time.time()
-        input_size = len(json.dumps(msg.input_data)) if msg.input_data else 0
-
-        # v0.33.0 C-track: configurable default timeout
-        _default_timeout_s = float(self._config.get("skills", {}).get("default_timeout", 30))
-        max_timeout = self._config.get("node", {}).get("max_task_timeout", 3600)
-        _req_timeout_s = msg.timeout_ms / 1000.0 if msg.timeout_ms else _default_timeout_s
-        handler_timeout = min(_req_timeout_s, max_timeout) if max_timeout > 0 else _req_timeout_s
-
-        # Emit task.started and write order_executing receipt (parity with async path)
-        if self.bus:
-            self.bus.emit("task.started", skill_name=skill_name, caller_node=caller_node_id, task_id=job_id, fast_path=True, identity=caller_node_id)
-        self._write_receipt(
-            document_type="order_executing",
-            payload={
-                "provider": self.node_info.node_id,
-                "caller": caller_node_id,
-                "skill_uri": f"knarr:///{skill_name}",
-                "order_ref": job_id,
-                "fast_path": True,
-            },
-        )
-
-        try:
-            loop = asyncio.get_running_loop()
-
-            # Prepare input data (same as _execute_queued_task)
-            input_data = dict(msg.input_data)
-            input_data["_job_id"] = job_id
-            input_data["_caller_node_id"] = caller_node_id
-            input_data["_node_encrypt"] = self.encrypt_for_peer
-            input_data["_node_decrypt"] = self.decrypt_from_peer
-
-            # Check if handler accepts TaskContext
-            ctx = TaskContext(self._asset_dir) if self._asset_dir else None
-            handler_accepts_ctx = False
-            try:
-                sig = inspect.signature(handler_fn)
-                handler_accepts_ctx = len(sig.parameters) >= 2
-            except (ValueError, TypeError):
-                pass
-
-            # Execute handler (same logic as _execute_queued_task)
-            if asyncio.iscoroutinefunction(handler_fn):
-                def _run_async():
-                    tloop = asyncio.new_event_loop()
-                    try:
-                        if handler_accepts_ctx:
-                            return tloop.run_until_complete(handler_fn(input_data, ctx))
-                        else:
-                            return tloop.run_until_complete(handler_fn(input_data))
-                    finally:
-                        tloop.close()
-                result_data = await asyncio.wait_for(
-                    loop.run_in_executor(self._handler_pool, _run_async),
-                    timeout=handler_timeout
-                )
-            else:
-                if handler_accepts_ctx:
-                    result_data = await asyncio.wait_for(
-                        loop.run_in_executor(self._handler_pool, handler_fn, input_data, ctx),
-                        timeout=handler_timeout
-                    )
-                else:
-                    result_data = await asyncio.wait_for(
-                        loop.run_in_executor(self._handler_pool, handler_fn, input_data),
-                        timeout=handler_timeout
-                    )
-
-            wall_ms = int((time.time() - start_time) * 1000)
-            logger.info(f"FAST_PATH completed: skill={skill_name} task={job_id[:8]} wall={wall_ms}ms")
-
-            # Strip non-serializable hooks from result
-            if isinstance(result_data, dict):
-                result_data = {k: v for k, v in result_data.items() if not callable(v)}
-
-            # Egress check
-            if result_data and hasattr(self, '_egress'):
-                out_str = json.dumps(result_data) if isinstance(result_data, dict) else str(result_data)
-                if not self._egress.check(out_str):
-                    logger.critical(f"EGRESS_BLOCK_RESULT task={job_id[:16]} skill={skill_name}")
-                    if self.bus:
-                        self.bus.emit("security.egress_blocked", skill_name=skill_name, target=caller_node_id, identity=caller_node_id)
-                    result_data = {"error": "SECURITY_VIOLATION", "code": "EGRESS_FILTER_BLOCKED"}
-
-            # Write task status and execution log
-            await self._enqueue_write(
-                self.storage.update_task_status, job_id, "completed",
-                result_data, None, input_size, wall_ms
-            )
-            await self._enqueue_write(
-                self.storage.log_execution,
-                job_id, skill_name, caller_node_id, "completed", wall_ms, input_hash, None, None, skill_price, ""
-            )
-
-            # Emit bus event
-            if self.bus:
-                self.bus.emit("task.completed", skill_name=skill_name, caller_node=caller_node_id, task_id=job_id, wall_ms=wall_ms, price=skill_price, identity=caller_node_id)
-
-            # Write execution receipt (same as async path)
-            output_hash = hashlib.sha256(
-                json.dumps(result_data, sort_keys=True, separators=(',', ':')).encode()
-            ).hexdigest() if result_data else ""
-
-            from datetime import datetime, timezone as _tz_exec
-            _completed_at = datetime.now(_tz_exec.utc)
-            _completed_iso = _completed_at.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_completed_at.microsecond // 1000:03d}Z"
-            _started_at = _completed_at - __import__("datetime").timedelta(milliseconds=max(0, min(wall_ms, 86400000)))
-            _started_iso = _started_at.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_started_at.microsecond // 1000:03d}Z"
-
-            self._write_receipt(
-                document_type="execution_receipt",
-                payload={
-                    "provider": self.node_info.node_id,
-                    "caller": caller_node_id,
-                    "skill_uri": f"knarr:///{skill_name}",
-                    "order_ref": job_id,
-                    "execution": {
-                        "status": "completed",
-                        "started_at": _started_iso,
-                        "completed_at": _completed_iso,
-                        "duration_ms": wall_ms,
-                        "input_hash": f"sha256:{input_hash}" if input_hash else None,
-                        "output_hash": f"sha256:{output_hash}" if output_hash else None,
-                        "error": None,
-                    },
-                    "settlement": {
-                        "credit_note_ref": None,
-                        "amount": float(skill_price),
-                        "currency": "credits",
-                    },
-                },
-                counterparty=caller_node_id,
-                order_ref=job_id,
-                proof_purpose="assertion",
-                sign=True,
-            )
-
-            # Return success result
-            return self._sign(TaskResult(task_id=job_id, status="completed", result=result_data))
-
-        except asyncio.TimeoutError:
-            err = {"code": "TIMEOUT", "message": f"Handler exceeded {handler_timeout}s timeout"}
-            wall_ms = int((time.time() - start_time) * 1000)
-            await self._enqueue_write(
-                self.storage.update_task_status, job_id, "failed", None, err, input_size, wall_ms
-            )
-            if self.bus:
-                self.bus.emit("task.failed", skill_name=skill_name, caller_node=caller_node_id, task_id=job_id, error_type="TIMEOUT", identity=caller_node_id)
-            return self._sign(TaskResult(task_id=job_id, status="failed", error=err))
-
-        except Exception as e:
-            logger.exception(f"FAST_PATH_ERROR: skill={skill_name} task={job_id[:8]}: {e}")
-            err = {"code": "HANDLER_ERROR", "message": str(e)}
-            wall_ms = int((time.time() - start_time) * 1000)
-            await self._enqueue_write(
-                self.storage.update_task_status, job_id, "failed", None, err, input_size, wall_ms
-            )
-            if self.bus:
-                self.bus.emit("task.failed", skill_name=skill_name, caller_node=caller_node_id, task_id=job_id, error_type="EXCEPTION", identity=caller_node_id)
-            return self._sign(TaskResult(task_id=job_id, status="failed", error=err))
-
     async def _send_direct(self, host: str, port: int, msg: Message):
         """Sends a message directly to a host:port without expecting a Knarr response."""
         try:
@@ -1162,32 +991,23 @@ class DHTNode:
             self._wallet = self._solana_address
             logger.info(f"Solana wallet: {self._wallet} (auto-derived)")
 
-        # v0.38.0 A6: Chain selector — single source for chain config
+        # Chain + token runtime config
+        token_cfg = self._config.get("token", {})
+        # Deprecated: [token] mint config key. Ignored — KNARR_MINT is a protocol constant.
+        old_mint = token_cfg.get("mint", "")
+        if old_mint:
+            logger.warning("Config [token] mint is deprecated and ignored — KNARR_MINT is a protocol constant")
         from ..core.chain import get_chain_config
         self._chain = get_chain_config(self._config)
-        self._token_mint = self._chain["token_mint"]
-        self._rpc_url = self._chain["rpc_url"] or None
-        self._chain_id = self._chain["chain_id"]
+        self._token_symbol = self._chain.get("token_symbol", "KNARR")
+        self._token_mint = self._chain.get("token_mint", "")
+        self._token_decimals = int(self._chain.get("token_decimals", 0) or 0)
+        self._rpc_url = self._chain.get("rpc_url") or None
         self._token_balance: Optional[float] = None
         self._sol_balance: Optional[float] = None
         self._balance_last_refresh: float = 0.0
 
         return hashlib.sha256(verify_key.encode()).hexdigest()
-
-    def _init_cockpit_keypair(self):
-        """Initialize cockpit sub-identity keypair for configuration_order signing."""
-        config_dir = self._config.get("_config_dir", ".")
-        key_path = os.path.join(config_dir, "cockpit_ed25519.key")
-        if os.path.exists(key_path):
-            key_bytes = open(key_path, "rb").read()
-            self._cockpit_signing_key = SigningKey(key_bytes)
-            logger.info("Loaded cockpit sub-identity key")
-        else:
-            self._cockpit_signing_key = SigningKey.generate()
-            with open(key_path, "wb") as f:
-                f.write(bytes(self._cockpit_signing_key))
-            logger.info("Generated cockpit sub-identity key")
-        self._cockpit_verify_key = self._cockpit_signing_key.verify_key
 
     def _cleanup_zombie_tasks(self):
         """Fix #13: Transition zombie 'running' tasks in execution_log and async_jobs to 'failed'."""
@@ -1352,54 +1172,6 @@ class DHTNode:
                 self.bus.emit("receipt.write_failed", document_type=document_type, receipt_id=receipt_id, error=str(_exc), identity=self.node_info.node_id)
 
         return receipt_id
-
-    def _build_identity_fragments(self) -> list[str]:
-        """Build the list of all local identity fragments for WM Gate 2.
-
-        Returns node_id and all DID-based identity strings that could appear
-        as party fields in inbound documents.
-        """
-        nid = self.node_info.node_id
-        return [
-            nid,
-            f"did:knarr:{nid}",
-            f"did:knarr:{nid}#key-1",
-            f"did:knarr:{nid}#cockpit-1",
-            f"did:knarr:{nid}#thrall-1",
-        ]
-
-    def _wm_restart_recovery(self):
-        """v0.37.0: Scan quarantine for unfinished WM business on startup.
-
-        Pending items: left visible for operator review (NOT re-ingested).
-        Approved-but-not-promoted items: re-promoted without re-verification.
-        """
-        try:
-            pending = self.storage.quarantine_list_pending()
-            approved = self.storage.quarantine_list_by_status("approved")
-            needs_promotion = [a for a in approved if not a.get("promoted_at")]
-            if pending:
-                logger.info(f"WM restart recovery: {len(pending)} items pending operator review")
-            if not needs_promotion:
-                return
-            logger.info(f"WM restart recovery: promoting {len(needs_promotion)} approved-not-promoted items")
-            for item in needs_promotion:
-                try:
-                    self._warehouse_manager.approve(item["id"])
-                except Exception as exc:
-                    logger.warning(f"WM recovery fail qid={item['id'][:16]}: {exc}")
-        except Exception as exc:
-            logger.warning(f"WM restart recovery failed: {exc}")
-
-    def wm_ingest_external(self, document: dict, originator_pubkey: bytes):
-        """Public entry point for external-origin documents through WM.
-
-        Returns the IngestResult, or None if WM is disabled (pass-through).
-        Commerce handlers and SyncEngine call this before dispatching.
-        """
-        if self._warehouse_manager is None:
-            return None  # WM disabled — pass-through
-        return self._warehouse_manager.ingest(document, originator_pubkey)
 
     def _init_group_engine(self):
         """Initialize GroupEngine from config. Plugin can override later."""
@@ -1640,11 +1412,7 @@ class DHTNode:
         for skill in own_skills:
             self._own_skills[skill.name] = skill
         logger.info(f"Reloaded {len(self._own_skills)} own skills from storage")
-
-        # v0.37.0: Warehouse Manager restart recovery
-        if self._warehouse_manager is not None:
-            self._wm_restart_recovery()
-
+        
         self.background_tasks.append(asyncio.create_task(self._heartbeat_loop()))
         self.background_tasks.append(asyncio.create_task(self._republish_loop()))
         self.background_tasks.append(asyncio.create_task(self._prune_loop()))
@@ -1865,8 +1633,7 @@ class DHTNode:
                 skill_sheet=skill_sheet.to_dict(),
                 sidecar_port=self._sidecar_port,
                 encryption_key=self._encryption_key_hex,
-                # v0.38.0 A3.1: wallet address no longer broadcast — use has_wallet flag
-                has_wallet=bool(getattr(self, '_wallet', '')),
+                wallet=self._wallet,
                 provider_host=self.node_info.host,
                 provider_port=self.node_info.port,
                 jurisdiction=self._node_jurisdiction_wire,
@@ -1912,8 +1679,7 @@ class DHTNode:
                 skill_sheet=skill_sheet.to_dict(),
                 sidecar_port=self._sidecar_port,
                 encryption_key=self._encryption_key_hex,
-                # v0.38.0 A3.1: wallet address no longer broadcast — use has_wallet flag
-                has_wallet=bool(getattr(self, '_wallet', '')),
+                wallet=self._wallet,
                 provider_host=self.node_info.host,
                 provider_port=self.node_info.port,
                 jurisdiction=self._node_jurisdiction_wire,
@@ -2183,36 +1949,10 @@ class DHTNode:
             
             logger.info(f"Deregistered skill '{skill_name}'")
 
-    def _get_skill_max_concurrent(self, skill_name: str) -> int:
-        """Return the max_concurrent setting for a skill (default 1)."""
-        skill_name_lower = skill_name.lower()
-        mc = getattr(self, "_skill_max_concurrent", {})
-        if skill_name_lower in mc:
-            return mc[skill_name_lower]
-        # Fallback: read from config
-        skill_cfg = self._config.get("skills", {}).get(skill_name, {})
-        if isinstance(skill_cfg, dict):
-            try:
-                return max(1, int(skill_cfg.get("max_concurrent", 1)))
-            except (ValueError, TypeError):
-                return 1
-        return 1
-
     def register_handler(self, skill_name: str, handler_fn: Callable, slow: bool = False):
-        """Registers a handler for a skill.
-
-        v0.36.0: Also parses max_concurrent from [skills.X] config.
-        """
-        skill_name_lower = skill_name.lower()
-        self._handlers[skill_name_lower] = (handler_fn, slow)
-
-        # v0.36.0: Parse max_concurrent from config (default: 1)
-        skill_cfg = self._config.get("skills", {}).get(skill_name, {})
-        max_concurrent = int(skill_cfg.get("max_concurrent", 1)) if isinstance(skill_cfg, dict) else 1
-        self._skill_max_concurrent[skill_name_lower] = max(1, max_concurrent)
-        self._skill_active[skill_name_lower] = 0
-
-        logger.info(f"Registered {'slow' if slow else 'fast'} handler for skill '{skill_name}' (max_concurrent={self._skill_max_concurrent[skill_name_lower]})")
+        """Registers a handler for a skill."""
+        self._handlers[skill_name.lower()] = (handler_fn, slow)
+        logger.info(f"Registered {'slow' if slow else 'fast'} handler for skill '{skill_name}'")
 
     async def register_system_skills(self, config: dict):
         """Register all system skills based on config.
@@ -2432,14 +2172,8 @@ class DHTNode:
                 if resp.status == "completed":
                     _nid = hashlib.sha256(bytes.fromhex(resp.public_key)).hexdigest()
                     _trust = self._get_initial_trust(_nid)
-                    # v0.38.0 A1.3: new entries start at 0.0 (not initial_credit)
-                    await self._enqueue_write(self.storage.get_or_create_ledger_entry, resp.public_key, 0.0, _trust)
-                    # v0.38.0 B1: sign-aware consumer credit flow
-                    if skill_price >= 0:
-                        await self._enqueue_write(self.storage.update_ledger_consumer, resp.public_key, skill_price)
-                    else:
-                        # Bounty: provider pays us — increment our own position
-                        await self._enqueue_write(self.storage.update_ledger_provider, resp.public_key, abs(skill_price))
+                    await self._enqueue_write(self.storage.get_or_create_ledger_entry, resp.public_key, self.policy.initial_credit, _trust)
+                    await self._enqueue_write(self.storage.update_ledger_consumer, resp.public_key, skill_price)
                     # E3: credit.change fires after ledger update (sync path)
                     if self.bus:
                         self.bus.emit(
@@ -2468,11 +2202,9 @@ class DHTNode:
                         )
                         await self._enqueue_write(self.storage.store_receipt, task_id, receipt_json)
                         
-                        # B1: negative price = bounty → "credit" note (consumer earns)
-                        _note_type_sync = "zero" if skill_price == 0 else ("credit" if skill_price < 0 else "debit")
                         credit_note_json = _create_credit_note(
-                            note_type=_note_type_sync,
-                            amount=abs(float(skill_price)),  # B1: credit notes use absolute amount
+                            note_type="debit" if skill_price > 0 else "zero",
+                            amount=float(skill_price),
                             issuer=self._public_key_hex,
                             recipient=resp.public_key,
                             reference=task_id,
@@ -2514,7 +2246,7 @@ class DHTNode:
                             document_type="credit_note",
                             payload={
                                 "note_type": _note_type_sync,
-                                "amount": abs(float(skill_price)),  # B1: match credit note (absolute)
+                                "amount": float(skill_price),
                                 "currency": "credits",
                                 "issuer": self.node_info.node_id,
                                 "recipient": resp.public_key,
@@ -2566,13 +2298,8 @@ class DHTNode:
                             )
                             _nid2 = hashlib.sha256(bytes.fromhex(result.public_key)).hexdigest()
                             _trust2 = self._get_initial_trust(_nid2)
-                            # v0.38.0 A1.3: new entries start at 0.0 (not initial_credit)
-                            await self._enqueue_write(self.storage.get_or_create_ledger_entry, result.public_key, 0.0, _trust2)
-                            # v0.38.0 B1: sign-aware consumer credit flow
-                            if skill_price >= 0:
-                                await self._enqueue_write(self.storage.update_ledger_consumer, result.public_key, skill_price)
-                            else:
-                                await self._enqueue_write(self.storage.update_ledger_provider, result.public_key, abs(skill_price))
+                            await self._enqueue_write(self.storage.get_or_create_ledger_entry, result.public_key, self.policy.initial_credit, _trust2)
+                            await self._enqueue_write(self.storage.update_ledger_consumer, result.public_key, skill_price)
                             # E3: credit.change fires after ledger update (sync queued path)
                             if self.bus:
                                 self.bus.emit(
@@ -3262,55 +2989,71 @@ class DHTNode:
                 ))
 
         # Policy check — all writes through writer queue [R-01, CLAUDE-001]
-        initial_credit, min_balance = self._resolve_policy(msg.public_key, skill_name)
+        soft_limit, hard_limit = self._resolve_policy(msg.public_key, skill_name)
         peer_nid = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
         initial_trust = self._get_initial_trust(peer_nid)
-        # v0.38.0 A1.3: new entries start at 0.0 (not initial_credit)
         entry = await self._enqueue_write(
             self.storage.get_or_create_ledger_entry,
-            msg.public_key, 0.0, initial_trust
+            msg.public_key, soft_limit, initial_trust
         )
 
         # v0.25.0: Commerce Tab Reminder
-        await self._maybe_send_tab_reminder(msg.public_key, entry.balance, initial_credit, min_balance)
+        await self._maybe_send_tab_reminder(msg.public_key, entry.balance, soft_limit, hard_limit)
 
-        # v0.38.0 A1.4: Admission check using effective_balance = balance + prepaid
-        # v0.38.0 FIX: Skip economy gate for self-calls (issue #18)
-        is_self_call = peer_nid == self.node_info.node_id
-        skill_price_for_admission = skill_sheet.price if skill_sheet else 1.0
-        if not is_self_call and skill_price_for_admission >= 0:
-            # Normal positive-price skill: check effective credit
-            entry_prepaid = getattr(entry, 'prepaid', 0.0)
-            effective_balance = entry.balance + entry_prepaid
-            hard_limit = getattr(entry, 'hard_limit', min_balance)
-            if not self.policy.tit_for_tat and skill_price_for_admission > 0 and effective_balance - skill_price_for_admission < hard_limit:
-                logger.debug(
-                    f"INSUFFICIENT_CREDIT (effective): skill={skill_name} from={msg.public_key[:16]} "
-                    f"balance={entry.balance:.1f} prepaid={entry_prepaid:.1f} "
-                    f"effective={effective_balance:.1f} hard_limit={hard_limit:.1f}"
-                )
-                if self.bus:
-                    self.bus.emit("credit.sanctioned", counterparty=msg.public_key, limit_type="hard", identity=msg.public_key)
-                self._emit_task_rejected(skill_name, msg.public_key, msg.task_id, "INSUFFICIENT_CREDIT")
-                return self._sign(TaskResult(
-                    task_id=msg.task_id,
-                    status="failed",
-                    error={"code": "INSUFFICIENT_CREDIT",
-                           "message": f"Effective balance {effective_balance:.1f} below hard_limit {hard_limit:.1f}"}
-                ))
-        # B1: Negative price (bounty) — skip admission check, peer is earning
-        # (handled below in credit flow logic)
+        meter = self.storage.meter_get(peer_nid, skill_name, "")
+        meter_count = int(meter["count"]) if meter else 0
+        skill_cfg = self._get_skill_runtime_config(skill_name)
+        meter_max_count = int(skill_cfg.get("meter_max_count", 0) or 0)
 
-        # v0.38.0: Stale balance-only check removed — effective_balance check above handles all cases
+        from ..commerce.admission_pipeline import AdmissionContext, run_admission
+
+        admission = run_admission(
+            AdmissionContext(
+                caller_key=msg.public_key,
+                skill_name=skill_name,
+                base_price=skill_sheet.price if skill_sheet else 1.0,
+                balance=entry.balance,
+                soft_limit=soft_limit,
+                hard_limit=hard_limit,
+                tit_for_tat=self.policy.tit_for_tat,
+                peer_node_id=peer_nid,
+                peer_groups=set(self._group_engine.get_groups(peer_nid)) if self._group_engine else set(),
+                discount_rules=self._load_discount_rules(peer_nid, skill_name),
+                cost_projection=self._get_cost_projection(skill_name),
+                skill_min_price=self._get_skill_min_price(skill_name),
+                pricing_config=self._build_pricing_config(skill_name),
+                meter_count=meter_count,
+                meter_max_count=meter_max_count,
+                prepaid_balance=getattr(entry, "prepaid", 0.0),
+                prepaid_config=self._config.get("economy", {}).get("prepaid", {}),
+                identity=self.node_info.node_id,
+                counterparty=peer_nid,
+            )
+        )
+
+        if admission.gate.outcome == "hard_block":
+            logger.debug(
+                f"ADMISSION_BLOCKED: skill={skill_name} from={msg.public_key[:16]} "
+                f"reason={admission.gate.reason}"
+            )
+            if self.bus:
+                self.bus.emit("credit.sanctioned", counterparty=msg.public_key, limit_type="hard", identity=msg.public_key)
+            code = "INSUFFICIENT_CREDIT"
+            if admission.gate.reason and "Rate limit exceeded" in admission.gate.reason:
+                code = "RATE_LIMITED"
+            elif admission.gate.reason and "Prepaid rejection:" in admission.gate.reason:
+                code = "PREPAID_REQUIRED"
+            elif admission.gate.reason and "Invalid price" in admission.gate.reason:
+                code = "INVALID_PRICE"
+            self._emit_task_rejected(skill_name, msg.public_key, msg.task_id, code)
+            return self._sign(TaskResult(
+                task_id=msg.task_id,
+                status="failed",
+                error={"code": code, "message": admission.gate.reason or "Admission rejected"},
+            ))
 
         # Compute dedup hash (H18/H19)
-        caller_node_id = peer_nid  # already sha256(public_key) from line above
-
-        # v0.36.0 A1: Local skill fast path
-        # When caller == self, skip async queue and call handler directly
-        # MUST still write receipts, emit bus events, respect max_concurrent
-        is_local_call = is_self_call
-
+        caller_node_id = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
         canonical = json.dumps(msg.input_data, sort_keys=True, separators=(',', ':'))
         input_hash = hashlib.sha256(
             f"{msg.skill_name}:{canonical}:{caller_node_id}".encode()
@@ -3325,41 +3068,17 @@ class DHTNode:
                 position=existing.get("position", 0)
             ))
 
-        # v0.36.0 A2: Per-skill max_concurrent check
-        # Track per-skill active count, reject with SKILL_BUSY when at limit
-        max_conc = self._skill_max_concurrent.get(skill_name, 1)
-        active_count = self._skill_active.get(skill_name, 0)
-        if active_count >= max_conc:
-            logger.debug(f"SKILL_BUSY: skill={skill_name} active={active_count} max={max_conc}")
-            self._emit_task_rejected(skill_name, msg.public_key, msg.task_id, "SKILL_BUSY")
-            err = {"code": "SKILL_BUSY", "message": f"Skill '{skill_name}' at max concurrency ({max_conc})"}
-            await self._enqueue_write(
-                self.storage.update_task_status, msg.task_id, "failed",
-                None, err, 0, 0
-            )
-            return self._sign(TaskResult(task_id=msg.task_id, status="failed", error=err))
-
         # H19: Generate job_id for async jobs, or use task_id for sync
         job_id = msg.task_id
         is_async = getattr(msg, "mode", "sync") == "async"
         if is_async:
             job_id = str(uuid.uuid4())
-
-        # v0.36.0 A1: Local skill fast path — execute directly without queue
-        # MUST still write receipts, emit bus events, check admission gate, respect max_concurrent
-        if is_local_call and not is_async:
-            # Increment per-skill active count
-            self._skill_active[skill_name] = self._skill_active.get(skill_name, 0) + 1
-            try:
-                # Execute handler directly (similar to _execute_queued_task but inline)
-                result = await self._execute_local_fast_path(
-                    msg, handler_fn, slow, skill_name, skill_price,
-                    caller_node_id, job_id, input_hash
-                )
-                return result
-            finally:
-                # Decrement per-skill active count in finally block
-                self._skill_active[skill_name] = max(0, self._skill_active.get(skill_name, 0) - 1)
+        self._admission_cache[job_id] = {
+            "price": admission.pricing.final_price,
+            "breakdown": dataclasses.asdict(self._pricing_result_to_breakdown(admission.pricing)),
+            "prepaid_action": admission.prepaid.action if admission.prepaid else "skip",
+            "prepaid_amount": admission.prepaid.amount if admission.prepaid else 0.0,
+        }
 
         task = Task(
             task_id=job_id,
@@ -3412,6 +3131,7 @@ class DHTNode:
                 )
                 return self._sign(TaskStatus(task_id=job_id, status="accepted", position=position))
             except asyncio.QueueFull:
+                self._admission_cache.pop(job_id, None)
                 logger.debug(f"PROVIDER_BUSY: skill={skill_name} task={job_id[:8]} queue_full")
                 # v0.33.0: node.slots_exhausted + task.rejected
                 if self.bus:
@@ -3450,6 +3170,7 @@ class DHTNode:
 
         if self._active_workers >= self._task_slots and not slow:
             # Fast task, all workers busy: tell consumer to retry later
+            self._admission_cache.pop(job_id, None)
             queue_depth = self._task_queue.qsize()
             stats = self.storage.get_skill_task_stats(skill_name)
             avg_ms = stats.get("avg_wall_time_ms", 30000) or 30000
@@ -3469,6 +3190,7 @@ class DHTNode:
         try:
             self._task_queue.put_nowait((msg, handler_fn, slow, input_size, start_time, result_future))
         except asyncio.QueueFull:
+            self._admission_cache.pop(job_id, None)
             logger.debug(f"PROVIDER_BUSY: skill={skill_name} task={msg.task_id[:8]} queue_full")
             # v0.33.0: node.slots_exhausted + task.rejected
             if self.bus:
@@ -3816,9 +3538,6 @@ class DHTNode:
                     credits_charged = 0.0
                 else:
                     credits_charged = float(cn.get("amount", 0.0))
-                    # B1: "credit" note = bounty — consumer earned, negate for ledger direction
-                    if cn.get("note_type") == "credit":
-                        credits_charged = -credits_charged
                     if not provider_pubkey:
                         provider_pubkey = cn.get("issuer", "")
                     # Store consumer's copy (receipt before bus)
@@ -3852,16 +3571,14 @@ class DHTNode:
                 pass
 
         # Consumer-side ledger update (applies regardless of credit_note format)
-        # B1: credits_charged < 0 for bounties (consumer earned)
-        if credits_charged != 0 and math.isfinite(credits_charged) and abs(credits_charged) <= 1_000_000:
+        if credits_charged > 0 and math.isfinite(credits_charged) and credits_charged <= 1_000_000:
             if provider_pubkey:
                 try:
                     _nid = hashlib.sha256(bytes.fromhex(provider_pubkey)).hexdigest()
                     _trust = self._get_initial_trust(_nid)
-                    # v0.38.0 A1.3: new entries start at 0.0 (not initial_credit)
                     await self._enqueue_write(
                         self.storage.get_or_create_ledger_entry,
-                        provider_pubkey, 0.0, _trust
+                        provider_pubkey, self.policy.initial_credit, _trust
                     )
                     await self._enqueue_write(
                         self.storage.update_ledger_consumer,
@@ -4472,123 +4189,125 @@ class DHTNode:
                 best_trust = max(best_trust, float(trust_cfg[g]))
         return best_trust
 
-    def _resolve_price(self, node_id: str, base_price: float, skill_name: str = "") -> tuple:
-        """Compute final price with structured breakdown.
+    def _get_skill_runtime_config(self, skill_name: str) -> Dict[str, Any]:
+        raw = self._config.get("skills", {}).get(skill_name, {})
+        return raw if isinstance(raw, dict) else {}
 
-        Returns (final_price: float, breakdown: PriceBreakdown).
-        """
-        from ..core.pricing import PriceBreakdown
+    def _get_skill_min_price(self, skill_name: str) -> Optional[float]:
+        skill_cfg = self._get_skill_runtime_config(skill_name)
+        if "min_price" not in skill_cfg:
+            return None
+        try:
+            return float(skill_cfg["min_price"])
+        except (TypeError, ValueError):
+            return None
 
-        # 1. Load applicable discounts from SQL
-        rules_applied = []
-        groups = set()
-        if self._group_engine:
-            groups = set(self._group_engine.get_groups(node_id))
+    def _get_cost_projection(self, skill_name: str) -> Optional[float]:
+        try:
+            row = self.storage._get_conn().execute(
+                "SELECT total_cost FROM skill_cost_projection WHERE skill_name = ?",
+                (skill_name,),
+            ).fetchone()
+            return float(row[0]) if row and row[0] is not None else None
+        except Exception:
+            return None
 
-        discount_rows = []
+    def _load_discount_rules(self, node_id: str, skill_name: str):
+        from ..commerce.pricing_engine import DiscountRule
+
+        groups = set(self._group_engine.get_groups(node_id)) if self._group_engine else set()
+        rules = []
         if groups:
             try:
                 conn = self.storage._get_conn()
                 placeholders = ",".join("?" * len(groups))
-                rows = conn.execute(f"""
+                rows = conn.execute(
+                    f"""
                     SELECT name, group_name, skill_group, effect_pct, priority
                     FROM pricing_discounts
                     WHERE group_name IN ({placeholders})
                       AND (skill_group = '*' OR skill_group = ?)
                       AND active = 1
                     ORDER BY priority DESC
-                """, list(groups) + [skill_name]).fetchall()
-                discount_rows = [
-                    {"name": r[0], "group_name": r[1], "skill_group": r[2], "effect_pct": r[3], "priority": r[4]}
+                    """,
+                    list(groups) + [skill_name],
+                ).fetchall()
+                rules = [
+                    DiscountRule(
+                        name=r[0],
+                        group_name=r[1],
+                        skill_group=r[2],
+                        effect_pct=float(r[3]),
+                        priority=int(r[4]),
+                    )
                     for r in rows
                 ]
             except Exception as e:
                 logger.warning(f"PRICING_SQL_FAIL: {e}")
-                discount_rows = []
+                rules = []
 
-        # Fallback: TOML discounts (dual-read for one version)
-        if not discount_rows and groups:
-            toml_discounts = self._config.get("pricing", {}).get("discounts", {})
-            for group_name, pct_off in toml_discounts.items():
+        if not rules and groups:
+            for group_name, pct_off in self._config.get("pricing", {}).get("discounts", {}).items():
                 if group_name in groups:
-                    discount_rows.append({
-                        "name": f"toml_{group_name}", "group_name": group_name,
-                        "skill_group": "*", "effect_pct": float(pct_off), "priority": 0
-                    })
+                    rules.append(
+                        DiscountRule(
+                            name=f"toml_{group_name}",
+                            group_name=group_name,
+                            skill_group="*",
+                            effect_pct=float(pct_off),
+                            priority=0,
+                        )
+                    )
+        return rules
 
-        # 2. Apply stacking mode
-        discount_mode = self._config.get("pricing", {}).get("discount_mode", "multiplicative")
-        price = base_price
+    def _build_pricing_config(self, skill_name: str = ""):
+        from ..commerce.pricing_engine import PricingConfig
 
-        if discount_rows:
-            if discount_mode == "multiplicative":
-                for rule in discount_rows:
-                    factor = 1.0 - (rule["effect_pct"] / 100.0)
-                    price *= factor
-                    rules_applied.append({"name": rule["name"], "effect_pct": rule["effect_pct"], "factor": factor})
-            elif discount_mode == "additive":
-                total_pct = sum(r["effect_pct"] for r in discount_rows)
-                price = base_price * (1.0 - total_pct / 100.0)
-                rules_applied = [{"name": r["name"], "effect_pct": r["effect_pct"]} for r in discount_rows]
-            elif discount_mode == "best_wins":
-                best = max(discount_rows, key=lambda r: r["effect_pct"])
-                price = base_price * (1.0 - best["effect_pct"] / 100.0)
-                rules_applied = [{"name": best["name"], "effect_pct": best["effect_pct"]}]
-
-        # 3. Apply discount cap
-        caps = self._config.get("pricing", {}).get("caps", {})
-        max_pct = float(caps.get(skill_name, caps.get("*", 100.0)))
-        max_discount = base_price * (max_pct / 100.0)
-        if base_price - price > max_discount:
-            price = base_price - max_discount
-
-        # 4. Compute floor
-        cost_projection = None
-        try:
-            conn = self.storage._get_conn()
-            row = conn.execute(
-                "SELECT total_cost FROM skill_cost_projection WHERE skill_name = ?",
-                (skill_name,)
-            ).fetchone()
-            if row:
-                cost_projection = row[0]
-        except Exception:
-            pass
-
-        markup_min = float(self._config.get("pricing", {}).get("floors", {}).get("markup_minimum", 1.1))
-        static_floor = float(self._config.get("pricing", {}).get("min_price", 0.01))
-        skill_floor = float(self._config.get("skills", {}).get(skill_name, {}).get("min_price", static_floor) if isinstance(self._config.get("skills", {}).get(skill_name), dict) else static_floor)
-
-        if cost_projection is not None and cost_projection > 0:
-            dynamic_floor = cost_projection * markup_min
-            floor_price = max(dynamic_floor, skill_floor)
-        else:
-            floor_price = skill_floor
-
-        # 5. Clamp to floor
-        floor_applied = price < floor_price
-        if floor_applied:
-            price = floor_price
-
-        # v0.33.0 C-track: global minimum price floor from config
-        global_min = float(self._config.get("skills", {}).get("minimum_price", 0.0))
-        if price < global_min:
-            price = global_min
-            floor_applied = True
-
-        # 6. Build breakdown
-        breakdown = PriceBreakdown(
-            base_price=base_price,
-            cost_projection=cost_projection,
-            rules_applied=rules_applied,
-            discount_mode=discount_mode,
-            floor_price=max(floor_price, global_min),
-            floor_applied=floor_applied,
-            promotion_applied=False,  # interface only, no implementation yet
-            final_price=round(price, 6),
+        pricing_cfg = self._config.get("pricing", {})
+        caps = pricing_cfg.get("caps", {})
+        floors = pricing_cfg.get("floors", {})
+        return PricingConfig(
+            discount_mode=str(pricing_cfg.get("discount_mode", "multiplicative")),
+            discount_cap_pct=float(caps.get(skill_name, caps.get("*", 100.0))),
+            markup_minimum=float(floors.get("markup_minimum", 1.1)),
+            min_price=float(pricing_cfg.get("min_price", 0.01)),
+            global_min_price=float(self._config.get("skills", {}).get("minimum_price", 0.0)),
+            bounty_decay=float(pricing_cfg.get("bounty_decay", 1.0)),
         )
 
-        return (round(price, 6), breakdown)
+    @staticmethod
+    def _pricing_result_to_breakdown(pricing_result) -> PriceBreakdown:
+        return PriceBreakdown(
+            base_price=pricing_result.base_price,
+            cost_projection=pricing_result.cost_projection,
+            rules_applied=pricing_result.rules_applied,
+            discount_mode=pricing_result.discount_mode,
+            floor_price=pricing_result.floor_price,
+            floor_applied=pricing_result.floor_applied,
+            promotion_applied=False,
+            final_price=pricing_result.final_price,
+        )
+
+    def _resolve_price(self, node_id: str, base_price: float, skill_name: str = "") -> tuple:
+        """Compute final price with structured breakdown.
+
+        Returns (final_price: float, breakdown: PriceBreakdown).
+        """
+        from ..commerce.pricing_engine import PricingRequest, resolve_price
+
+        pricing = resolve_price(
+            PricingRequest(
+                base_price=base_price,
+                skill_name=skill_name,
+                peer_node_id=node_id,
+                peer_groups=set(self._group_engine.get_groups(node_id)) if self._group_engine else set(),
+                discount_rules=self._load_discount_rules(node_id, skill_name),
+                cost_projection=self._get_cost_projection(skill_name),
+                skill_min_price=self._get_skill_min_price(skill_name),
+            ),
+            self._build_pricing_config(skill_name),
+        )
+        return pricing.final_price, self._pricing_result_to_breakdown(pricing)
 
     def _resolve_policy(self, public_key: str, skill_name: str) -> tuple:
         """Returns (initial_credit, min_balance) for this peer+skill combination.
