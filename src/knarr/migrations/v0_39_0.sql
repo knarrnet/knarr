@@ -15,6 +15,10 @@ CREATE TABLE IF NOT EXISTS meter (
 
 DROP TABLE IF EXISTS settlement_state;
 
+-- Drop old payment_receipts (v0.38 had different schema: tx_signature, job_id, etc.)
+-- v0.39 x402 code expects tx_digest, destination columns — incompatible.
+DROP TABLE IF EXISTS payment_receipts;
+
 CREATE TABLE IF NOT EXISTS payment_receipts (
     tx_digest TEXT PRIMARY KEY,
     amount INTEGER NOT NULL,

@@ -4293,7 +4293,15 @@ class DHTNode:
 
         Returns (final_price: float, breakdown: PriceBreakdown).
         """
-        from ..commerce.pricing_engine import PricingRequest, resolve_price
+        from ..commerce.pricing_engine import PricingRequest, PricingResult, resolve_price
+
+        # Free skills (price=0.0) are intentional — skip pricing engine floor
+        if base_price == 0.0:
+            return 0.0, self._pricing_result_to_breakdown(PricingResult(
+                final_price=0.0, base_price=0.0, cost_projection=None,
+                rules_applied=[], discount_mode="none", floor_price=0.0,
+                floor_applied=False, cap_applied=False,
+            ))
 
         pricing = resolve_price(
             PricingRequest(
