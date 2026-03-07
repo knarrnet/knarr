@@ -88,6 +88,15 @@ def resolve_price(req: PricingRequest, config: PricingConfig) -> PricingResult:
     Pure function: no side effects, no I/O, no SQL.
     The caller loads discount rules and cost projections before calling.
     """
+    # Free skills (base_price=0.0) are intentional — no discounts, no floor
+    if req.base_price == 0.0:
+        return PricingResult(
+            final_price=0.0, base_price=0.0,
+            cost_projection=req.cost_projection, rules_applied=[],
+            discount_mode=config.discount_mode, floor_price=0.0,
+            floor_applied=False, cap_applied=False,
+        )
+
     # Reject non-finite base_price (NaN/Inf bypass floor/cap logic)
     if not math.isfinite(req.base_price):
         logger.warning(f"PRICING_INVALID_BASE base_price={req.base_price!r} skill={req.skill_name}")
