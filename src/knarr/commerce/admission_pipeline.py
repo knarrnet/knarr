@@ -35,6 +35,7 @@ from typing import List, Optional, Set
 
 from .admission_gate import AdmissionDecision, AdmissionRequest, check_admission
 from .documents import Document, admission_decision, price_calculation
+from .prepaid_engine import PrepaidRequest, PrepaidResult, evaluate_prepaid
 from .pricing_engine import (
     DiscountRule,
     PricingConfig,
@@ -64,6 +65,12 @@ class AdmissionContext:
     cost_projection: Optional[float] = None
     skill_min_price: Optional[float] = None
     pricing_config: PricingConfig = field(default_factory=PricingConfig)
+    meter_count: int = 0
+    meter_max_count: int = 0
+
+    # Prepaid inputs
+    prepaid_balance: float = 0.0
+    prepaid_config: dict = field(default_factory=dict)
 
     # Receipt context
     identity: str = ""  # this node's ID
@@ -77,10 +84,11 @@ class AdmissionResult:
     gate: AdmissionDecision
     pricing: PricingResult
     receipt: Document  # admission_decision receipt
+    prepaid: Optional[PrepaidResult] = None
 
 
 def run_admission(ctx: AdmissionContext) -> AdmissionResult:
-    """Run the full admission pipeline: price → gate → receipt.
+    """Run the full admission pipeline: price → prepaid → gate → receipt.
 
     Pure function: no side effects. Caller handles bus events,
     storage writes, and response construction.
@@ -95,31 +103,63 @@ def run_admission(ctx: AdmissionContext) -> AdmissionResult:
             discount_rules=ctx.discount_rules,
             cost_projection=ctx.cost_projection,
             skill_min_price=ctx.skill_min_price,
+            meter_count=ctx.meter_count,
         ),
         ctx.pricing_config,
     )
 
-    # Step 2: Gate check with effective price
-    gate = check_admission(
-        AdmissionRequest(
-            caller_key=ctx.caller_key,
+    # Step 2: Prepaid check (before gate check)
+    prepaid = evaluate_prepaid(
+        PrepaidRequest(
+            peer_key=ctx.caller_key,
             skill_name=ctx.skill_name,
-            base_price=pricing.final_price,
-            balance=ctx.balance,
-            soft_limit=ctx.soft_limit,
-            hard_limit=ctx.hard_limit,
-            tit_for_tat=ctx.tit_for_tat,
-        )
+            price=pricing.final_price,
+            prepaid_balance=ctx.prepaid_balance,
+            deduction_timing="at_execution",  # Default timing
+        ),
+        ctx.prepaid_config,
     )
 
-    # Step 3: Build admission decision receipt
+    # Step 3: Gate check with effective price
+    # If prepaid action is "reject", use that outcome; otherwise proceed normally
+    if prepaid.action == "reject":
+        gate = AdmissionDecision(
+            outcome="hard_block",
+            effective_price=pricing.final_price,
+            balance_after=ctx.balance,
+            reason=f"Prepaid rejection: {prepaid.reason}",
+        )
+    elif prepaid.action == "deduct":
+        gate = AdmissionDecision(
+            outcome="accepted",
+            effective_price=0.0,
+            balance_after=ctx.balance,
+            reason=prepaid.reason,
+        )
+    else:
+        gate = check_admission(
+            AdmissionRequest(
+                caller_key=ctx.caller_key,
+                skill_name=ctx.skill_name,
+                base_price=pricing.final_price,
+                balance=ctx.balance,
+                soft_limit=ctx.soft_limit,
+                hard_limit=ctx.hard_limit,
+                tit_for_tat=ctx.tit_for_tat,
+                meter_count=ctx.meter_count,
+                meter_max_count=ctx.meter_max_count,
+            )
+        )
+
+    # Step 4: Build admission decision receipt
     receipt = admission_decision(
         skill_name=ctx.skill_name,
         decision={
             "outcome": gate.outcome,
-            "effective_price": pricing.final_price,
+            "effective_price": gate.effective_price,
             "balance_before": ctx.balance,
             "balance_after": gate.balance_after,
+            "prepaid_action": prepaid.action,
         },
         identity=ctx.identity,
         counterparty=ctx.counterparty,
@@ -131,6 +171,12 @@ def run_admission(ctx: AdmissionContext) -> AdmissionResult:
             "floor_applied": pricing.floor_applied,
             "cap_applied": pricing.cap_applied,
         },
+        prepaid={
+            "action": prepaid.action,
+            "amount": prepaid.amount,
+            "remaining": prepaid.remaining,
+            "reason": prepaid.reason,
+        } if prepaid else None,
     )
 
-    return AdmissionResult(gate=gate, pricing=pricing, receipt=receipt)
+    return AdmissionResult(gate=gate, pricing=pricing, prepaid=prepaid, receipt=receipt)

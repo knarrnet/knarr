@@ -51,6 +51,7 @@ class PricingConfig:
     markup_minimum: float = 1.1  # cost * markup = dynamic floor
     min_price: float = 0.01  # absolute minimum price
     global_min_price: float = 0.0  # v0.33.0 global floor
+    bounty_decay: float = 1.0  # F1 - Multiplicative decay factor for bounties (0.8 = 20% decay per execution)
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,7 @@ class PricingRequest:
     discount_rules: List[DiscountRule] = field(default_factory=list)
     cost_projection: Optional[float] = None
     skill_min_price: Optional[float] = None  # per-skill floor override
+    meter_count: int = 0  # F1 - Used for bounty decay calculation
 
 
 @dataclass(frozen=True)
@@ -86,6 +88,15 @@ def resolve_price(req: PricingRequest, config: PricingConfig) -> PricingResult:
     Pure function: no side effects, no I/O, no SQL.
     The caller loads discount rules and cost projections before calling.
     """
+    # Free skills (base_price=0.0) are intentional — no discounts, no floor
+    if req.base_price == 0.0:
+        return PricingResult(
+            final_price=0.0, base_price=0.0,
+            cost_projection=req.cost_projection, rules_applied=[],
+            discount_mode=config.discount_mode, floor_price=0.0,
+            floor_applied=False, cap_applied=False,
+        )
+
     # Reject non-finite base_price (NaN/Inf bypass floor/cap logic)
     if not math.isfinite(req.base_price):
         logger.warning(f"PRICING_INVALID_BASE base_price={req.base_price!r} skill={req.skill_name}")
@@ -99,7 +110,20 @@ def resolve_price(req: PricingRequest, config: PricingConfig) -> PricingResult:
     # Clamp discount_cap_pct to [0, 100]
     effective_cap_pct = min(max(config.discount_cap_pct, 0.0), 100.0)
 
-    price = req.base_price
+    # F1: Apply bounty decay if skill is a bounty (negative price) and meter_count > 0
+    base_price = req.base_price
+    if req.base_price < 0 and req.meter_count > 0:
+        # Clamp decay to (0, 1.0] — 0 would collapse bounty to 0, >1 inflates exponentially
+        clamped_decay = min(max(config.bounty_decay, 1e-9), 1.0)
+        decay_factor = clamped_decay ** req.meter_count
+        base_price = min(req.base_price * decay_factor, 0.0)
+        logger.debug(
+            f"BOUNTY_DECAY skill={req.skill_name} original={req.base_price} "
+            f"count={req.meter_count} decay={config.bounty_decay} "
+            f"result={base_price}"
+        )
+
+    price = base_price
     rules_applied: List[Dict] = []
 
     if not req.discount_rules:
@@ -123,7 +147,7 @@ def resolve_price(req: PricingRequest, config: PricingConfig) -> PricingResult:
     elif config.discount_mode == "additive":
         total_pct = sum(min(max(r.effect_pct, 0.0), 100.0) for r in sorted_rules)
         total_pct = min(total_pct, 100.0)  # cap at 100% discount
-        price = req.base_price * (1.0 - total_pct / 100.0)
+        price = base_price * (1.0 - total_pct / 100.0)
         for rule in sorted_rules:
             rules_applied.append({
                 "name": rule.name,
@@ -133,7 +157,7 @@ def resolve_price(req: PricingRequest, config: PricingConfig) -> PricingResult:
     elif config.discount_mode == "best_wins":
         best = max(sorted_rules, key=lambda r: min(max(r.effect_pct, 0.0), 100.0))
         clamped_pct = min(max(best.effect_pct, 0.0), 100.0)
-        price = req.base_price * (1.0 - clamped_pct / 100.0)
+        price = base_price * (1.0 - clamped_pct / 100.0)
         rules_applied.append({
             "name": best.name,
             "effect_pct": clamped_pct,
@@ -153,11 +177,12 @@ def resolve_price(req: PricingRequest, config: PricingConfig) -> PricingResult:
 
     # Apply discount cap
     cap_applied = False
-    max_discount = req.base_price * (effective_cap_pct / 100.0)
-    actual_discount = req.base_price - price
-    if actual_discount > max_discount:
-        price = req.base_price - max_discount
-        cap_applied = True
+    if base_price >= 0:
+        max_discount = base_price * (effective_cap_pct / 100.0)
+        actual_discount = base_price - price
+        if actual_discount > max_discount:
+            price = base_price - max_discount
+            cap_applied = True
 
     return _apply_floor(price, req, config, rules_applied, cap_applied)
 
@@ -171,6 +196,18 @@ def _apply_floor(
 ) -> PricingResult:
     """Apply price floor (cost projection + minimum price)."""
     floor_applied = False
+
+    if price < 0:
+        return PricingResult(
+            final_price=round(min(price, 0.0), 6),
+            base_price=req.base_price,
+            cost_projection=req.cost_projection,
+            rules_applied=rules_applied,
+            discount_mode=config.discount_mode,
+            floor_price=0.0,
+            floor_applied=False,
+            cap_applied=cap_applied,
+        )
 
     # Dynamic floor from cost projection
     if req.cost_projection is not None and math.isfinite(req.cost_projection) and req.cost_projection > 0:

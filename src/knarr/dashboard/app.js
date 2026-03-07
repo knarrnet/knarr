@@ -31,6 +31,8 @@ function switchTab(n) {
 async function poll() {
     if (activeTab === 'skills' && (currentView === 'execute' || currentView === 'detail')) return;
     if (activeTab === 'wants' && document.getElementById('want-form')?.style.display !== 'none') return;
+    const activeTag = document.activeElement?.tagName;
+    if (activeTag === 'INPUT' || activeTag === 'TEXTAREA' || activeTag === 'SELECT') return;
     const c = TABS[activeTab], ind = document.getElementById('connection-status');
     try {
         if (c.endpoint) {

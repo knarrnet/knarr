@@ -1,5 +1,4 @@
 import json
-import math
 import sqlite3
 import time
 import logging
@@ -143,7 +142,20 @@ class Storage:
                 tasks_provided INTEGER NOT NULL DEFAULT 0,
                 tasks_consumed INTEGER NOT NULL DEFAULT 0,
                 first_seen REAL NOT NULL,
-                last_updated REAL NOT NULL
+                last_updated REAL NOT NULL,
+                held_balance REAL NOT NULL DEFAULT 0.0
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS meter (
+                actor TEXT NOT NULL,
+                skill TEXT NOT NULL,
+                qualifier TEXT DEFAULT '',
+                count INTEGER DEFAULT 0,
+                first_at REAL,
+                last_at REAL,
+                window_seconds REAL DEFAULT 0,
+                PRIMARY KEY (actor, skill, qualifier)
             )
         """)
         # Demand table (Phase 5b)
@@ -253,16 +265,11 @@ class Storage:
                 input_hash TEXT,
                 asset_hash TEXT,
                 error TEXT,
-                created_at REAL,
-                quality_rating INTEGER
+                created_at REAL
             )
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_execlog_job ON execution_log(job_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_execlog_skill ON execution_log(skill_name)")
-        # #16: Ensure quality_rating column exists on DBs created before it was added
-        execlog_cols = {row[1] for row in cursor.execute("PRAGMA table_info(execution_log)").fetchall()}
-        if "quality_rating" not in execlog_cols:
-            cursor.execute("ALTER TABLE execution_log ADD COLUMN quality_rating INTEGER")
 
         # Async jobs (v0.13.0)
         cursor.execute("""
@@ -453,7 +460,7 @@ class Storage:
                 skill_record_json=excluded.skill_record_json,
                 announced_at=excluded.announced_at,
                 ttl=excluded.ttl,
-                is_own=MAX(is_own, excluded.is_own),
+                is_own=excluded.is_own,
                 provider_public_key=excluded.provider_public_key,
                 announce_signature=excluded.announce_signature,
                 provider_msg_id=excluded.provider_msg_id,
@@ -1071,42 +1078,30 @@ class Storage:
 
     # Ledger methods
     def get_or_create_ledger_entry(self, peer_public_key: str, initial_balance: float = 0.0, initial_trust: float = 0.3) -> LedgerEntry:
-        """Gets or creates a ledger entry.
-
-        v0.38.0 A1.2: New entries ALWAYS start at balance=0.0.
-        The initial_balance parameter is accepted for API compatibility but
-        ignored for new entry creation. Existing entries return their stored balance.
-        """
+        """Gets or creates a ledger entry. New entries get initial_balance and initial_trust."""
         conn = self._get_conn()
-        # FIX-007: fetch extended columns (prepaid, hard_limit) if they exist
-        try:
-            cursor = conn.execute(
-                "SELECT peer_public_key, balance, tasks_provided, tasks_consumed, "
-                "first_seen, last_updated, prepaid, hard_limit "
-                "FROM ledger WHERE peer_public_key = ?", (peer_public_key,)
+        cursor = conn.execute(
+            """
+            SELECT peer_public_key, balance, tasks_provided, tasks_consumed,
+                   first_seen, last_updated, COALESCE(prepaid, 0.0),
+                   COALESCE(pub_tab, 0.0), COALESCE(soft_limit, 0.0),
+                   COALESCE(hard_limit, 0.0), COALESCE(held_balance, 0.0),
+                   COALESCE(credit_limit, 0.0), COALESCE(trust, 0.0)
+            FROM ledger WHERE peer_public_key = ?
+            """,
+            (peer_public_key,),
+        )
+        row = cursor.fetchone()
+        if row:
+            return LedgerEntry(
+                peer_public_key=row[0], balance=row[1],
+                tasks_provided=row[2], tasks_consumed=row[3],
+                first_seen=row[4], last_updated=row[5],
+                prepaid=row[6], pub_tab=row[7], soft_limit=row[8],
+                hard_limit=row[9], held_balance=row[10],
+                credit_limit=row[11], trust=row[12],
             )
-            row = cursor.fetchone()
-            if row:
-                return LedgerEntry(
-                    peer_public_key=row[0], balance=row[1],
-                    tasks_provided=row[2], tasks_consumed=row[3],
-                    first_seen=row[4], last_updated=row[5],
-                    prepaid=row[6], hard_limit=row[7],
-                )
-        except Exception:
-            # Pre-migration DB without extended columns — fall back to base query
-            cursor = conn.execute(
-                "SELECT peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated "
-                "FROM ledger WHERE peer_public_key = ?", (peer_public_key,)
-            )
-            row = cursor.fetchone()
-            if row:
-                return LedgerEntry(
-                    peer_public_key=row[0], balance=row[1],
-                    tasks_provided=row[2], tasks_consumed=row[3],
-                    first_seen=row[4], last_updated=row[5]
-                )
-        # Create new entry — A1.2: always start at 0.0
+        # Create new entry
         now = time.time()
         # Cap ledger size
         count = conn.execute("SELECT COUNT(*) FROM ledger").fetchone()[0]
@@ -1119,79 +1114,18 @@ class Storage:
             """)
         conn.execute(
             "INSERT INTO ledger (peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated, trust) "
-            "VALUES (?, 0.0, 0, 0, ?, ?, ?)",
-            (peer_public_key, now, now, initial_trust)
+            "VALUES (?, ?, 0, 0, ?, ?, ?)",
+            (peer_public_key, initial_balance, now, now, initial_trust)
         )
         conn.commit()
         return LedgerEntry(
-            peer_public_key=peer_public_key, balance=0.0,
+            peer_public_key=peer_public_key, balance=initial_balance,
             tasks_provided=0, tasks_consumed=0, first_seen=now, last_updated=now
         )
 
-    def update_prepaid(self, peer_public_key: str, amount: float) -> None:
-        """A2: Update prepaid balance by delta amount.
-
-        Used at the token/credit boundary for deposits.
-        UPDATE ledger SET prepaid = prepaid + amount.
-        """
-        if not math.isfinite(amount) or amount < 0:
-            raise ValueError(f"update_prepaid: amount must be finite and non-negative, got {amount}")
-        conn = self._get_conn()
-        now = time.time()
-        conn.execute(
-            "UPDATE ledger SET prepaid = prepaid + ?, last_updated = ? "
-            "WHERE peer_public_key = ?",
-            (amount, now, peer_public_key),
-        )
-        conn.commit()
-
-    def run_v038_balance_migration(self, default_soft_limit: float = 3.0) -> int:
-        """A1.1: Apply v0.38.0 balance semantic migration.
-
-        Creates bilateral_positions_v037 backup, then adjusts all balances
-        by subtracting default_soft_limit.  Idempotent: uses a kv_meta
-        marker to track whether migration has already run.
-
-        Returns count of rows updated (0 if already migrated).
-        """
-        conn = self._get_conn()
-        # Ensure kv_meta table exists for migration tracking
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS kv_meta "
-            "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-        )
-        # Idempotency check: marker present means migration already ran
-        row = conn.execute(
-            "SELECT value FROM kv_meta WHERE key = 'v038_balance_migrated'"
-        ).fetchone()
-        if row:
-            logger.debug("v0.38.0 balance migration already applied — skipping")
-            return 0
-        # Backup
-        try:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS bilateral_positions_v037 AS "
-                "SELECT * FROM ledger"
-            )
-        except Exception:
-            pass  # already exists
-        # Transform
-        cur = conn.execute(
-            "UPDATE ledger SET balance = balance - ?",
-            (default_soft_limit,)
-        )
-        # Set migration marker
-        conn.execute(
-            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('v038_balance_migrated', '1')"
-        )
-        conn.commit()
-        logger.info(f"v0.38.0 balance migration applied: {cur.rowcount} rows shifted by -{default_soft_limit}")
-        return cur.rowcount
-
     def update_ledger_provider(self, peer_public_key: str, price: float):
         """Provider side: consumer spent credit. Decrement their balance, increment tasks_provided."""
-        if not math.isfinite(price):
-            raise ValueError(f"update_ledger_provider: price must be finite, got {price}")
+        # print(f"DEBUG: update_ledger_provider key={peer_public_key[:8]}... price={price}")
         conn = self._get_conn()
         now = time.time()
         cursor = conn.execute("""
@@ -1201,12 +1135,11 @@ class Storage:
                 last_updated = ?
             WHERE peer_public_key = ?
         """, (price, now, peer_public_key))
+        # print(f"DEBUG: updated {cursor.rowcount} rows")
         conn.commit()
 
     def update_ledger_consumer(self, peer_public_key: str, price: float):
         """Consumer side: provider earned credit. Increment their balance, increment tasks_consumed."""
-        if not math.isfinite(price):
-            raise ValueError(f"update_ledger_consumer: price must be finite, got {price}")
         conn = self._get_conn()
         now = time.time()
         conn.execute("""
@@ -1228,43 +1161,187 @@ class Storage:
     def get_all_ledger_entries(self) -> List[Dict[str, Any]]:
         """Returns all ledger entries. Feeds cockpit economy panel."""
         conn = self._get_conn()
-        # B5: Include prepaid, pub_tab, soft_limit, hard_limit (v0.31.0 columns)
-        # Use COALESCE for backward compat with pre-migration databases
         cursor = conn.execute("""
             SELECT peer_public_key, balance, tasks_provided, tasks_consumed,
-                   first_seen, last_updated
+                   first_seen, last_updated, COALESCE(prepaid, 0.0),
+                   COALESCE(pub_tab, 0.0), COALESCE(soft_limit, 0.0),
+                   COALESCE(hard_limit, 0.0), COALESCE(held_balance, 0.0),
+                   COALESCE(credit_limit, 0.0), COALESCE(trust, 0.0)
             FROM ledger ORDER BY last_updated DESC
         """)
-        # Detect if new columns exist
-        col_names = [desc[0] for desc in cursor.description]
-        results = []
-        for r in cursor.fetchall():
-            entry = {"peer_public_key": r[0], "balance": r[1], "tasks_provided": r[2],
-                     "tasks_consumed": r[3], "first_seen": r[4], "last_updated": r[5]}
-            results.append(entry)
-        # Try fetching extended columns if migration has run
-        try:
-            ext_cursor = conn.execute("""
-                SELECT peer_public_key, prepaid, pub_tab, soft_limit, hard_limit
-                FROM ledger
-            """)
-            ext_map = {r[0]: {"prepaid": r[1], "pub_tab": r[2],
-                              "soft_limit": r[3], "hard_limit": r[4]}
-                       for r in ext_cursor.fetchall()}
-            for entry in results:
-                ext = ext_map.get(entry["peer_public_key"], {})
-                entry["prepaid"] = ext.get("prepaid", 0.0)
-                entry["pub_tab"] = ext.get("pub_tab", 0.0)
-                entry["soft_limit"] = ext.get("soft_limit", 0.0)
-                entry["hard_limit"] = ext.get("hard_limit", 0.0)
-        except Exception:
-            # Columns don't exist yet (pre-migration) — return defaults
-            for entry in results:
-                entry["prepaid"] = 0.0
-                entry["pub_tab"] = 0.0
-                entry["soft_limit"] = 0.0
-                entry["hard_limit"] = 0.0
-        return results
+        return [
+            {
+                "peer_public_key": r[0],
+                "balance": r[1],
+                "tasks_provided": r[2],
+                "tasks_consumed": r[3],
+                "first_seen": r[4],
+                "last_updated": r[5],
+                "prepaid": r[6],
+                "pub_tab": r[7],
+                "soft_limit": r[8],
+                "hard_limit": r[9],
+                "held_balance": r[10],
+                "credit_limit": r[11],
+                "trust": r[12],
+            }
+            for r in cursor.fetchall()
+        ]
+
+    def credit_prepaid(self, peer_public_key: str, amount: float):
+        """Increase prepaid balance for a peer."""
+        if amount <= 0:
+            return
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE ledger SET prepaid = COALESCE(prepaid, 0.0) + ?, last_updated = ? WHERE peer_public_key = ?",
+            (amount, time.time(), peer_public_key),
+        )
+        conn.commit()
+
+    def deduct_prepaid(self, peer_public_key: str, amount: float):
+        """Decrease prepaid balance for a peer, flooring at zero."""
+        if amount <= 0:
+            return
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE ledger SET prepaid = MAX(COALESCE(prepaid, 0.0) - ?, 0.0), last_updated = ? WHERE peer_public_key = ?",
+            (amount, time.time(), peer_public_key),
+        )
+        conn.commit()
+
+    def hold_balance(self, peer_public_key: str, amount: float):
+        """Increase held bounty balance for a peer."""
+        if amount <= 0:
+            return
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE ledger SET held_balance = COALESCE(held_balance, 0.0) + ?, last_updated = ? WHERE peer_public_key = ?",
+            (amount, time.time(), peer_public_key),
+        )
+        conn.commit()
+
+    def release_held(self, peer_public_key: str, amount: float):
+        """Release held bounty amount into the normal balance."""
+        if amount <= 0:
+            return
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT COALESCE(held_balance, 0.0) FROM ledger WHERE peer_public_key = ?",
+            (peer_public_key,),
+        ).fetchone()
+        releasable = min(float(row[0]) if row else 0.0, amount)
+        conn.execute(
+            "UPDATE ledger SET held_balance = MAX(COALESCE(held_balance, 0.0) - ?, 0.0), balance = balance + ?, last_updated = ? WHERE peer_public_key = ?",
+            (releasable, releasable, time.time(), peer_public_key),
+        )
+        conn.commit()
+
+    def return_held(self, peer_public_key: str, amount: float):
+        """Return held bounty amount without crediting the peer."""
+        if amount <= 0:
+            return
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT COALESCE(held_balance, 0.0) FROM ledger WHERE peer_public_key = ?",
+            (peer_public_key,),
+        ).fetchone()
+        returned = min(float(row[0]) if row else 0.0, amount)
+        conn.execute(
+            "UPDATE ledger SET held_balance = MAX(COALESCE(held_balance, 0.0) - ?, 0.0), last_updated = ? WHERE peer_public_key = ?",
+            (returned, time.time(), peer_public_key),
+        )
+        conn.commit()
+
+    def check_payment_receipt(self, tx_digest: str) -> bool:
+        """Return True if this transaction digest has already been used."""
+        conn = self._get_conn()
+        row = conn.execute("SELECT 1 FROM payment_receipts WHERE tx_digest = ?", (tx_digest,)).fetchone()
+        return row is not None
+
+    def store_payment_receipt(self, tx_digest: str, amount: int, asset: str, destination: str):
+        """Persist a verified payment receipt for replay protection."""
+        conn = self._get_conn()
+        conn.execute(
+            "INSERT OR IGNORE INTO payment_receipts (tx_digest, amount, asset, destination, verified_at) VALUES (?, ?, ?, ?, ?)",
+            (tx_digest, amount, asset, destination, time.time()),
+        )
+        conn.commit()
+
+    def meter_increment(self, actor: str, skill: str, qualifier: str = "", window_seconds: float = 0) -> Dict[str, Any]:
+        """Increment a general-purpose meter, resetting expired windows automatically."""
+        conn = self._get_conn()
+        now = time.time()
+        key = (actor, skill, qualifier)
+        row = conn.execute(
+            "SELECT count, first_at, last_at, window_seconds FROM meter WHERE actor = ? AND skill = ? AND qualifier = ?",
+            key,
+        ).fetchone()
+        if row:
+            count, first_at, _last_at, stored_window = row
+            effective_window = float(window_seconds if window_seconds else stored_window or 0)
+            expired = effective_window > 0 and first_at is not None and (now - float(first_at)) > effective_window
+            if expired:
+                count = 1
+                first_at = now
+            else:
+                count = int(count or 0) + 1
+                first_at = float(first_at or now)
+            conn.execute(
+                "UPDATE meter SET count = ?, first_at = ?, last_at = ?, window_seconds = ? WHERE actor = ? AND skill = ? AND qualifier = ?",
+                (count, first_at, now, effective_window, *key),
+            )
+        else:
+            effective_window = float(window_seconds or 0)
+            count = 1
+            first_at = now
+            conn.execute(
+                "INSERT INTO meter (actor, skill, qualifier, count, first_at, last_at, window_seconds) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (actor, skill, qualifier, count, now, now, effective_window),
+            )
+        conn.commit()
+        return {
+            "actor": actor,
+            "skill": skill,
+            "qualifier": qualifier,
+            "count": count,
+            "first_at": first_at,
+            "last_at": now,
+            "window_seconds": effective_window,
+        }
+
+    def meter_get(self, actor: str, skill: str, qualifier: str = "") -> Optional[Dict[str, Any]]:
+        """Return current meter state, deleting expired windowed rows."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT count, first_at, last_at, window_seconds FROM meter WHERE actor = ? AND skill = ? AND qualifier = ?",
+            (actor, skill, qualifier),
+        ).fetchone()
+        if not row:
+            return None
+        count, first_at, last_at, window_seconds = row
+        now = time.time()
+        if float(window_seconds or 0) > 0 and first_at is not None and (now - float(first_at)) > float(window_seconds):
+            self.meter_reset(actor, skill, qualifier)
+            return None
+        return {
+            "actor": actor,
+            "skill": skill,
+            "qualifier": qualifier,
+            "count": int(count or 0),
+            "first_at": first_at,
+            "last_at": last_at,
+            "window_seconds": float(window_seconds or 0),
+        }
+
+    def meter_reset(self, actor: str, skill: str, qualifier: str = ""):
+        """Delete a meter row."""
+        conn = self._get_conn()
+        conn.execute(
+            "DELETE FROM meter WHERE actor = ? AND skill = ? AND qualifier = ?",
+            (actor, skill, qualifier),
+        )
+        conn.commit()
 
     def poll_task_results(self, limit: int = 20, status: str = "unread") -> list:
         """E4: Query mail_jobreport + mail_system, merged and sorted by timestamp."""
@@ -2018,8 +2095,7 @@ class Storage:
         """Check if there's already a pending settlement for this peer."""
         conn = self._get_conn()
         # B1/S-025: escape LIKE metacharacters to prevent injection
-        # v0.36.0: use full key — truncation to 32 chars risks prefix collisions
-        escaped_key = self._escape_like(peer_public_key)
+        escaped_key = self._escape_like(peer_public_key[:32])
         row = conn.execute(
             "SELECT 1 FROM settlement_queue WHERE status = 'pending' AND body LIKE ? ESCAPE '\\'",
             (f'%{escaped_key}%',)
@@ -2105,176 +2181,5 @@ class Storage:
         """, (max_entries,))
         conn.commit()
 
-    # ------------------------------------------------------------------
-    # v0.37.0: DMZ quarantine CRUD (Warehouse Manager)
-    # ------------------------------------------------------------------
-
-    def quarantine_store(
-        self,
-        id: str,
-        document_type: str,
-        document_json: str,
-        originator_pubkey: str,
-        status: str,
-        gate_results: str,
-        reason: str | None,
-    ) -> None:
-        """Insert a document into the DMZ quarantine table."""
-        conn = self._get_conn()
-        now = time.time()
-        conn.execute(
-            """INSERT OR REPLACE INTO dmz_quarantine
-               (id, document_type, document_json, originator_pubkey,
-                status, gate_results, reason, received_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (id, document_type, document_json, originator_pubkey,
-             status, gate_results, reason, now),
-        )
-        conn.commit()
-        logger.debug(f"DMZ_QUARANTINE_STORE id={id[:16]} type={document_type} status={status}")
-
-    def quarantine_get(self, id: str) -> Optional[Dict]:
-        """Retrieve a single quarantine entry by ID."""
-        conn = self._get_conn()
-        cursor = conn.execute(
-            """SELECT id, document_type, document_json, originator_pubkey,
-                      status, gate_results, reason, received_at,
-                      promoted_at, resolved_at
-               FROM dmz_quarantine WHERE id = ?""",
-            (id,),
-        )
-        row = cursor.fetchone()
-        if not row:
-            return None
-        return dict(zip(
-            ["id", "document_type", "document_json", "originator_pubkey",
-             "status", "gate_results", "reason", "received_at",
-             "promoted_at", "resolved_at"],
-            row,
-        ))
-
-    def quarantine_update_status(
-        self,
-        id: str,
-        status: str,
-        reason: str | None = None,
-        promoted_at: float | None = None,
-        resolved_at: float | None = None,
-    ) -> None:
-        """Update the status of a quarantine entry."""
-        conn = self._get_conn()
-        conn.execute(
-            """UPDATE dmz_quarantine
-               SET status = ?,
-                   reason = COALESCE(?, reason),
-                   promoted_at = COALESCE(?, promoted_at),
-                   resolved_at = COALESCE(?, resolved_at)
-               WHERE id = ?""",
-            (status, reason, promoted_at, resolved_at, id),
-        )
-        conn.commit()
-        logger.debug(f"DMZ_QUARANTINE_UPDATE id={id[:16]} status={status}")
-
-    def quarantine_list_pending(self) -> List[Dict]:
-        """Return all quarantine entries with status='pending'."""
-        return self.quarantine_list_by_status("pending")
-
-    def quarantine_list_by_status(self, status: str) -> List[Dict]:
-        """Return all quarantine entries matching the given status."""
-        conn = self._get_conn()
-        cursor = conn.execute(
-            """SELECT id, document_type, document_json, originator_pubkey,
-                      status, gate_results, reason, received_at,
-                      promoted_at, resolved_at
-               FROM dmz_quarantine WHERE status = ?
-               ORDER BY received_at ASC""",
-            (status,),
-        )
-        cols = [
-            "id", "document_type", "document_json", "originator_pubkey",
-            "status", "gate_results", "reason", "received_at",
-            "promoted_at", "resolved_at",
-        ]
-        return [dict(zip(cols, r)) for r in cursor.fetchall()]
-
     def close(self):
         self._keepalive_conn.close()
-
-
-class StorageStub:
-    """Minimal stub for unit tests. In-memory SQLite with receipt_log only.
-
-    Tests that need full Storage should use Storage(":memory:") instead.
-    This stub exists for receipt-focused tests that don't need the full schema.
-    """
-
-    _RECEIPT_LOG_DDL = """
-        CREATE TABLE IF NOT EXISTS receipt_log (
-            receipt_id      TEXT PRIMARY KEY,
-            document_type   TEXT NOT NULL,
-            timestamp       TEXT NOT NULL,
-            identity        TEXT NOT NULL,
-            counterparty    TEXT,
-            order_ref       TEXT,
-            proof_purpose   TEXT NOT NULL,
-            payload_json    TEXT NOT NULL,
-            signature       TEXT,
-            created_at      REAL NOT NULL
-        )
-    """
-
-    def __init__(self, db_path: str = ":memory:"):
-        self.db_path = db_path
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute(self._RECEIPT_LOG_DDL)
-        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_log_type ON receipt_log(document_type)")
-        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_log_identity ON receipt_log(identity)")
-        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_log_ts ON receipt_log(timestamp)")
-        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_log_order ON receipt_log(order_ref)")
-        self._conn.commit()
-
-    def write_receipt(self, receipt_id, document_type, timestamp, identity,
-                      counterparty, order_ref, proof_purpose, payload_json, signature):
-        """INSERT OR IGNORE into receipt_log. Idempotent."""
-        self._conn.execute(
-            """INSERT OR IGNORE INTO receipt_log
-               (receipt_id, document_type, timestamp, identity, counterparty,
-                order_ref, proof_purpose, payload_json, signature, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (receipt_id, document_type, timestamp, identity, counterparty,
-             order_ref, proof_purpose, payload_json, signature, time.time()),
-        )
-        self._conn.commit()
-
-    def get_receipt(self, receipt_id):
-        cursor = self._conn.execute(
-            "SELECT receipt_id, document_type, timestamp, identity, counterparty, "
-            "order_ref, proof_purpose, payload_json, signature, created_at "
-            "FROM receipt_log WHERE receipt_id = ?", (receipt_id,))
-        row = cursor.fetchone()
-        if not row:
-            return None
-        return dict(zip(["receipt_id", "document_type", "timestamp", "identity",
-                         "counterparty", "order_ref", "proof_purpose",
-                         "payload_json", "signature", "created_at"], row))
-
-    def get_receipts_by_type(self, document_type):
-        cursor = self._conn.execute(
-            "SELECT receipt_id, document_type, timestamp, identity, counterparty, "
-            "order_ref, proof_purpose, payload_json, signature, created_at "
-            "FROM receipt_log WHERE document_type = ? ORDER BY created_at ASC",
-            (document_type,))
-        cols = ["receipt_id", "document_type", "timestamp", "identity",
-                "counterparty", "order_ref", "proof_purpose",
-                "payload_json", "signature", "created_at"]
-        return [dict(zip(cols, r)) for r in cursor.fetchall()]
-
-    def count_receipts(self, document_type=None):
-        if document_type:
-            cursor = self._conn.execute(
-                "SELECT COUNT(*) FROM receipt_log WHERE document_type = ?",
-                (document_type,))
-        else:
-            cursor = self._conn.execute("SELECT COUNT(*) FROM receipt_log")
-        return cursor.fetchone()[0]

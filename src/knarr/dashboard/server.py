@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 import hmac
 import json
 import logging
@@ -56,6 +57,26 @@ def _html_escape(s: str) -> str:
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#x27;")
 
 
+class RingBufferHandler(logging.Handler):
+    """In-memory log sink for the cockpit logs endpoint."""
+
+    def __init__(self, maxlen: int = 1000):
+        super().__init__()
+        self._records = deque(maxlen=maxlen)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._records.append({
+            "created": record.created,
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        })
+
+    def tail(self, limit: int = 100) -> list[dict]:
+        limit = max(1, min(int(limit), len(self._records) or 1))
+        return list(self._records)[-limit:]
+
+
 class CockpitServer:
     """Lightweight HTTP server for the Knarr Cockpit dashboard."""
 
@@ -77,16 +98,8 @@ class CockpitServer:
         self._exposures = self._build_exposure_index(exposures or {})
         self._rate_limits: Dict[str, Dict[str, list]] = {}  # path -> {ip: [timestamps]}
         self._token_counters: Dict[str, Dict[str, dict]] = {}  # path -> {token: {count, day}}
-        # v0.38.0 A3.2: Wallet HMAC auth + spending caps
-        self._wallet_daily_spent: float = 0.0
-        self._wallet_daily_reset: float = time.time()
-        # FIX-002: HMAC replay guard — track seen signatures within timestamp window
-        self._seen_wallet_sigs: dict = {}  # {sig_hex: expiry_time}
-        self._sig_sweep_interval: float = 60.0
-        self._last_sig_sweep: float = time.time()
-        # FIX-003: Spend cap lock to prevent TOCTOU race
-        import asyncio as _asyncio
-        self._wallet_send_lock = _asyncio.Lock()
+        self._log_handler = RingBufferHandler(maxlen=1000)
+        logging.getLogger().addHandler(self._log_handler)
 
     @property
     def port(self) -> int:
@@ -137,6 +150,7 @@ class CockpitServer:
             self._server.close()
             await self._server.wait_closed()
             logger.info("Cockpit dashboard stopped")
+        logging.getLogger().removeHandler(self._log_handler)
 
     @staticmethod
     def _build_exposure_index(exposures: Dict[str, Any]) -> Dict[str, dict]:
@@ -164,6 +178,9 @@ class CockpitServer:
                 "mode": cfg.get("mode", "auto"),
                 "timeout": int(cfg.get("timeout", 30)),
                 "timeout_ms": int(cfg.get("timeout_ms", 0)),
+                "payment": cfg.get("payment", "none"),
+                "payment_asset": cfg.get("payment_asset", ""),
+                "payment_assets": cfg.get("payment_assets", []),
                 "payment_address": cfg.get("payment_address", ""),
                 "payment_network": cfg.get("payment_network", ""),
                 "payment_amount": cfg.get("payment_amount", ""),
@@ -320,8 +337,8 @@ class CockpitServer:
                 return
 
             # Auth check for API endpoints
-            # Exempt: GET /api/skills/*/schema (read-only), GET /api/assets/* without remote proxy (local read-only)
-            auth_exempt = path.endswith("/schema")
+            # Exempt: GET /api/assets/* without remote proxy (local read-only)
+            auth_exempt = False
             if auth_exempt is False and method == "GET" and path.startswith("/api/assets/") and not query.get("host"):
                 auth_exempt = True
             if path.startswith("/api/") and not auth_exempt:
@@ -437,15 +454,10 @@ class CockpitServer:
                         status_filter = query.get("status", ["unread"])[0]
                         results = self._node.storage.poll_task_results(limit, status_filter)
                         self._respond_json(writer, {"results": results, "count": len(results)})
+                    elif path == "/api/logs":
+                        self._handle_logs(writer, query)
                     elif path == "/api/reputation":
                         self._respond_json(writer, self._node.get_reputation_summary())
-                    elif path.startswith("/api/skills/") and path.endswith("/schema"):
-                        skill_name = path.split("/")[3]
-                        data = self._node.get_skill_schema(skill_name)
-                        if data:
-                            self._respond_json(writer, data)
-                        else:
-                            self._respond_404(writer)
                     elif path == "/api/secrets":
                         self._respond_json(writer, self._node.get_secrets_summary())
                     elif path.startswith("/api/secrets/"):
@@ -473,19 +485,6 @@ class CockpitServer:
                         # v0.32.0: GET /api/receipts/{reference} — fetch credit note by job_id
                         reference = path[len("/api/receipts/"):]
                         await self._handle_receipt_fetch(writer, reference)
-                    # v0.36.0: Settlement cockpit endpoints
-                    elif path == "/api/positions":
-                        await self._handle_positions(writer)
-                    elif path == "/api/settlements":
-                        await self._handle_settlements(writer, query)
-                    # v0.38.0 A3.3: Wallet read endpoints (bearer auth only)
-                    elif path == "/api/wallet/balance":
-                        await self._handle_wallet_balance(writer)
-                    elif path == "/api/wallet/address":
-                        await self._handle_wallet_address(writer)
-                    # v0.38.0 A5.4: Netting query endpoint
-                    elif path == "/api/netting/query":
-                        await self._handle_netting_query(writer, query)
                     else:
                         try:
                             content, content_type = self._serve_static(path)
@@ -542,6 +541,8 @@ class CockpitServer:
                         self._handle_pricing_discount_upsert(writer, body)
                     elif path == "/api/groups/refresh":
                         self._handle_groups_refresh(writer, body)
+                    elif path == "/api/settlements/execute":
+                        await self._handle_settlement_execute(writer, body)
                     elif path.startswith("/api/groups/") and path.endswith("/members"):
                         group_name = path[len("/api/groups/"):-len("/members")]
                         self._handle_group_member_manage(writer, group_name, body)
@@ -549,13 +550,6 @@ class CockpitServer:
                         # v0.32.0: P1 — on-demand upgrade trigger (auth required)
                         result = await self._handle_upgrade_check()
                         self._respond_json(writer, result)
-                    # v0.36.0: Manual settlement trigger
-                    elif path.startswith("/api/settle/"):
-                        peer_key = path[len("/api/settle/"):]
-                        await self._handle_manual_settle(writer, peer_key)
-                    # v0.38.0 A3.3: Wallet send (bearer + HMAC required)
-                    elif path == "/api/wallet/send":
-                        await self._handle_wallet_send(writer, body, headers)
                     else:
                         self._respond_404(writer)
                 elif method == "PUT":
@@ -1443,7 +1437,7 @@ class CockpitServer:
             if not self._check_token_rate_limit(exposure_path, token, exposure):
                 self._respond_cors_error(writer, 429, "Too Many Requests")
                 return
-            await self._handle_exposure_execute(writer, body, exposure)
+            await self._handle_exposure_execute(writer, body, exposure, headers)
         elif action == "status" and method == "GET":
             token = self._check_exposure_auth(exposure, headers)
             if token is None:
@@ -1728,7 +1722,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
             "fields": exposed,
         })
 
-    async def _handle_exposure_execute(self, writer, body, exposure):
+    async def _handle_exposure_execute(self, writer, body, exposure, headers=None):
         """POST /s/{path}/execute — Validate, merge presets, execute."""
         if len(body) > 65536:
             self._respond_cors_error(writer, 413, "Request Too Large")
@@ -1743,6 +1737,81 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
         if not isinstance(data, dict):
             self._respond_cors_error(writer, 400, "Invalid input")
             return
+
+        headers = headers or {}
+        payment_mode = exposure.get("payment", "none")
+        if payment_mode != "none":
+            payment_sig = headers.get("payment-signature", "")
+            chain_cfg = self._node._chain
+            expected_amount = exposure.get("payment_amount") or exposure.get("price") or 0
+            expected_asset = exposure.get("payment_asset") or chain_cfg.get("token_mint", "")
+            expected_dest = exposure.get("payment_address", "")
+            node_address = self._node._wallet
+            # Fail closed: reject if asset or destination not configured
+            if not expected_asset or not expected_dest:
+                logger.error(f"x402 config incomplete: asset={expected_asset!r} dest={expected_dest!r}")
+                self._respond_cors_error(writer, 500, "Payment configuration incomplete: payment_asset and payment_address required")
+                return
+            if not payment_sig:
+                try:
+                    from ..commerce.x402 import build_payment_required
+
+                    pr = build_payment_required(chain_cfg, exposure, node_address)
+                except Exception as exc:
+                    logger.error(f"x402 build failed: {type(exc).__name__}: {exc}")
+                    self._respond_cors_error(writer, 500, "Payment configuration invalid")
+                    return
+                self._respond_cors(
+                    writer,
+                    "402 Payment Required",
+                    "application/json",
+                    json.dumps(pr).encode("utf-8"),
+                )
+                return
+            try:
+                import base64 as _b64, hashlib as _hl
+                from ..commerce.x402 import verify_x402_payload, settle_x402
+
+                # Persistent replay check — survives restarts, no TTL gap
+                try:
+                    _raw = _b64.b64decode(payment_sig, validate=True)
+                    _digest = _hl.sha256(_raw).hexdigest()
+                except Exception:
+                    self._respond_cors_error(writer, 403, "payment-signature must be base64 transaction bytes")
+                    return
+                if self._node.storage.check_payment_receipt(_digest):
+                    self._respond_cors_error(writer, 403, "replay detected")
+                    return
+
+                verify_result = verify_x402_payload(
+                    payment_sig,
+                    expected_amount,
+                    expected_asset,
+                    expected_dest,
+                    node_address,
+                )
+                if not verify_result.get("verified"):
+                    self._respond_cors_error(writer, 403, verify_result.get("error", "Invalid payment"))
+                    return
+
+                # Persist receipt before settlement — fail-closed on crash
+                self._node.storage.store_payment_receipt(
+                    _digest, verify_result["amount"],
+                    verify_result["asset"], verify_result["destination"],
+                )
+
+                settle_result = await settle_x402(
+                    verify_result["tx_bytes"],
+                    getattr(self._node, "_signing_key", None),
+                    chain_cfg.get("rpc_url", ""),
+                )
+                if not settle_result.get("success"):
+                    self._respond_cors_error(writer, 502, settle_result.get("error", "Payment settlement failed"))
+                    return
+            except Exception as exc:
+                logger.error(f"x402 verify/settle failed: {type(exc).__name__}: {exc}")
+                self._respond_cors_error(writer, 502, "Payment verification failed")
+                return
 
         fields = exposure.get("fields", {})
         presets = exposure.get("presets", {})
@@ -1913,7 +1982,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
             self._respond_cors_error(writer, 404, "Job not found")
             return
         
-        # 410 Gone for expired jobs
+        # Elder review: 410 Gone for expired jobs
         if job["status"] == "expired":
             self._respond_cors(writer, "410 Gone", "application/json", json.dumps({
                 "status": "expired",
@@ -1955,113 +2024,6 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
             if _bus:
                 _bus.emit("security.auth_failed", source_ip=(source_ip or "")[:20], endpoint=(endpoint or "")[:40])
         return result
-
-    def _check_wallet_auth(
-        self, method: str, path: str, body: bytes | str, headers: dict
-    ) -> bool:
-        """v0.38.0 A3.2: HMAC authentication for wallet write operations.
-
-        Verifies X-Wallet-Signature header using:
-            HMAC-SHA256(send_secret, timestamp + "\\n" + method + "\\n" + path + "\\n" + body)
-
-        Also verifies X-Wallet-Timestamp is within ±30 seconds.
-        """
-        import hashlib as _hashlib
-        wallet_cfg = self._node._config.get("cockpit", {}).get("wallet", {})
-        send_secret = wallet_cfg.get("send_secret", "")
-        if not send_secret:
-            # No secret configured — reject all wallet write requests
-            logger.warning("WALLET_AUTH_FAIL: send_secret not configured")
-            return False
-
-        timestamp_window = int(wallet_cfg.get("timestamp_window_seconds", 30))
-
-        # Get and validate timestamp
-        ts_header = headers.get("x-wallet-timestamp", "")
-        if not ts_header:
-            logger.warning("WALLET_AUTH_FAIL: missing X-Wallet-Timestamp")
-            return False
-        try:
-            ts = int(ts_header)
-        except (ValueError, TypeError):
-            logger.warning(f"WALLET_AUTH_FAIL: unparseable timestamp {ts_header!r}")
-            return False
-
-        if abs(time.time() - ts) > timestamp_window:
-            logger.warning(
-                f"WALLET_AUTH_FAIL: timestamp {ts} outside window "
-                f"(now={int(time.time())} window={timestamp_window}s)"
-            )
-            return False
-
-        # Get signature from header
-        sig_header = headers.get("x-wallet-signature", "")
-        if not sig_header:
-            logger.warning("WALLET_AUTH_FAIL: missing X-Wallet-Signature")
-            return False
-
-        # Build body string for signing
-        if isinstance(body, bytes):
-            body_str = body.decode("utf-8", errors="replace")
-        else:
-            body_str = body or ""
-
-        # Compute expected HMAC
-        msg = f"{ts}\n{method}\n{path}\n{body_str}"
-        expected_sig = hmac.new(
-            send_secret.encode("utf-8"),
-            msg.encode("utf-8"),
-            _hashlib.sha256,
-        ).hexdigest()
-
-        # Constant-time compare
-        if not hmac.compare_digest(sig_header.encode(), expected_sig.encode()):
-            logger.warning("WALLET_AUTH_FAIL: signature mismatch")
-            return False
-
-        # FIX-002: Replay guard — reject duplicate (timestamp, signature) tuples
-        sig_key = f"{ts}:{sig_header}"
-        now_replay = time.time()
-        if sig_key in self._seen_wallet_sigs:
-            logger.warning("WALLET_AUTH_FAIL: replayed signature")
-            return False
-        # Record signature with expiry (window + margin)
-        self._seen_wallet_sigs[sig_key] = now_replay + timestamp_window + 5
-        # Periodic sweep of expired entries
-        if now_replay - self._last_sig_sweep > self._sig_sweep_interval:
-            self._seen_wallet_sigs = {
-                k: v for k, v in self._seen_wallet_sigs.items() if v > now_replay
-            }
-            self._last_sig_sweep = now_replay
-
-        return True
-
-    def _check_wallet_spend_cap(self, amount: float) -> tuple[bool, str]:
-        """v0.38.0 A3.3: Check per-tx and daily spending caps.
-
-        Returns (allowed, reason).
-        """
-        wallet_cfg = self._node._config.get("cockpit", {}).get("wallet", {})
-        max_per_tx = float(wallet_cfg.get("max_per_tx", 100.0))
-        max_daily = float(wallet_cfg.get("max_daily", 1000.0))
-
-        # Per-tx cap
-        if amount > max_per_tx:
-            return False, f"amount {amount} exceeds per-tx cap {max_per_tx}"
-
-        # Daily rolling cap: reset if > 24h since last reset
-        now = time.time()
-        if now - self._wallet_daily_reset > 86400:
-            self._wallet_daily_spent = 0.0
-            self._wallet_daily_reset = now
-
-        if self._wallet_daily_spent + amount > max_daily:
-            return False, (
-                f"daily cap exceeded: spent={self._wallet_daily_spent:.2f} "
-                f"+ requested={amount:.2f} > max={max_daily:.2f}"
-            )
-
-        return True, ""
 
     def _serve_static(self, path: str) -> tuple[bytes, str]:
         """Returns (content_bytes, content_type). Raises FileNotFoundError."""
@@ -2305,6 +2267,69 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
             engine.refresh(group_name)
         self._respond_json(writer, {"status": "ok"})
 
+    def _handle_logs(self, writer, query: dict):
+        """GET /api/logs?limit=100 — return recent in-memory logs."""
+        try:
+            limit = int(query.get("limit", ["100"])[0])
+        except Exception:
+            limit = 100
+        limit = max(1, min(limit, 1000))
+        logs = self._log_handler.tail(limit)
+        self._respond_json(writer, {"logs": logs, "count": len(logs)})
+
+    async def _handle_settlement_execute(self, writer, body: bytes):
+        """POST /api/settlements/execute — execute a countersigned settlement."""
+        try:
+            data = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            self._respond_error(writer, 400, "Invalid JSON")
+            return
+
+        peer_key = str(data.get("peer_key", "")).strip()
+        prepared_doc = data.get("prepared_doc")
+        countersigned_doc = data.get("countersigned_doc")
+        if len(peer_key) != 64 or any(c not in "0123456789abcdefABCDEF" for c in peer_key):
+            self._respond_error(writer, 400, "Invalid peer_key")
+            return
+        if not isinstance(prepared_doc, dict) or not isinstance(countersigned_doc, dict):
+            self._respond_error(writer, 400, "prepared_doc and countersigned_doc are required")
+            return
+
+        try:
+            from ..commerce.settlement_execution import execute_settlement
+
+            authority_vm = str(countersigned_doc.get("proof", {}).get("verificationMethod", ""))
+            authority_signing_key = getattr(self._node, "_cockpit_signing_key", None)
+            if authority_vm.endswith("#thrall-1"):
+                authority_signing_key = getattr(self._node, "_thrall_signing_key", authority_signing_key)
+            authority_verify_key = (
+                authority_signing_key.verify_key
+                if authority_signing_key is not None
+                else self._node._signing_key.verify_key
+            )
+
+            receipt_id = await execute_settlement(
+                prepared_doc=prepared_doc,
+                countersigned_doc=countersigned_doc,
+                node_verify_key=self._node._signing_key.verify_key,
+                authority_verify_key=authority_verify_key,
+                node_id=self._node.node_info.node_id,
+                signing_key=self._node._signing_key,
+                peer_key=peer_key,
+                storage=self._node.storage,
+                send_mail_fn=self._node._sync.enqueue,
+                bus=getattr(self._node, "bus", None),
+            )
+        except ValueError as exc:
+            self._respond_error(writer, 400, str(exc))
+            return
+        except Exception as exc:
+            logger.error(f"Settlement execute failed: {type(exc).__name__}: {exc}")
+            self._respond_error(writer, 500, "Settlement execution failed")
+            return
+
+        self._respond_json(writer, {"status": "ok", "receipt_id": receipt_id})
+
     async def _handle_receipt_fetch(self, writer, reference: str):
         """GET /api/receipts/{reference} — fetch signed credit note by job_id.
 
@@ -2323,349 +2348,6 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
             self._respond_json(writer, {"status": "ok", "credit_note": note_json})
         except Exception as e:
             logger.error(f"Receipt fetch error ref={reference}: {e}")
-            self._respond_error(writer, 500, "Internal error")
-
-    # ── v0.38.0: Wallet API endpoints ──────────────────────────────────────
-
-    async def _handle_wallet_balance(self, writer) -> None:
-        """GET /api/wallet/balance — return hot wallet token + SOL balance.
-
-        Bearer auth only (read). No HMAC required.
-        """
-        try:
-            # Try to fetch via solana-rpc skill
-            result = {}
-            try:
-                res = await self._node.call_local("solana-rpc", {"action": "get_balance"})
-                if isinstance(res, dict):
-                    result = res
-            except Exception:
-                pass
-            self._respond_json(writer, {
-                "status": "ok",
-                "token_balance": result.get("token_balance", 0.0),
-                "sol_balance": result.get("sol_balance", 0.0),
-                "address": result.get("address", ""),
-            })
-        except Exception as exc:
-            self._respond_error(writer, 500, str(exc))
-
-    async def _handle_wallet_address(self, writer) -> None:
-        """GET /api/wallet/address — return hot wallet address.
-
-        Bearer auth only (read). No HMAC required.
-        """
-        try:
-            vault = getattr(self._node, '_vault', None)
-            address = ""
-            if vault and hasattr(vault, 'get'):
-                seed_hex = vault.get("__wallet__", "hot_seed")
-                if seed_hex:
-                    from knarr.core.wallet import derive_solana_address
-                    from nacl.signing import SigningKey
-                    seed = bytes.fromhex(seed_hex)
-                    address = derive_solana_address(SigningKey(seed))
-            if not address:
-                address = getattr(self._node, '_wallet', '') or ""
-            self._respond_json(writer, {"status": "ok", "address": address})
-        except Exception as exc:
-            self._respond_error(writer, 500, str(exc))
-
-    async def _handle_wallet_send(self, writer, body: bytes, headers: dict) -> None:
-        """POST /api/wallet/send — submit a token transfer.
-
-        Requires bearer token + HMAC signature. Enforces per-tx and daily caps.
-        """
-        import math as _math
-
-        # HMAC auth check (mandatory — bearer alone is not sufficient)
-        if not self._check_wallet_auth("POST", "/api/wallet/send", body, headers):
-            self._respond_error(writer, 401, "WALLET_AUTH_FAILED")
-            return
-
-        try:
-            data = json.loads(body)
-        except Exception:
-            self._respond_error(writer, 400, "Invalid JSON body")
-            return
-
-        to_address = data.get("to", "")
-        amount_raw = data.get("amount", 0)
-
-        try:
-            amount = float(amount_raw)
-        except (TypeError, ValueError):
-            self._respond_error(writer, 400, "amount must be numeric")
-            return
-
-        if not _math.isfinite(amount) or amount <= 0:
-            self._respond_error(writer, 400, f"amount must be positive finite, got {amount!r}")
-            return
-
-        if not isinstance(to_address, str) or not to_address:
-            self._respond_error(writer, 400, "to must be non-empty string")
-            return
-
-        # FIX-003: Atomic spend cap check + send under lock to prevent TOCTOU
-        async with self._wallet_send_lock:
-            # Spending cap check
-            allowed, cap_reason = self._check_wallet_spend_cap(amount)
-            if not allowed:
-                self._respond_error(writer, 403, f"SPEND_CAP_EXCEEDED: {cap_reason}")
-                return
-
-            # Pre-reserve spend before yielding to send
-            self._wallet_daily_spent += amount
-
-        # Submit transaction (outside lock to avoid holding during RPC)
-        try:
-            tx_result = await self._node.call_local(
-                "solana-rpc",
-                {"action": "send", "to": to_address, "amount": amount},
-            )
-            if isinstance(tx_result, dict) and not tx_result.get("error"):
-                self._respond_json(writer, {"status": "ok", "tx_hash": tx_result.get("tx_hash", ""), "amount": amount})
-            else:
-                # Refund the pre-reserved amount on failure
-                self._wallet_daily_spent -= amount
-                self._respond_error(writer, 500, f"TX_FAILED: {tx_result}")
-        except Exception as exc:
-            # Refund the pre-reserved amount on exception
-            self._wallet_daily_spent -= amount
-            self._respond_error(writer, 500, f"TX_ERROR: {exc}")
-
-    # ── v0.38.0: Netting query endpoint ─────────────────────────────────────
-
-    async def _handle_netting_query(self, writer, query: dict) -> None:
-        """GET /api/netting/query?scope=book&raw=false
-
-        Returns settlement positions or proposals depending on raw flag.
-        """
-        scope = query.get("scope", ["book"])[0] if isinstance(query.get("scope"), list) else query.get("scope", "book")
-        raw_str = query.get("raw", ["false"])[0] if isinstance(query.get("raw"), list) else query.get("raw", "false")
-        raw = raw_str.lower() in ("true", "1", "yes")
-        target = query.get("target", [None])[0] if isinstance(query.get("target"), list) else query.get("target")
-
-        try:
-            from knarr.commerce.netting_query import query as nq_query
-            results = nq_query(
-                storage=self._node.storage,
-                scope=scope,
-                target=target,
-                raw=raw,
-                config=getattr(self._node, '_config', {}),
-                resolve_policy_fn=getattr(self._node, '_resolve_policy', None),
-            )
-            self._respond_json(writer, {"status": "ok", "scope": scope, "raw": raw, "results": results})
-        except Exception as exc:
-            self._respond_error(writer, 500, str(exc))
-
-    # ── v0.36.0: Settlement cockpit endpoints ──────────────────────────────
-
-    async def _handle_positions(self, writer) -> None:
-        """GET /api/positions — bilateral balances + utilization for all peers.
-
-        Source: storage.get_all_ledger_entries() + compute utilization.
-        Returns a list of position objects, one per peer.
-        """
-        try:
-            entries = self._node.storage.get_all_ledger_entries()
-            positions = []
-            for entry in entries:
-                pk = entry.get("peer_public_key", "")
-                balance = float(entry.get("balance", 0.0))
-                prepaid = float(entry.get("prepaid", 0.0))
-                pub_tab = float(entry.get("pub_tab", 0.0))
-                soft_limit = float(entry.get("soft_limit", -5.0))
-                hard_limit = float(entry.get("hard_limit", -10.0))
-
-                # Resolve credit limits from policy
-                try:
-                    ic, mb = self._node._resolve_policy(pk, "")
-                    credit_range = ic - mb
-                    utilization = (ic - balance) / credit_range if credit_range > 0 else 0.0
-                    effective_hard_limit = mb
-                    effective_soft_limit = ic
-                except Exception:
-                    credit_range = abs(hard_limit - soft_limit)
-                    utilization = abs(balance) / abs(hard_limit) if hard_limit != 0 else 0.0
-                    effective_hard_limit = hard_limit
-                    effective_soft_limit = soft_limit
-
-                import math
-                positions.append({
-                    "peer_key": pk,
-                    "balance": round(balance, 4),
-                    "prepaid": round(prepaid, 4),
-                    "pub_tab": round(pub_tab, 4),
-                    "utilization": round(utilization, 4) if math.isfinite(utilization) else 0.0,
-                    "soft_limit": round(effective_soft_limit, 4),
-                    "hard_limit": round(effective_hard_limit, 4),
-                    "credit_range": round(credit_range, 4),
-                })
-            self._respond_json(writer, {"positions": positions, "count": len(positions)})
-        except Exception as e:
-            logger.error(f"Positions endpoint error: {e}")
-            self._respond_error(writer, 500, "Internal error")
-
-    async def _handle_settlements(self, writer, query: dict) -> None:
-        """GET /api/settlements — settlement history from receipt_log.
-
-        Queries receipt_log for all settlement document types.
-        Optional query param: limit (default 50, max 200).
-        """
-        try:
-            import sqlite3
-            limit = min(int((query.get("limit", ["50"]) or ["50"])[0]), 200)
-
-            conn = self._node.storage._get_conn()
-            rows = conn.execute(
-                """
-                SELECT receipt_id, document_type, timestamp, counterparty,
-                       order_ref, payload_json, signature
-                FROM receipt_log
-                WHERE document_type IN (
-                    'settlement_prepared', 'settlement_accepted',
-                    'settlement_processed', 'settlement_confirmation'
-                )
-                ORDER BY rowid DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-
-            settlements = []
-            for row in rows:
-                receipt_id, doc_type, ts, counterparty, order_ref, payload_json_str, sig = row
-                amount = None
-                try:
-                    payload = json.loads(payload_json_str) if payload_json_str else {}
-                    amount = payload.get("amount") or payload.get("amount_settled") or payload.get("amount_confirmed")
-                except Exception:
-                    payload = {}
-
-                settlements.append({
-                    "receipt_id": receipt_id,
-                    "document_type": doc_type,
-                    "counterparty": counterparty,
-                    "amount": amount,
-                    "timestamp": ts,
-                    "order_ref": order_ref,
-                    "signed": sig is not None,
-                })
-
-            self._respond_json(writer, {"settlements": settlements, "count": len(settlements)})
-        except Exception as e:
-            logger.error(f"Settlements endpoint error: {e}")
-            self._respond_error(writer, 500, "Internal error")
-
-    async def _handle_manual_settle(self, writer, peer_key: str) -> None:
-        """POST /api/settle/{peer_key} — manual settlement trigger.
-
-        Runs the settlement engine for the specified peer.
-        Returns the prepared_tx (settlement_prepared Document) for operator review.
-        The cockpit countersigns if a cockpit keypair exists.
-
-        Response: {prepared_doc, needs_countersign: bool, receipt_id}
-        """
-        try:
-            import math
-            from ..commerce.settlement_engine import SettlementInput, evaluate_settlement
-            from ..commerce.settlement_execution import prepare_settlement
-
-            if not peer_key or len(peer_key) < 16:
-                self._respond_error(writer, 400, "Invalid peer_key")
-                return
-
-            # Look up ledger entry for this peer
-            entries = self._node.storage.get_all_ledger_entries()
-            entry = next((e for e in entries if e.get("peer_public_key") == peer_key), None)
-            if not entry:
-                self._respond_error(writer, 404, f"No ledger entry for peer: {peer_key[:16]}")
-                return
-
-            balance = float(entry.get("balance", 0.0))
-            prepaid = float(entry.get("prepaid", 0.0))
-            pub_tab = float(entry.get("pub_tab", 0.0))
-
-            try:
-                ic, mb = self._node._resolve_policy(peer_key, "")
-                credit_range = ic - mb
-                utilization = (ic - balance) / credit_range if credit_range > 0 else 0.0
-            except Exception:
-                credit_range = 10.0
-                utilization = abs(balance) / 10.0 if balance else 0.0
-                ic = 0.0
-                mb = -10.0
-
-            economy_cfg = self._node._config.get("economy", {})
-            settlement_cfg = economy_cfg.get("settlement", {})
-
-            inp = SettlementInput(
-                peer_key=peer_key,
-                balance=balance,
-                prepaid=prepaid if math.isfinite(prepaid) else 0.0,
-                pub_tab=pub_tab if math.isfinite(pub_tab) else 0.0,
-                soft_limit=float(ic),
-                hard_limit=float(mb),
-                credit_limit=credit_range,
-                tasks_provided=0,
-                tasks_consumed=0,
-                utilization=utilization if math.isfinite(utilization) else 0.0,
-            )
-
-            output = evaluate_settlement(inp, settlement_cfg)
-
-            # Build prepared doc even if engine says "skip" (manual override)
-            formula = (
-                f"balance={balance:.2f} utilization={utilization:.1%} "
-                f"target={settlement_cfg.get('soft_target', 0.5):.1%}"
-            )
-            amount = output.amount if output.action == "settle" else balance
-
-            if not self._node._signing_key:
-                self._respond_error(writer, 503, "Node signing key not available")
-                return
-
-            prepared_doc = await prepare_settlement(
-                node_id=self._node.node_info.node_id,
-                peer_key=peer_key,
-                amount=amount,
-                formula=formula,
-                proposer_balance=balance,
-                counterparty_balance_claimed=-balance,
-                utilization=utilization if math.isfinite(utilization) else 0.0,
-                target_utilization=float(settlement_cfg.get("soft_target", 0.5)),
-                signing_key=self._node._signing_key,
-                storage=self._node.storage,
-                bus=getattr(self._node, "bus", None),
-            )
-
-            # Cockpit countersign if keypair available (B6)
-            needs_countersign = True
-            cockpit_key = getattr(self._node, "_cockpit_signing_key", None)
-            if cockpit_key:
-                try:
-                    from ..core.proof import sign_document as _sign_doc
-                    cockpit_vm = f"did:knarr:{self._node.node_info.node_id}#cockpit-1"
-                    # Sign the payload (without node proof) using cockpit key
-                    doc_payload = {k: v for k, v in prepared_doc.items() if k != "proof"}
-                    countersigned = _sign_doc(doc_payload, cockpit_key, cockpit_vm)
-                    # v0.36.0: Append cockpit proof as authority_proof — preserve node proof
-                    prepared_doc["authority_proof"] = countersigned["proof"]
-                    needs_countersign = False
-                except Exception as e:
-                    logger.warning(f"COCKPIT_COUNTERSIGN_FAIL: {e}")
-
-            self._respond_json(writer, {
-                "prepared_doc": prepared_doc,
-                "needs_countersign": needs_countersign,
-                "engine_action": output.action,
-                "engine_reason": output.reason,
-                "receipt_id": prepared_doc.get("receipt_id", ""),
-            })
-        except Exception as e:
-            logger.error(f"Manual settle error peer={peer_key[:16] if peer_key else '?'}: {e}")
             self._respond_error(writer, 500, "Internal error")
 
     async def _handle_upgrade_check(self) -> dict:

@@ -81,20 +81,20 @@ _TYPE_REGISTRY: Dict[str, Set[str]] = {
     # v0.38.0: Netting document types (A5.1)
     "netting_reconcile": {
         "netting_id", "identity", "counterparty",
-        "proposed_net", "receipt_count", "chain_id",
+        "proposed_net", "receipt_count", "chain_id", "token",
     },
     "netting_proposal": {
         "netting_id", "identity", "counterparty",
-        "settlement_amount", "chain_id", "token_mint",
+        "settlement_amount", "chain_id", "token",
         "target_address", "deadline",
     },
     "netting_acceptance": {
         "netting_id", "proposal_ref", "identity", "counterparty",
-        "accepted_amount", "source_address",
+        "accepted_amount", "source_address", "token",
     },
     "netting_executed": {
         "netting_id", "acceptance_ref", "identity", "counterparty",
-        "tx_hash", "chain_id", "amount",
+        "tx_hash", "chain_id", "amount", "token",
     },
 }
 
@@ -459,7 +459,7 @@ def cache_object(
 
 def netting_reconcile(
     netting_id: str, identity: str, counterparty: str,
-    proposed_net: float, receipt_count: int, chain_id: str,
+    proposed_net: float, receipt_count: int, chain_id: str, token: str = "KNARR",
     **extra: Any,
 ) -> Document:
     """Netting step 1: initiator proposes net position for reconciliation."""
@@ -470,14 +470,15 @@ def netting_reconcile(
         "proposed_net": proposed_net,
         "receipt_count": receipt_count,
         "chain_id": chain_id,
+        "token": token,
         **extra,
     })
 
 
 def netting_proposal(
     netting_id: str, identity: str, counterparty: str,
-    settlement_amount: float, chain_id: str, token_mint: str,
-    target_address: str, deadline: str,
+    settlement_amount: float, chain_id: str, token: str = "KNARR",
+    target_address: str = "", deadline: str = "",
     **extra: Any,
 ) -> Document:
     """Netting step 2: initiator proposes specific on-chain settlement."""
@@ -487,7 +488,7 @@ def netting_proposal(
         "counterparty": counterparty,
         "settlement_amount": settlement_amount,
         "chain_id": chain_id,
-        "token_mint": token_mint,
+        "token": token,
         "target_address": target_address,
         "deadline": deadline,
         **extra,
@@ -497,7 +498,7 @@ def netting_proposal(
 def netting_acceptance(
     netting_id: str, proposal_ref: str,
     identity: str, counterparty: str,
-    accepted_amount: float, source_address: str,
+    accepted_amount: float, source_address: str, token: str = "KNARR",
     **extra: Any,
 ) -> Document:
     """Netting step 3: counterparty accepts and commits source wallet."""
@@ -508,6 +509,7 @@ def netting_acceptance(
         "counterparty": counterparty,
         "accepted_amount": accepted_amount,
         "source_address": source_address,
+        "token": token,
         **extra,
     })
 
@@ -515,7 +517,7 @@ def netting_acceptance(
 def netting_executed(
     netting_id: str, acceptance_ref: str,
     identity: str, counterparty: str,
-    tx_hash: str, chain_id: str, amount: float,
+    tx_hash: str, chain_id: str, amount: float, token: str = "KNARR",
     **extra: Any,
 ) -> Document:
     """Netting step 4: counterparty reports on-chain execution."""
@@ -527,5 +529,6 @@ def netting_executed(
         "tx_hash": tx_hash,
         "chain_id": chain_id,
         "amount": amount,
+        "token": token,
         **extra,
     })

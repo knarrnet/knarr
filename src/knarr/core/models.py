@@ -108,27 +108,20 @@ class Task:
 
 @dataclass(frozen=True)
 class LedgerEntry:
-    """Bilateral balance with a specific peer.
-
-    v0.38.0 A1.2: Added prepaid, pub_tab, soft_limit, hard_limit, credit_limit.
-
-    Sign convention:
-        Negative balance = they owe us (they consumed more, net debtor).
-        Positive balance = we owe them (they provided more, net creditor).
-        Zero = even. New entries start at 0.0.
-    """
+    """Bilateral balance with a specific peer."""
     peer_public_key: str
     balance: float = 0.0
     tasks_provided: int = 0
     tasks_consumed: int = 0
     first_seen: float = 0.0
     last_updated: float = 0.0
-    # v0.38.0: extended bilateral fields
-    prepaid: float = 0.0        # on-chain pre-deposited credits (always >= 0)
-    pub_tab: float = 0.0        # publicly visible tab amount
-    soft_limit: float = -5.0    # soft credit limit (negative)
-    hard_limit: float = -10.0   # hard credit limit (negative, hard floor)
-    credit_limit: float = 3.0   # maximum positive credit we extend (positive)
+    prepaid: float = 0.0
+    pub_tab: float = 0.0
+    soft_limit: float = 0.0
+    hard_limit: float = 0.0
+    held_balance: float = 0.0
+    credit_limit: float = 0.0
+    trust: float = 0.0
 
 @dataclass(frozen=True)
 class Policy:
