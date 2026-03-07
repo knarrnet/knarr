@@ -453,7 +453,7 @@ class Storage:
                 skill_record_json=excluded.skill_record_json,
                 announced_at=excluded.announced_at,
                 ttl=excluded.ttl,
-                is_own=excluded.is_own,
+                is_own=MAX(is_own, excluded.is_own),
                 provider_public_key=excluded.provider_public_key,
                 announce_signature=excluded.announce_signature,
                 provider_msg_id=excluded.provider_msg_id,
