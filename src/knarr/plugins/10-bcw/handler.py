@@ -37,13 +37,17 @@ def derive_counterparty_address(master_seed: bytes, node_id: str, chain_id: str)
     except ValueError:
         raise ValueError(f"node_id must be valid hex, got {node_id[:16]}...")
     seed = hashlib.sha256(master_seed + node_id.encode("utf-8")).digest()
-    if chain_id == "solana-mainnet":
+    if not isinstance(chain_id, str):
+        raise ValueError(f"Unsupported chain: {chain_id}")
+    if chain_id.startswith("solana-"):
         return derive_solana_address(SigningKey(seed))
     raise ValueError(f"Unsupported chain: {chain_id}")
 
 
 def _derive_master_address(master_seed: bytes, chain_id: str) -> str:
-    if chain_id == "solana-mainnet":
+    if not isinstance(chain_id, str):
+        raise ValueError(f"Unsupported chain: {chain_id}")
+    if chain_id.startswith("solana-"):
         return derive_solana_address(SigningKey(master_seed))
     raise ValueError(f"Unsupported chain: {chain_id}")
 
@@ -200,7 +204,7 @@ class BCWPlugin(PluginHooks):
         self._solana_modules: dict[str, SolanaWatcher] = {}
         for chain_cfg in self._config.get("chains", []):
             chain_id = str(chain_cfg.get("chain_id", ""))
-            if chain_id == "solana-mainnet":
+            if chain_id.startswith("solana-"):
                 self._solana_modules[chain_id] = SolanaWatcher(chain_id, chain_cfg)
 
         self._master_seed = self._load_master_seed()
@@ -555,7 +559,7 @@ class BCWPlugin(PluginHooks):
 
 
 def _chain_topic(chain_id: str) -> str:
-    if chain_id.startswith("solana"):
+    if chain_id.startswith("solana-"):
         return "solana"
     return chain_id.replace("-", "_")
 

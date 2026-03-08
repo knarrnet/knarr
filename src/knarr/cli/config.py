@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import os
 import re
@@ -32,20 +33,53 @@ def merge_defaults(defaults: dict, overrides: dict) -> dict:
             result[key] = defaults[key]
     return result
 
+def deep_merge(base: dict, override: dict) -> dict:
+    """Merge override into base. Override wins on leaf conflicts.
+
+    Key-level deep merge — not section replacement. If both base and override
+    have the same key as a dict, recurse. Otherwise override wins.
+    Returns an independent copy — mutations to result never affect base.
+    """
+    result = copy.deepcopy(base)
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+# Tier file names, load order, and their valid top-level sections.
+# knarr.skills.toml existed since v0.37.0; knarr.economy.toml and
+# knarr.mail.toml are new in v0.40.0.
+_TIER_FILES = [
+    ("knarr.economy.toml", {"economy", "settlement", "policy", "pricing", "netting", "prepaid"}),
+    ("knarr.skills.toml",  {"skills"}),
+    ("knarr.mail.toml",    {"mail"}),
+]
+
+import logging as _logging
+_cfg_log = _logging.getLogger(__name__)
+
+
 def load_config(path: Path, explicit: bool = False) -> dict:
-    """Load and validate knarr.toml. Returns merged config with defaults."""
+    """Load and validate knarr.toml, then deep-merge optional tier files.
+
+    Tier files (knarr.economy.toml, knarr.skills.toml, knarr.mail.toml) are
+    loaded from the same directory as knarr.toml.  Missing tier files are
+    silently skipped.  Returns merged config with defaults applied.
+    """
     if not path.exists():
         if explicit:
             print(f"Error: Config file not found: {path}", file=sys.stderr)
             print(f"  Check the path passed to --config.", file=sys.stderr)
             sys.exit(1)
         return DEFAULT_CONFIG
-    
+
     try:
         with open(path, "rb") as f:
             raw = tomllib.load(f)
         _warn_unknown_keys(raw, path)
-        return merge_defaults(DEFAULT_CONFIG, raw)
     except tomllib.TOMLDecodeError as e:
         print(f"Error: Invalid TOML in {path}: {e}", file=sys.stderr)
         sys.exit(1)
@@ -53,6 +87,50 @@ def load_config(path: Path, explicit: bool = False) -> dict:
         print(f"Error in {path}: {e}", file=sys.stderr)
         print("Check the configuration reference in the README.", file=sys.stderr)
         sys.exit(1)
+
+    # v0.40.0: load tier files from same directory, deep-merge into base config
+    config_dir = path.parent
+    for tier_filename, tier_valid_sections in _TIER_FILES:
+        tier_path = config_dir / tier_filename
+        if not tier_path.exists():
+            continue
+        try:
+            with open(tier_path, "rb") as f:
+                tier_raw = tomllib.load(f)
+            _warn_unknown_keys_tier(tier_raw, tier_path, tier_valid_sections)
+            # Strip sections that don't belong in this tier file
+            for section in list(tier_raw.keys()):
+                if section not in tier_valid_sections:
+                    _cfg_log.warning(
+                        f"CONFIG_TIER_STRIPPED file={tier_filename} "
+                        f"section={section} — not valid for this tier file"
+                    )
+                    del tier_raw[section]
+            # Validate keys within tier sections against known keys
+            _warn_unknown_keys(tier_raw, tier_path)
+            # Log any keys that override the base config
+            for section in tier_raw:
+                if section in raw and isinstance(raw.get(section), dict) and isinstance(tier_raw[section], dict):
+                    for key in tier_raw[section]:
+                        if key in raw.get(section, {}):
+                            _cfg_log.debug(
+                                f"CONFIG_TIER_OVERRIDE file={tier_filename} "
+                                f"section={section} key={key}"
+                            )
+                elif section in raw:
+                    _cfg_log.debug(
+                        f"CONFIG_TIER_OVERRIDE file={tier_filename} section={section}"
+                    )
+            raw = deep_merge(raw, tier_raw)
+        except tomllib.TOMLDecodeError as e:
+            print(f"Error: Invalid TOML in {tier_path}: {e}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error in {tier_path}: {e}", file=sys.stderr)
+            print("Check the configuration reference in the README.", file=sys.stderr)
+            sys.exit(1)
+
+    return merge_defaults(DEFAULT_CONFIG, raw)
 
 _KNOWN_KEYS = {
     "node": {"port", "host", "storage", "advertise_host", "sidecar_port", "max_asset_size",
@@ -80,6 +158,23 @@ def _warn_unknown_keys(raw: dict, path: Path):
             for key in raw[section]:
                 if key not in known:
                     print(f"Warning: Unknown key '{key}' in [{section}] in {path}", file=sys.stderr)
+
+
+def _warn_unknown_keys_tier(raw: dict, path: Path, valid_sections: set):
+    """Warn about top-level sections in a tier file that don't belong there.
+
+    Tier files have a fixed set of valid top-level sections.  Keys within
+    those sections are not re-validated here — that happens when the merged
+    config is fed into _warn_unknown_keys().
+    """
+    for section in raw:
+        if section not in valid_sections:
+            valid_str = "/".join(sorted(valid_sections))
+            print(
+                f"Warning: Unknown key '[{section}]' in {path.name} "
+                f"— expected {valid_str} sections",
+                file=sys.stderr,
+            )
 
 def load_handler(handler_spec: str, config_dir: str, skill_name: Optional[str] = None) -> Any:
     """Load a handler function from a file path spec."""

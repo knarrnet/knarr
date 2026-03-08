@@ -47,6 +47,7 @@ MAX_TASK_DEDUP_SIZE = 5000
 HEARTBEAT_CHECK_INTERVAL = 10    # seconds between heartbeat scans
 HEARTBEAT_SILENCE_THRESHOLD = 90  # seconds of silence before dedicated heartbeat
 PEER_DEAD_TIMEOUT = 300          # seconds before removing silent peer
+PEER_HEARTBEAT_SWEEP_TIMEOUT = 10.0
 MIN_PEER_FLOOR = 8  # never prune below this many peers
 
 def _parse_version(v: str) -> tuple:
@@ -4157,6 +4158,36 @@ class DHTNode:
         return best_trust
 
     def _resolve_price(self, node_id: str, base_price: float, skill_name: str = "") -> tuple:
+        """Resolve price through the configured pricing engine."""
+        import math
+        if not math.isfinite(base_price) or base_price < 0:
+            logger.warning("PRICING_INVALID base_price=%s skill=%s", base_price, skill_name)
+            from ..core.pricing import PriceBreakdown
+            return 0.0, PriceBreakdown(base_price=0.0, cost_projection=None, rules_applied=[], discount_mode="", floor_price=0.0, floor_applied=True, promotion_applied=False)
+        engine = str(self._config.get("pricing", {}).get("engine", "builtin") or "builtin").strip().lower()
+        if engine == "builtin":
+            return self._resolve_price_builtin(node_id, base_price, skill_name)
+        if engine == "module":
+            from ..commerce.pricing_engine import PricingRequest, resolve_price
+
+            pricing_result = resolve_price(
+                PricingRequest(
+                    base_price=base_price,
+                    skill_name=skill_name,
+                    peer_node_id=node_id,
+                    peer_groups=set(self._group_engine.get_groups(node_id)) if self._group_engine else set(),
+                    discount_rules=self._load_discount_rules(node_id, skill_name),
+                    cost_projection=self._get_cost_projection(skill_name),
+                    skill_min_price=self._get_skill_min_price(skill_name),
+                ),
+                self._build_pricing_config(skill_name),
+            )
+            return pricing_result.final_price, self._pricing_result_to_breakdown(pricing_result)
+
+        logger.warning("PRICING_ENGINE_UNKNOWN engine=%s falling back to builtin", engine)
+        return self._resolve_price_builtin(node_id, base_price, skill_name)
+
+    def _resolve_price_builtin(self, node_id: str, base_price: float, skill_name: str = "") -> tuple:
         """Compute final price with structured breakdown.
 
         Returns (final_price: float, breakdown: PriceBreakdown).
@@ -4786,6 +4817,76 @@ class DHTNode:
             logger.error(f"Netting cycle failed: {exc}")
             return 0
 
+    async def _peer_heartbeat_sweep(self, peers, now):
+        for peer in peers:
+            last_seen = self._peer_last_activity.get(peer.node_id)
+            if last_seen is None:
+                # New peer — initialize activity to now, evaluate next cycle
+                self._peer_last_activity[peer.node_id] = now
+                continue
+            silence = now - last_seen
+
+            if silence > self._peer_dead_timeout:
+                # Dead: no activity of any kind for too long
+                logger.warning(f"Removing dead peer {peer.node_id[:16]} (silent {silence:.0f}s)")
+                await self._enqueue_write(self.storage.remove_peer, peer.node_id)
+                await self._pool.remove(peer.node_id)
+                self._peer_last_activity.pop(peer.node_id, None)
+                continue
+
+            if silence > self._heartbeat_silence_threshold:
+                # Silent: send dedicated heartbeat
+                logger.debug(f"HB_SEND to={peer.node_id[:16]} silence={silence:.0f}s")
+                msg = self._sign(Heartbeat(
+                    node_id=self.node_info.node_id,
+                    timestamp=time.time(),
+                    version=__version__,
+                ))
+                try:
+                    h, p = self.resolve_peer(peer.node_id, peer.host, peer.port)
+                    resp = await self._pool.send(peer.node_id, h, p, msg)
+                except Exception:
+                    logger.debug(f"HB_SEND_FAIL to={peer.node_id[:16]}", exc_info=True)
+                    continue
+                if isinstance(resp, Heartbeat) and verify_message(resp) and verify_node_id(resp):
+                    self._peer_last_activity[peer.node_id] = time.monotonic()
+                    logger.debug(f"HB_SEND_OK to={peer.node_id[:16]}")
+
+                    # v0.17.0: Auto-populate address book cached tier
+                    await self._enqueue_write_proto(
+                        self.storage.upsert_address,
+                        peer.node_id, "cached", None,
+                        peer.host, peer.port,
+                        getattr(peer, 'sidecar_port', 0)
+                    )
+
+                    # v0.17.0: Try to push mail to this peer now that we know they are up
+                    h, p = self.resolve_peer(peer.node_id, peer.host, peer.port)
+                    await self._sync.push_to_peer(peer.node_id, h, p)
+
+                    # H14: Version gating and update notifications
+                    if resp.min_protocol_version and _parse_version(resp.min_protocol_version) > _parse_version(__version__):
+                        if not self._version_gated:
+                            self._version_gated = True
+                            logger.warning(
+                                f"Node version {__version__} is below network minimum {resp.min_protocol_version} "
+                                f"— skills suspended. Update: knarr upgrade"
+                            )
+                            # v0.33.0: node.version_blocked
+                            if self.bus:
+                                self.bus.emit("node.version_blocked", required_version=resp.min_protocol_version, current_version=__version__, identity=self.node_info.node_id)
+                    elif self._version_gated and resp.min_protocol_version:
+                        self._version_gated = False
+                        logger.info(f"Node version {__version__} meets minimum {resp.min_protocol_version} — skills resumed")
+
+                    if resp.version and _parse_version(resp.version) > _parse_version(__version__):
+                        if not hasattr(self, '_notified_version') or self._notified_version != resp.version:
+                            self._notified_version = resp.version
+                            logger.info(f"New knarr version available: {resp.version} (running {__version__})")
+                            # v0.33.0: node.upgrade_available
+                            if self.bus:
+                                self.bus.emit("node.upgrade_available", current_version=__version__, available_version=resp.version, identity=self.node_info.node_id)
+
     async def _heartbeat_tick(self):
         """Single heartbeat maintenance cycle. Separated for resilience."""
         await self._enqueue_write(self.storage.cleanup_expired_jobs)
@@ -4820,6 +4921,10 @@ class DHTNode:
             uptime_seconds=time.monotonic() - self._start_time,
         )
         await self._plugins.on_tick(peers, health)
+        if self.bus:
+            _bus_fired = self.bus.tick()
+            if _bus_fired and self._config.get("node", {}).get("event_bus_debug", False):
+                logger.info(f"BUS_TICK_FIRED fired={_bus_fired}")
 
         await self._pool.evict_idle(self._connection_idle_timeout)
 
@@ -4845,74 +4950,16 @@ class DHTNode:
                         self.bus.emit("node.rebootstrap_failed", error=str(e), identity=self.node_info.node_id)
             return
 
-        for peer in peers:
-            last_seen = self._peer_last_activity.get(peer.node_id)
-            if last_seen is None:
-                # New peer — initialize activity to now, evaluate next cycle
-                self._peer_last_activity[peer.node_id] = now
-                continue
-            silence = now - last_seen
-
-            if silence > self._peer_dead_timeout:
-                # Dead: no activity of any kind for too long
-                logger.warning(f"Removing dead peer {peer.node_id[:16]} (silent {silence:.0f}s)")
-                await self._enqueue_write(self.storage.remove_peer, peer.node_id)
-                await self._pool.remove(peer.node_id)
-                self._peer_last_activity.pop(peer.node_id, None)
-                continue
-
-            if silence > self._heartbeat_silence_threshold:
-                # Silent: send dedicated heartbeat
-                logger.debug(f"HB_SEND to={peer.node_id[:16]} silence={silence:.0f}s")
-                msg = self._sign(Heartbeat(
-                    node_id=self.node_info.node_id,
-                    timestamp=time.time(),
-                    version=__version__,
-                ))
-                try:
-                    h, p = self.resolve_peer(peer.node_id, peer.host, peer.port)
-                    resp = await self._pool.send(peer.node_id, h, p, msg)
-                except Exception:
-                    logger.debug(f"HB_SEND_FAIL to={peer.node_id[:16]}", exc_info=True)
-                    continue
-                if isinstance(resp, Heartbeat) and verify_message(resp) and verify_node_id(resp):
-                    self._peer_last_activity[peer.node_id] = time.monotonic()
-                    logger.debug(f"HB_SEND_OK to={peer.node_id[:16]}")
-                    
-                    # v0.17.0: Auto-populate address book cached tier
-                    await self._enqueue_write_proto(
-                        self.storage.upsert_address,
-                        peer.node_id, "cached", None,
-                        peer.host, peer.port,
-                        getattr(peer, 'sidecar_port', 0)
-                    )
-                    
-                    # v0.17.0: Try to push mail to this peer now that we know they are up
-                    h, p = self.resolve_peer(peer.node_id, peer.host, peer.port)
-                    await self._sync.push_to_peer(peer.node_id, h, p)
-
-                    # H14: Version gating and update notifications
-                    if resp.min_protocol_version and _parse_version(resp.min_protocol_version) > _parse_version(__version__):
-                        if not self._version_gated:
-                            self._version_gated = True
-                            logger.warning(
-                                f"Node version {__version__} is below network minimum {resp.min_protocol_version} "
-                                f"— skills suspended. Update: knarr upgrade"
-                            )
-                            # v0.33.0: node.version_blocked
-                            if self.bus:
-                                self.bus.emit("node.version_blocked", required_version=resp.min_protocol_version, current_version=__version__, identity=self.node_info.node_id)
-                    elif self._version_gated and resp.min_protocol_version:
-                        self._version_gated = False
-                        logger.info(f"Node version {__version__} meets minimum {resp.min_protocol_version} — skills resumed")
-
-                    if resp.version and _parse_version(resp.version) > _parse_version(__version__):
-                        if not hasattr(self, '_notified_version') or self._notified_version != resp.version:
-                            self._notified_version = resp.version
-                            logger.info(f"New knarr version available: {resp.version} (running {__version__})")
-                            # v0.33.0: node.upgrade_available
-                            if self.bus:
-                                self.bus.emit("node.upgrade_available", current_version=__version__, available_version=resp.version, identity=self.node_info.node_id)
+        try:
+            await asyncio.wait_for(
+                self._peer_heartbeat_sweep(peers, now),
+                timeout=PEER_HEARTBEAT_SWEEP_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "PEER_SWEEP_TIMEOUT peer heartbeat sweep exceeded %.1fs",
+                PEER_HEARTBEAT_SWEEP_TIMEOUT,
+            )
 
     async def _event_loop_watchdog(self):
         """Detects event loop blocking by measuring scheduling latency."""
