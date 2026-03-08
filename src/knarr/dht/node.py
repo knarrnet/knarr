@@ -27,7 +27,7 @@ from ..core.messages import (
     sign_message, verify_message, verify_node_id
 )
 from ..core.validation import validate_skill_sheet, validate_task_input, ValidationError
-from ..core.pricing import RealmConfig
+from ..core.pricing import PriceBreakdown, RealmConfig
 from .storage import Storage
 from .protocol import send_message, receive_message, request_response, ProtocolError
 from .sidecar import AssetSidecar, TaskContext
@@ -418,10 +418,14 @@ class DHTNode:
             skill_price = float(admission_meta.get("price", skill_sheet.price if skill_sheet else 1.0))
             prepaid_action = str(admission_meta.get("prepaid_action", "skip"))
             prepaid_amount = float(admission_meta.get("prepaid_amount", 0.0) or 0.0)
+            breakdown_dict = admission_meta.get("breakdown") or {}
+            from ..core.pricing import PriceBreakdown
+            price_breakdown = PriceBreakdown(**breakdown_dict)
         else:
             skill_price = skill_sheet.price if skill_sheet else 1.0
             caller_nid = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
             skill_price, price_breakdown = self._resolve_price(caller_nid, skill_price, skill_name)
+        skill_cfg = self._get_skill_runtime_config(skill_name) or {}
 
         # H21-prep: Job ID propagation
         # For async jobs, msg.task_id is the generated job_id (sent in TaskStatus)
@@ -4275,6 +4279,80 @@ class DHTNode:
         skills_cfg = self._config.get("skills", {})
         skill_cfg = skills_cfg.get(skill_name, {})
         return dict(skill_cfg) if isinstance(skill_cfg, dict) else {}
+
+    def _get_skill_min_price(self, skill_name: str) -> Optional[float]:
+        skill_cfg = self._get_skill_runtime_config(skill_name)
+        if "min_price" not in skill_cfg:
+            return None
+        try:
+            return float(skill_cfg["min_price"])
+        except (TypeError, ValueError):
+            return None
+
+    def _get_cost_projection(self, skill_name: str) -> Optional[float]:
+        try:
+            row = self.storage._get_conn().execute(
+                "SELECT total_cost FROM skill_cost_projection WHERE skill_name = ?",
+                (skill_name,),
+            ).fetchone()
+            return float(row[0]) if row and row[0] is not None else None
+        except Exception:
+            return None
+
+    def _load_discount_rules(self, node_id: str, skill_name: str):
+        from ..commerce.pricing_engine import DiscountRule
+
+        groups = set(self._group_engine.get_groups(node_id)) if self._group_engine else set()
+        rules = []
+        if groups:
+            try:
+                conn = self.storage._get_conn()
+                placeholders = ",".join("?" * len(groups))
+                rows = conn.execute(
+                    f"""
+                    SELECT name, group_name, skill_group, effect_pct, priority
+                    FROM pricing_discounts
+                    WHERE group_name IN ({placeholders})
+                      AND (skill_group = '*' OR skill_group = ?)
+                      AND active = 1
+                    ORDER BY priority DESC
+                    """,
+                    list(groups) + [skill_name],
+                ).fetchall()
+                rules = [
+                    DiscountRule(
+                        name=r[0], group_name=r[1], skill_group=r[2],
+                        effect_pct=float(r[3]), priority=int(r[4]),
+                    )
+                    for r in rows
+                ]
+            except Exception as e:
+                logger.warning(f"PRICING_SQL_FAIL: {e}")
+                rules = []
+
+        if not rules and groups:
+            for group_name, pct_off in self._config.get("pricing", {}).get("discounts", {}).items():
+                if group_name in groups:
+                    rules.append(
+                        DiscountRule(
+                            name=f"toml_{group_name}", group_name=group_name,
+                            skill_group="*", effect_pct=float(pct_off), priority=0,
+                        )
+                    )
+        return rules
+
+    @staticmethod
+    def _pricing_result_to_breakdown(pricing_result) -> PriceBreakdown:
+        return PriceBreakdown(
+            base_price=pricing_result.base_price,
+            cost_projection=pricing_result.cost_projection,
+            rules_applied=pricing_result.rules_applied,
+            discount_mode=pricing_result.discount_mode,
+            floor_price=pricing_result.floor_price,
+            floor_applied=pricing_result.floor_applied,
+            promotion_applied=False,
+            final_price=pricing_result.final_price,
+        )
 
     def _build_pricing_config(self, skill_name: str = ""):
         """Build PricingConfig from node config."""
