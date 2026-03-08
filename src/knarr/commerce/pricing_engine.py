@@ -51,7 +51,7 @@ class PricingConfig:
     markup_minimum: float = 1.1  # cost * markup = dynamic floor
     min_price: float = 0.01  # absolute minimum price
     global_min_price: float = 0.0  # v0.33.0 global floor
-    bounty_decay: float = 1.0  # F1 - Multiplicative decay factor for bounties (0.8 = 20% decay per execution)
+    decay: float = 1.0  # Multiplicative decay factor per meter count
 
 
 @dataclass(frozen=True)
@@ -110,16 +110,19 @@ def resolve_price(req: PricingRequest, config: PricingConfig) -> PricingResult:
     # Clamp discount_cap_pct to [0, 100]
     effective_cap_pct = min(max(config.discount_cap_pct, 0.0), 100.0)
 
-    # F1: Apply bounty decay if skill is a bounty (negative price) and meter_count > 0
+    # F1: Apply price decay by meter count for all price signs.
     base_price = req.base_price
-    if req.base_price < 0 and req.meter_count > 0:
-        # Clamp decay to (0, 1.0] — 0 would collapse bounty to 0, >1 inflates exponentially
-        clamped_decay = min(max(config.bounty_decay, 1e-9), 1.0)
+    if req.meter_count > 0 and config.decay != 1.0:
+        clamped_decay = min(max(config.decay, 1e-9), 2.0)
         decay_factor = clamped_decay ** req.meter_count
-        base_price = min(req.base_price * decay_factor, 0.0)
+        base_price = req.base_price * decay_factor
+        if req.base_price < 0:
+            base_price = min(base_price, 0.0)
+        else:
+            base_price = max(base_price, config.min_price)
         logger.debug(
-            f"BOUNTY_DECAY skill={req.skill_name} original={req.base_price} "
-            f"count={req.meter_count} decay={config.bounty_decay} "
+            f"PRICE_DECAY skill={req.skill_name} original={req.base_price} "
+            f"count={req.meter_count} decay={config.decay} "
             f"result={base_price}"
         )
 

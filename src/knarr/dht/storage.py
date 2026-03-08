@@ -142,20 +142,7 @@ class Storage:
                 tasks_provided INTEGER NOT NULL DEFAULT 0,
                 tasks_consumed INTEGER NOT NULL DEFAULT 0,
                 first_seen REAL NOT NULL,
-                last_updated REAL NOT NULL,
-                held_balance REAL NOT NULL DEFAULT 0.0
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS meter (
-                actor TEXT NOT NULL,
-                skill TEXT NOT NULL,
-                qualifier TEXT DEFAULT '',
-                count INTEGER DEFAULT 0,
-                first_at REAL,
-                last_at REAL,
-                window_seconds REAL DEFAULT 0,
-                PRIMARY KEY (actor, skill, qualifier)
+                last_updated REAL NOT NULL
             )
         """)
         # Demand table (Phase 5b)
@@ -1081,15 +1068,8 @@ class Storage:
         """Gets or creates a ledger entry. New entries get initial_balance and initial_trust."""
         conn = self._get_conn()
         cursor = conn.execute(
-            """
-            SELECT peer_public_key, balance, tasks_provided, tasks_consumed,
-                   first_seen, last_updated, COALESCE(prepaid, 0.0),
-                   COALESCE(pub_tab, 0.0), COALESCE(soft_limit, 0.0),
-                   COALESCE(hard_limit, 0.0), COALESCE(held_balance, 0.0),
-                   COALESCE(credit_limit, 0.0), COALESCE(trust, 0.0)
-            FROM ledger WHERE peer_public_key = ?
-            """,
-            (peer_public_key,),
+            "SELECT peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated, held_balance "
+            "FROM ledger WHERE peer_public_key = ?", (peer_public_key,)
         )
         row = cursor.fetchone()
         if row:
@@ -1097,9 +1077,7 @@ class Storage:
                 peer_public_key=row[0], balance=row[1],
                 tasks_provided=row[2], tasks_consumed=row[3],
                 first_seen=row[4], last_updated=row[5],
-                prepaid=row[6], pub_tab=row[7], soft_limit=row[8],
-                hard_limit=row[9], held_balance=row[10],
-                credit_limit=row[11], trust=row[12],
+                held_balance=row[6] if row[6] is not None else 0.0
             )
         # Create new entry
         now = time.time()
@@ -1113,14 +1091,15 @@ class Storage:
                 )
             """)
         conn.execute(
-            "INSERT INTO ledger (peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated, trust) "
-            "VALUES (?, ?, 0, 0, ?, ?, ?)",
-            (peer_public_key, initial_balance, now, now, initial_trust)
+            "INSERT INTO ledger (peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated, trust, held_balance) "
+            "VALUES (?, ?, 0, 0, ?, ?, ?, ?)",
+            (peer_public_key, initial_balance, now, now, initial_trust, 0.0)
         )
         conn.commit()
         return LedgerEntry(
             peer_public_key=peer_public_key, balance=initial_balance,
-            tasks_provided=0, tasks_consumed=0, first_seen=now, last_updated=now
+            tasks_provided=0, tasks_consumed=0, first_seen=now, last_updated=now,
+            held_balance=0.0
         )
 
     def update_ledger_provider(self, peer_public_key: str, price: float):
@@ -1161,187 +1140,43 @@ class Storage:
     def get_all_ledger_entries(self) -> List[Dict[str, Any]]:
         """Returns all ledger entries. Feeds cockpit economy panel."""
         conn = self._get_conn()
+        # B5: Include prepaid, pub_tab, soft_limit, hard_limit (v0.31.0 columns)
+        # Use COALESCE for backward compat with pre-migration databases
         cursor = conn.execute("""
             SELECT peer_public_key, balance, tasks_provided, tasks_consumed,
-                   first_seen, last_updated, COALESCE(prepaid, 0.0),
-                   COALESCE(pub_tab, 0.0), COALESCE(soft_limit, 0.0),
-                   COALESCE(hard_limit, 0.0), COALESCE(held_balance, 0.0),
-                   COALESCE(credit_limit, 0.0), COALESCE(trust, 0.0)
+                   first_seen, last_updated
             FROM ledger ORDER BY last_updated DESC
         """)
-        return [
-            {
-                "peer_public_key": r[0],
-                "balance": r[1],
-                "tasks_provided": r[2],
-                "tasks_consumed": r[3],
-                "first_seen": r[4],
-                "last_updated": r[5],
-                "prepaid": r[6],
-                "pub_tab": r[7],
-                "soft_limit": r[8],
-                "hard_limit": r[9],
-                "held_balance": r[10],
-                "credit_limit": r[11],
-                "trust": r[12],
-            }
-            for r in cursor.fetchall()
-        ]
-
-    def credit_prepaid(self, peer_public_key: str, amount: float):
-        """Increase prepaid balance for a peer."""
-        if amount <= 0:
-            return
-        conn = self._get_conn()
-        conn.execute(
-            "UPDATE ledger SET prepaid = COALESCE(prepaid, 0.0) + ?, last_updated = ? WHERE peer_public_key = ?",
-            (amount, time.time(), peer_public_key),
-        )
-        conn.commit()
-
-    def deduct_prepaid(self, peer_public_key: str, amount: float):
-        """Decrease prepaid balance for a peer, flooring at zero."""
-        if amount <= 0:
-            return
-        conn = self._get_conn()
-        conn.execute(
-            "UPDATE ledger SET prepaid = MAX(COALESCE(prepaid, 0.0) - ?, 0.0), last_updated = ? WHERE peer_public_key = ?",
-            (amount, time.time(), peer_public_key),
-        )
-        conn.commit()
-
-    def hold_balance(self, peer_public_key: str, amount: float):
-        """Increase held bounty balance for a peer."""
-        if amount <= 0:
-            return
-        conn = self._get_conn()
-        conn.execute(
-            "UPDATE ledger SET held_balance = COALESCE(held_balance, 0.0) + ?, last_updated = ? WHERE peer_public_key = ?",
-            (amount, time.time(), peer_public_key),
-        )
-        conn.commit()
-
-    def release_held(self, peer_public_key: str, amount: float):
-        """Release held bounty amount into the normal balance."""
-        if amount <= 0:
-            return
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT COALESCE(held_balance, 0.0) FROM ledger WHERE peer_public_key = ?",
-            (peer_public_key,),
-        ).fetchone()
-        releasable = min(float(row[0]) if row else 0.0, amount)
-        conn.execute(
-            "UPDATE ledger SET held_balance = MAX(COALESCE(held_balance, 0.0) - ?, 0.0), balance = balance + ?, last_updated = ? WHERE peer_public_key = ?",
-            (releasable, releasable, time.time(), peer_public_key),
-        )
-        conn.commit()
-
-    def return_held(self, peer_public_key: str, amount: float):
-        """Return held bounty amount without crediting the peer."""
-        if amount <= 0:
-            return
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT COALESCE(held_balance, 0.0) FROM ledger WHERE peer_public_key = ?",
-            (peer_public_key,),
-        ).fetchone()
-        returned = min(float(row[0]) if row else 0.0, amount)
-        conn.execute(
-            "UPDATE ledger SET held_balance = MAX(COALESCE(held_balance, 0.0) - ?, 0.0), last_updated = ? WHERE peer_public_key = ?",
-            (returned, time.time(), peer_public_key),
-        )
-        conn.commit()
-
-    def check_payment_receipt(self, tx_digest: str) -> bool:
-        """Return True if this transaction digest has already been used."""
-        conn = self._get_conn()
-        row = conn.execute("SELECT 1 FROM payment_receipts WHERE tx_digest = ?", (tx_digest,)).fetchone()
-        return row is not None
-
-    def store_payment_receipt(self, tx_digest: str, amount: int, asset: str, destination: str):
-        """Persist a verified payment receipt for replay protection."""
-        conn = self._get_conn()
-        conn.execute(
-            "INSERT OR IGNORE INTO payment_receipts (tx_digest, amount, asset, destination, verified_at) VALUES (?, ?, ?, ?, ?)",
-            (tx_digest, amount, asset, destination, time.time()),
-        )
-        conn.commit()
-
-    def meter_increment(self, actor: str, skill: str, qualifier: str = "", window_seconds: float = 0) -> Dict[str, Any]:
-        """Increment a general-purpose meter, resetting expired windows automatically."""
-        conn = self._get_conn()
-        now = time.time()
-        key = (actor, skill, qualifier)
-        row = conn.execute(
-            "SELECT count, first_at, last_at, window_seconds FROM meter WHERE actor = ? AND skill = ? AND qualifier = ?",
-            key,
-        ).fetchone()
-        if row:
-            count, first_at, _last_at, stored_window = row
-            effective_window = float(window_seconds if window_seconds else stored_window or 0)
-            expired = effective_window > 0 and first_at is not None and (now - float(first_at)) > effective_window
-            if expired:
-                count = 1
-                first_at = now
-            else:
-                count = int(count or 0) + 1
-                first_at = float(first_at or now)
-            conn.execute(
-                "UPDATE meter SET count = ?, first_at = ?, last_at = ?, window_seconds = ? WHERE actor = ? AND skill = ? AND qualifier = ?",
-                (count, first_at, now, effective_window, *key),
-            )
-        else:
-            effective_window = float(window_seconds or 0)
-            count = 1
-            first_at = now
-            conn.execute(
-                "INSERT INTO meter (actor, skill, qualifier, count, first_at, last_at, window_seconds) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (actor, skill, qualifier, count, now, now, effective_window),
-            )
-        conn.commit()
-        return {
-            "actor": actor,
-            "skill": skill,
-            "qualifier": qualifier,
-            "count": count,
-            "first_at": first_at,
-            "last_at": now,
-            "window_seconds": effective_window,
-        }
-
-    def meter_get(self, actor: str, skill: str, qualifier: str = "") -> Optional[Dict[str, Any]]:
-        """Return current meter state, deleting expired windowed rows."""
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT count, first_at, last_at, window_seconds FROM meter WHERE actor = ? AND skill = ? AND qualifier = ?",
-            (actor, skill, qualifier),
-        ).fetchone()
-        if not row:
-            return None
-        count, first_at, last_at, window_seconds = row
-        now = time.time()
-        if float(window_seconds or 0) > 0 and first_at is not None and (now - float(first_at)) > float(window_seconds):
-            self.meter_reset(actor, skill, qualifier)
-            return None
-        return {
-            "actor": actor,
-            "skill": skill,
-            "qualifier": qualifier,
-            "count": int(count or 0),
-            "first_at": first_at,
-            "last_at": last_at,
-            "window_seconds": float(window_seconds or 0),
-        }
-
-    def meter_reset(self, actor: str, skill: str, qualifier: str = ""):
-        """Delete a meter row."""
-        conn = self._get_conn()
-        conn.execute(
-            "DELETE FROM meter WHERE actor = ? AND skill = ? AND qualifier = ?",
-            (actor, skill, qualifier),
-        )
-        conn.commit()
+        # Detect if new columns exist
+        col_names = [desc[0] for desc in cursor.description]
+        results = []
+        for r in cursor.fetchall():
+            entry = {"peer_public_key": r[0], "balance": r[1], "tasks_provided": r[2],
+                     "tasks_consumed": r[3], "first_seen": r[4], "last_updated": r[5]}
+            results.append(entry)
+        # Try fetching extended columns if migration has run
+        try:
+            ext_cursor = conn.execute("""
+                SELECT peer_public_key, prepaid, pub_tab, soft_limit, hard_limit
+                FROM ledger
+            """)
+            ext_map = {r[0]: {"prepaid": r[1], "pub_tab": r[2],
+                              "soft_limit": r[3], "hard_limit": r[4]}
+                       for r in ext_cursor.fetchall()}
+            for entry in results:
+                ext = ext_map.get(entry["peer_public_key"], {})
+                entry["prepaid"] = ext.get("prepaid", 0.0)
+                entry["pub_tab"] = ext.get("pub_tab", 0.0)
+                entry["soft_limit"] = ext.get("soft_limit", 0.0)
+                entry["hard_limit"] = ext.get("hard_limit", 0.0)
+        except Exception:
+            # Columns don't exist yet (pre-migration) — return defaults
+            for entry in results:
+                entry["prepaid"] = 0.0
+                entry["pub_tab"] = 0.0
+                entry["soft_limit"] = 0.0
+                entry["hard_limit"] = 0.0
+        return results
 
     def poll_task_results(self, limit: int = 20, status: str = "unread") -> list:
         """E4: Query mail_jobreport + mail_system, merged and sorted by timestamp."""
@@ -2038,6 +1873,42 @@ class Storage:
         )
         conn.commit()
 
+    def get_pending_settlements(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Fetch pending settlement items ordered by priority ASC, created_at ASC."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT id, item_type, from_node, body, priority, created_at "
+            "FROM settlement_queue WHERE status = 'pending' "
+            "ORDER BY priority ASC, created_at ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        items = []
+        for row in rows:
+            body = row[3]
+            if isinstance(body, str):
+                try:
+                    body = json.loads(body)
+                except Exception:
+                    pass
+            items.append({
+                "id": row[0],
+                "item_type": row[1],
+                "from_node": row[2],
+                "body": body,
+                "priority": row[4],
+                "created_at": row[5],
+            })
+        return items
+
+    def mark_settlement_processed(self, item_id: int, status: str = "processed"):
+        """Mark a settlement queue item as processed (or failed)."""
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE settlement_queue SET status = ?, processed_at = ? WHERE id = ?",
+            (status, time.time(), item_id),
+        )
+        conn.commit()
+
     def update_ledger_refund(self, peer_public_key: str, amount: float):
         """Credit note refund: increase consumer's balance (return credit)."""
         import time
@@ -2183,3 +2054,241 @@ class Storage:
 
     def close(self):
         self._keepalive_conn.close()
+
+    # ── Meter methods (F1 - Bounty decay and rate limiting) ───────────────────────
+
+    def meter_increment(self, actor: str, skill: str, qualifier: str = "", window_seconds: float = 0.0) -> Dict[str, Any]:
+        """Increment meter count, with automatic reset if window expired.
+        
+        Args:
+            actor: Node ID of the actor (consumer/executor)
+            skill: Skill name
+            qualifier: Qualifier (coupon code, campaign tag, empty for default)
+            window_seconds: Window duration in seconds (0 = lifetime)
+            
+        Returns:
+            Dictionary with updated meter state
+        """
+        conn = self._get_conn()
+        now = time.time()
+        
+        # Check if entry exists and if window has expired
+        cursor = conn.execute(
+            "SELECT count, first_at, last_at, window_seconds FROM meter WHERE actor = ? AND skill = ? AND qualifier = ?",
+            (actor, skill, qualifier)
+        )
+        row = cursor.fetchone()
+        
+        if row:
+            count, first_at, last_at, existing_window = row
+            # Check if window has expired
+            if window_seconds > 0 and now - first_at > window_seconds:
+                # Reset the meter
+                count = 1
+                first_at = now
+                last_at = now
+            else:
+                # Increment the count
+                count += 1
+                last_at = now
+        else:
+            # Create new meter entry
+            count = 1
+            first_at = now
+            last_at = now
+            existing_window = window_seconds
+        
+        # Insert or update the meter
+        conn.execute("""
+            INSERT INTO meter (actor, skill, qualifier, count, first_at, last_at, window_seconds)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(actor, skill, qualifier) DO UPDATE SET
+                count = excluded.count,
+                first_at = excluded.first_at,
+                last_at = excluded.last_at,
+                window_seconds = excluded.window_seconds
+        """, (actor, skill, qualifier, count, first_at, last_at, window_seconds))
+        
+        conn.commit()
+        
+        return {
+            "actor": actor,
+            "skill": skill,
+            "qualifier": qualifier,
+            "count": count,
+            "first_at": first_at,
+            "last_at": last_at,
+            "window_seconds": window_seconds
+        }
+
+    def meter_get(self, actor: str, skill: str, qualifier: str = "") -> Optional[Dict[str, Any]]:
+        """Get current meter state.
+        
+        Args:
+            actor: Node ID of the actor
+            skill: Skill name  
+            qualifier: Qualifier (empty for default)
+            
+        Returns:
+            Dictionary with meter state or None if not found
+        """
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT count, first_at, last_at, window_seconds FROM meter WHERE actor = ? AND skill = ? AND qualifier = ?",
+            (actor, skill, qualifier)
+        )
+        row = cursor.fetchone()
+        
+        if not row:
+            return None
+        
+        return {
+            "actor": actor,
+            "skill": skill,
+            "qualifier": qualifier,
+            "count": row[0],
+            "first_at": row[1],
+            "last_at": row[2],
+            "window_seconds": row[3]
+        }
+
+    def meter_reset(self, actor: str, skill: str, qualifier: str = ""):
+        """Reset/delete meter entry.
+        
+        Args:
+            actor: Node ID of the actor
+            skill: Skill name
+            qualifier: Qualifier (empty for default)
+        """
+        conn = self._get_conn()
+        conn.execute(
+            "DELETE FROM meter WHERE actor = ? AND skill = ? AND qualifier = ?",
+            (actor, skill, qualifier)
+        )
+        conn.commit()
+
+    # ── Bounty hold methods (F2 - Held balance for quality gates) ─────────────────
+
+    def hold_balance(self, peer_public_key: str, amount: float) -> bool:
+        """Increment held balance for a peer.
+        
+        Args:
+            peer_public_key: Public key of the peer
+            amount: Amount to hold
+            
+        Returns:
+            True if successful, False if would go below zero
+        """
+        conn = self._get_conn()
+        now = time.time()
+        
+        # Get current held balance and regular balance
+        cursor = conn.execute(
+            "SELECT held_balance, balance FROM ledger WHERE peer_public_key = ?",
+            (peer_public_key,)
+        )
+        row = cursor.fetchone()
+        
+        if not row:
+            # Peer doesn't exist, create entry with zero balances
+            conn.execute(
+                "INSERT INTO ledger (peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated, held_balance) "
+                "VALUES (?, 0.0, 0, 0, ?, ?, ?)",
+                (peer_public_key, now, now, amount)
+            )
+            conn.commit()
+            return True
+        
+        current_held = row[0]
+        current_balance = row[1]
+        
+        # Check if this would go below zero (though for held balance we allow negative)
+        new_held = current_held + amount
+        
+        conn.execute(
+            "UPDATE ledger SET held_balance = ? WHERE peer_public_key = ?",
+            (new_held, peer_public_key)
+        )
+        conn.commit()
+        return True
+
+    def release_held(self, peer_public_key: str, amount: float) -> bool:
+        """Decrement held balance and credit to regular balance.
+        
+        Args:
+            peer_public_key: Public key of the peer
+            amount: Amount to release from held to regular balance
+            
+        Returns:
+            True if successful, False if insufficient held balance
+        """
+        conn = self._get_conn()
+        now = time.time()
+        
+        # Get current held balance
+        cursor = conn.execute(
+            "SELECT held_balance, balance FROM ledger WHERE peer_public_key = ?",
+            (peer_public_key,)
+        )
+        row = cursor.fetchone()
+        
+        if not row:
+            return False  # Peer doesn't exist
+        
+        current_held = row[0]
+        current_balance = row[1]
+        
+        if current_held < amount:
+            return False  # Insufficient held balance
+        
+        new_held = current_held - amount
+        new_balance = current_balance + amount
+        
+        conn.execute("""
+            UPDATE ledger SET 
+                held_balance = ?, 
+                balance = ?,
+                last_updated = ?
+            WHERE peer_public_key = ?
+        """, (new_held, new_balance, now, peer_public_key))
+        conn.commit()
+        return True
+
+    def return_held(self, peer_public_key: str, amount: float) -> bool:
+        """Decrement held balance without crediting to regular balance.
+        
+        Args:
+            peer_public_key: Public key of the peer
+            amount: Amount to return from held balance
+            
+        Returns:
+            True if successful, False if insufficient held balance
+        """
+        conn = self._get_conn()
+        now = time.time()
+        
+        # Get current held balance
+        cursor = conn.execute(
+            "SELECT held_balance FROM ledger WHERE peer_public_key = ?",
+            (peer_public_key,)
+        )
+        row = cursor.fetchone()
+        
+        if not row:
+            return False  # Peer doesn't exist
+        
+        current_held = row[0]
+        
+        if current_held < amount:
+            return False  # Insufficient held balance
+        
+        new_held = current_held - amount
+        
+        conn.execute("""
+            UPDATE ledger SET 
+                held_balance = ?,
+                last_updated = ?
+            WHERE peer_public_key = ?
+        """, (new_held, now, peer_public_key))
+        conn.commit()
+        return True

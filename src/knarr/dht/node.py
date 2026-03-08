@@ -27,7 +27,7 @@ from ..core.messages import (
     sign_message, verify_message, verify_node_id
 )
 from ..core.validation import validate_skill_sheet, validate_task_input, ValidationError
-from ..core.pricing import RealmConfig, PriceBreakdown
+from ..core.pricing import RealmConfig
 from .storage import Storage
 from .protocol import send_message, receive_message, request_response, ProtocolError
 from .sidecar import AssetSidecar, TaskContext
@@ -153,7 +153,7 @@ class DHTNode:
         self._task_events: Dict[str, asyncio.Event] = {}
         self._task_results: Dict[str, TaskResult] = {}
         self._task_expected_provider: Dict[str, str] = {}  # task_id -> expected provider public_key
-        self._admission_cache: Dict[str, Dict[str, Any]] = {}
+        self._admission_cache: Dict[str, Dict[str, Any]] = {}  # job_id -> admission result
 
         self._mcp_bridges: List[Any] = []
         self._active_connections: int = 0  # SA-02: accept-level connection tracking
@@ -409,23 +409,23 @@ class DHTNode:
         skill_name = msg.skill_name.lower()
         skill_sheet = self._own_skills.get(skill_name)
 
-        # H21-prep: Job ID propagation
-        # For async jobs, msg.task_id is the generated job_id (sent in TaskStatus)
-        job_id = msg.input_data.get("_job_id") or msg.task_id
-        caller_nid = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
-
-        admission_meta = self._admission_cache.pop(job_id, None)
+        # Pop cached admission result (price, breakdown, prepaid decision)
+        job_id_lookup = msg.input_data.get("_job_id") or msg.task_id
+        admission_meta = self._admission_cache.pop(job_id_lookup, None)
         prepaid_action = "skip"
         prepaid_amount = 0.0
         if admission_meta:
             skill_price = float(admission_meta.get("price", skill_sheet.price if skill_sheet else 1.0))
-            breakdown_dict = admission_meta.get("breakdown") or {}
-            price_breakdown = PriceBreakdown(**breakdown_dict)
             prepaid_action = str(admission_meta.get("prepaid_action", "skip"))
             prepaid_amount = float(admission_meta.get("prepaid_amount", 0.0) or 0.0)
         else:
             skill_price = skill_sheet.price if skill_sheet else 1.0
+            caller_nid = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
             skill_price, price_breakdown = self._resolve_price(caller_nid, skill_price, skill_name)
+
+        # H21-prep: Job ID propagation
+        # For async jobs, msg.task_id is the generated job_id (sent in TaskStatus)
+        job_id = msg.input_data.get("_job_id") or msg.task_id
 
         # v0.33.0 C-track: configurable default timeout
         _default_timeout_s = float(self._config.get("skills", {}).get("default_timeout", 30))
@@ -684,58 +684,19 @@ class DHTNode:
                         logger.warning(f"Async result mail enqueue failed for {job_id_for_update}: {mail_err}")
 
             if billable:
-                if prepaid_action == "deduct":
-                    await self._enqueue_write(
-                        self.storage.deduct_prepaid,
-                        msg.public_key,
-                        prepaid_amount or max(skill_price, 0.0),
-                    )
-                elif skill_price < 0:
-                    # v0.39.0 F2: Bounty (negative price = provider pays caller)
-                    _skill_rt_cfg = self._get_skill_runtime_config(skill_name)
-                    _qg_skill = _skill_rt_cfg.get("quality_gate", "")
-                    if _qg_skill:
-                        # Quality gate configured — hold funds, emit event for plugin evaluation.
-                        # Plugin calls release_held() or return_held() via commerce API.
-                        _hold_amt = abs(skill_price)
-                        await self._enqueue_write(self.storage.hold_balance, msg.public_key, _hold_amt)
-                        if self.bus:
-                            self.bus.emit(
-                                "bounty.pending_review",
-                                task_id=job_id_for_update, skill=skill_name,
-                                peer=msg.public_key, amount=_hold_amt,
-                                output=result_data, quality_gate=_qg_skill,
-                            )
-                        logger.info(f"BOUNTY_HELD task={job_id_for_update[:8]} amount={_hold_amt} gate={_qg_skill}")
-                    else:
-                        # No quality gate — direct credit
-                        _old_balance = self.storage.get_ledger_balance(msg.public_key)
-                        await self._enqueue_write(self.storage.update_ledger_provider, msg.public_key, skill_price)
-                        _new_balance = self.storage.get_ledger_balance(msg.public_key)
-                        if self.bus:
-                            self.bus.emit("credit.change", direction="provider", counterparty=getattr(msg, "public_key", ""),
-                                          amount=skill_price, reference=job_id_for_update, identity=getattr(msg, "public_key", ""))
-                        if _old_balance is not None and _new_balance is not None:
-                            self._check_credit_restored(msg.public_key, _old_balance, _new_balance)
-                else:
-                    # v0.33.0: read balance before update for threshold crossing check
-                    _old_balance = self.storage.get_ledger_balance(msg.public_key)
-                    await self._enqueue_write(self.storage.update_ledger_provider, msg.public_key, skill_price)
-                    _new_balance = self.storage.get_ledger_balance(msg.public_key)
-                    # E3: credit.change fires AFTER ledger update
-                    self.bus.emit(
-                        "credit.change",
-                        direction="provider",
-                        counterparty=getattr(msg, "public_key", ""),
-                        amount=skill_price,
-                        reference=job_id_for_update,
-                        identity=getattr(msg, "public_key", ""),
-                    )
-                    # v0.33.0: credit.restored on threshold crossing
-                    if _old_balance is not None and _new_balance is not None:
-                        self._check_credit_restored(msg.public_key, _old_balance, _new_balance)
-            # Meter counts ALL executions (including non-billable) — rate limits protect compute, not revenue
-            await self._enqueue_write(self.storage.meter_increment, caller_node_id, skill_name, "", 0)
+                # F1: Increment meter after successful execution
+                caller_node_id = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
+                await self._enqueue_write(self.storage.meter_increment, caller_node_id, skill_name, "", 0)
+
+                await self._apply_provider_billing(
+                    msg=msg,
+                    job_id_for_update=job_id_for_update,
+                    skill_name=skill_name,
+                    skill_price=skill_price,
+                    skill_cfg=skill_cfg,
+                    prepaid_action=prepaid_action,
+                    prepaid_amount=prepaid_amount,
+                )
             result_msg = self._sign(TaskResult(task_id=msg.task_id, status="completed", output_data=result_data, receipt=receipt_json))
             # M-016: Notify plugins of task completion
             asyncio.create_task(self._plugins.on_task_complete(
@@ -991,18 +952,15 @@ class DHTNode:
             self._wallet = self._solana_address
             logger.info(f"Solana wallet: {self._wallet} (auto-derived)")
 
-        # Chain + token runtime config
+        # Token config (read-only in 12a)
         token_cfg = self._config.get("token", {})
+        from ..core.constants import KNARR_MINT
         # Deprecated: [token] mint config key. Ignored — KNARR_MINT is a protocol constant.
         old_mint = token_cfg.get("mint", "")
         if old_mint:
             logger.warning("Config [token] mint is deprecated and ignored — KNARR_MINT is a protocol constant")
-        from ..core.chain import get_chain_config
-        self._chain = get_chain_config(self._config)
-        self._token_symbol = self._chain.get("token_symbol", "KNARR")
-        self._token_mint = self._chain.get("token_mint", "")
-        self._token_decimals = int(self._chain.get("token_decimals", 0) or 0)
-        self._rpc_url = self._chain.get("rpc_url") or None
+        self._token_mint = KNARR_MINT
+        self._rpc_url = token_cfg.get("rpc_url", "") or None  # None = use default
         self._token_balance: Optional[float] = None
         self._sol_balance: Optional[float] = None
         self._balance_last_refresh: float = 0.0
@@ -1414,6 +1372,7 @@ class DHTNode:
         logger.info(f"Reloaded {len(self._own_skills)} own skills from storage")
         
         self.background_tasks.append(asyncio.create_task(self._heartbeat_loop()))
+        self.background_tasks.append(asyncio.create_task(self._settlement_consumer_loop()))
         self.background_tasks.append(asyncio.create_task(self._republish_loop()))
         self.background_tasks.append(asyncio.create_task(self._prune_loop()))
         self.background_tasks.append(asyncio.create_task(self._writer_loop()))
@@ -2989,68 +2948,72 @@ class DHTNode:
                 ))
 
         # Policy check — all writes through writer queue [R-01, CLAUDE-001]
-        soft_limit, hard_limit = self._resolve_policy(msg.public_key, skill_name)
+        initial_credit, min_balance = self._resolve_policy(msg.public_key, skill_name)
         peer_nid = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
         initial_trust = self._get_initial_trust(peer_nid)
         entry = await self._enqueue_write(
             self.storage.get_or_create_ledger_entry,
-            msg.public_key, soft_limit, initial_trust
+            msg.public_key, initial_credit, initial_trust
         )
 
         # v0.25.0: Commerce Tab Reminder
-        await self._maybe_send_tab_reminder(msg.public_key, entry.balance, soft_limit, hard_limit)
+        await self._maybe_send_tab_reminder(msg.public_key, entry.balance, initial_credit, min_balance)
 
-        meter = self.storage.meter_get(peer_nid, skill_name, "")
-        meter_count = int(meter["count"]) if meter else 0
-        skill_cfg = self._get_skill_runtime_config(skill_name)
-        meter_max_count = int(skill_cfg.get("meter_max_count", 0) or 0)
+        # B1: Replace inline balance check with admission pipeline
+        from ..commerce.admission_pipeline import run_admission, AdmissionContext
 
-        from ..commerce.admission_pipeline import AdmissionContext, run_admission
-
-        admission = run_admission(
-            AdmissionContext(
-                caller_key=msg.public_key,
-                skill_name=skill_name,
-                base_price=skill_sheet.price if skill_sheet else 1.0,
-                balance=entry.balance,
-                soft_limit=soft_limit,
-                hard_limit=hard_limit,
-                tit_for_tat=self.policy.tit_for_tat,
-                peer_node_id=peer_nid,
-                peer_groups=set(self._group_engine.get_groups(peer_nid)) if self._group_engine else set(),
-                discount_rules=self._load_discount_rules(peer_nid, skill_name),
-                cost_projection=self._get_cost_projection(skill_name),
-                skill_min_price=self._get_skill_min_price(skill_name),
-                pricing_config=self._build_pricing_config(skill_name),
-                meter_count=meter_count,
-                meter_max_count=meter_max_count,
-                prepaid_balance=getattr(entry, "prepaid", 0.0),
-                prepaid_config=self._config.get("economy", {}).get("prepaid", {}),
-                identity=self.node_info.node_id,
-                counterparty=peer_nid,
-            )
+        # Query meter count for bounty decay and rate limiting
+        meter = await self._enqueue_write(
+            self.storage.meter_get, peer_nid, skill_name, ""
         )
-
-        if admission.gate.outcome == "hard_block":
-            logger.debug(
-                f"ADMISSION_BLOCKED: skill={skill_name} from={msg.public_key[:16]} "
-                f"reason={admission.gate.reason}"
-            )
+        meter_count = meter["count"] if meter else 0
+        
+        # Runtime skill config comes from [skills."name"] in knarr.toml.
+        skill_cfg = self._get_skill_runtime_config(skill_name)
+        if not skill_cfg and skill_sheet and hasattr(skill_sheet, "config") and isinstance(skill_sheet.config, dict):
+            skill_cfg = dict(skill_sheet.config)
+        
+        # Build admission context
+        ctx = AdmissionContext(
+            caller_key=msg.public_key,
+            skill_name=skill_name,
+            base_price=skill_sheet.price if skill_sheet else 1.0,
+            balance=entry.balance,
+            soft_limit=min_balance,  # from _resolve_policy
+            hard_limit=min_balance,  # from _resolve_policy
+            tit_for_tat=self.policy.tit_for_tat,
+            peer_node_id=peer_nid,
+            peer_groups=set(self._group_engine.get_groups(peer_nid)) if self._group_engine else set(),
+            discount_rules=self._load_discount_rules(peer_nid, skill_name),
+            cost_projection=self._get_cost_projection(skill_name),
+            pricing_config=self._build_pricing_config(skill_name),
+            prepaid_balance=getattr(entry, 'prepaid', 0.0),
+            meter_count=meter_count,
+            meter_max_count=int(skill_cfg.get("meter_max_count", 0)),
+            identity=self.node_info.node_id,
+            counterparty=peer_nid,
+        )
+        
+        # Run admission pipeline
+        result = run_admission(ctx)
+        
+        # Check admission result
+        if result.gate.outcome == "hard_block":
+            # Write admission decision receipt
+            self._write_receipt(result.receipt, counterparty=peer_nid, sign=True)
+            # v0.33.0: credit.sanctioned — hard limit block
             if self.bus:
                 self.bus.emit("credit.sanctioned", counterparty=msg.public_key, limit_type="hard", identity=msg.public_key)
-            code = "INSUFFICIENT_CREDIT"
-            if admission.gate.reason and "Rate limit exceeded" in admission.gate.reason:
-                code = "RATE_LIMITED"
-            elif admission.gate.reason and "Prepaid rejection:" in admission.gate.reason:
-                code = "PREPAID_REQUIRED"
-            elif admission.gate.reason and "Invalid price" in admission.gate.reason:
-                code = "INVALID_PRICE"
-            self._emit_task_rejected(skill_name, msg.public_key, msg.task_id, code)
+            self._emit_task_rejected(skill_name, msg.public_key, msg.task_id, "ADMISSION_BLOCKED")
             return self._sign(TaskResult(
                 task_id=msg.task_id,
                 status="failed",
-                error={"code": code, "message": admission.gate.reason or "Admission rejected"},
+                error={"code": "ADMISSION_BLOCKED",
+                       "message": result.gate.reason}
             ))
+        
+        # Cache admission result for the worker (price, breakdown, prepaid decision)
+        skill_price = result.pricing.final_price
 
         # Compute dedup hash (H18/H19)
         caller_node_id = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest()
@@ -3074,10 +3037,10 @@ class DHTNode:
         if is_async:
             job_id = str(uuid.uuid4())
         self._admission_cache[job_id] = {
-            "price": admission.pricing.final_price,
-            "breakdown": dataclasses.asdict(self._pricing_result_to_breakdown(admission.pricing)),
-            "prepaid_action": admission.prepaid.action if admission.prepaid else "skip",
-            "prepaid_amount": admission.prepaid.amount if admission.prepaid else 0.0,
+            "price": result.pricing.final_price,
+            "breakdown": dataclasses.asdict(self._pricing_result_to_breakdown(result.pricing)),
+            "prepaid_action": result.prepaid.action if result.prepaid else "skip",
+            "prepaid_amount": result.prepaid.amount if result.prepaid else 0.0,
         }
 
         task = Task(
@@ -4189,78 +4152,132 @@ class DHTNode:
                 best_trust = max(best_trust, float(trust_cfg[g]))
         return best_trust
 
-    def _get_skill_runtime_config(self, skill_name: str) -> Dict[str, Any]:
-        raw = self._config.get("skills", {}).get(skill_name, {})
-        return raw if isinstance(raw, dict) else {}
+    def _resolve_price(self, node_id: str, base_price: float, skill_name: str = "") -> tuple:
+        """Compute final price with structured breakdown.
 
-    def _get_skill_min_price(self, skill_name: str) -> Optional[float]:
-        skill_cfg = self._get_skill_runtime_config(skill_name)
-        if "min_price" not in skill_cfg:
-            return None
-        try:
-            return float(skill_cfg["min_price"])
-        except (TypeError, ValueError):
-            return None
+        Returns (final_price: float, breakdown: PriceBreakdown).
+        """
+        from ..core.pricing import PriceBreakdown
 
-    def _get_cost_projection(self, skill_name: str) -> Optional[float]:
-        try:
-            row = self.storage._get_conn().execute(
-                "SELECT total_cost FROM skill_cost_projection WHERE skill_name = ?",
-                (skill_name,),
-            ).fetchone()
-            return float(row[0]) if row and row[0] is not None else None
-        except Exception:
-            return None
+        # 1. Load applicable discounts from SQL
+        rules_applied = []
+        groups = set()
+        if self._group_engine:
+            groups = set(self._group_engine.get_groups(node_id))
 
-    def _load_discount_rules(self, node_id: str, skill_name: str):
-        from ..commerce.pricing_engine import DiscountRule
-
-        groups = set(self._group_engine.get_groups(node_id)) if self._group_engine else set()
-        rules = []
+        discount_rows = []
         if groups:
             try:
                 conn = self.storage._get_conn()
                 placeholders = ",".join("?" * len(groups))
-                rows = conn.execute(
-                    f"""
+                rows = conn.execute(f"""
                     SELECT name, group_name, skill_group, effect_pct, priority
                     FROM pricing_discounts
                     WHERE group_name IN ({placeholders})
                       AND (skill_group = '*' OR skill_group = ?)
                       AND active = 1
                     ORDER BY priority DESC
-                    """,
-                    list(groups) + [skill_name],
-                ).fetchall()
-                rules = [
-                    DiscountRule(
-                        name=r[0],
-                        group_name=r[1],
-                        skill_group=r[2],
-                        effect_pct=float(r[3]),
-                        priority=int(r[4]),
-                    )
+                """, list(groups) + [skill_name]).fetchall()
+                discount_rows = [
+                    {"name": r[0], "group_name": r[1], "skill_group": r[2], "effect_pct": r[3], "priority": r[4]}
                     for r in rows
                 ]
             except Exception as e:
                 logger.warning(f"PRICING_SQL_FAIL: {e}")
-                rules = []
+                discount_rows = []
 
-        if not rules and groups:
-            for group_name, pct_off in self._config.get("pricing", {}).get("discounts", {}).items():
+        # Fallback: TOML discounts (dual-read for one version)
+        if not discount_rows and groups:
+            toml_discounts = self._config.get("pricing", {}).get("discounts", {})
+            for group_name, pct_off in toml_discounts.items():
                 if group_name in groups:
-                    rules.append(
-                        DiscountRule(
-                            name=f"toml_{group_name}",
-                            group_name=group_name,
-                            skill_group="*",
-                            effect_pct=float(pct_off),
-                            priority=0,
-                        )
-                    )
-        return rules
+                    discount_rows.append({
+                        "name": f"toml_{group_name}", "group_name": group_name,
+                        "skill_group": "*", "effect_pct": float(pct_off), "priority": 0
+                    })
+
+        # 2. Apply stacking mode
+        discount_mode = self._config.get("pricing", {}).get("discount_mode", "multiplicative")
+        price = base_price
+
+        if discount_rows:
+            if discount_mode == "multiplicative":
+                for rule in discount_rows:
+                    factor = 1.0 - (rule["effect_pct"] / 100.0)
+                    price *= factor
+                    rules_applied.append({"name": rule["name"], "effect_pct": rule["effect_pct"], "factor": factor})
+            elif discount_mode == "additive":
+                total_pct = sum(r["effect_pct"] for r in discount_rows)
+                price = base_price * (1.0 - total_pct / 100.0)
+                rules_applied = [{"name": r["name"], "effect_pct": r["effect_pct"]} for r in discount_rows]
+            elif discount_mode == "best_wins":
+                best = max(discount_rows, key=lambda r: r["effect_pct"])
+                price = base_price * (1.0 - best["effect_pct"] / 100.0)
+                rules_applied = [{"name": best["name"], "effect_pct": best["effect_pct"]}]
+
+        # 3. Apply discount cap
+        caps = self._config.get("pricing", {}).get("caps", {})
+        max_pct = float(caps.get(skill_name, caps.get("*", 100.0)))
+        max_discount = base_price * (max_pct / 100.0)
+        if base_price - price > max_discount:
+            price = base_price - max_discount
+
+        # 4. Compute floor
+        cost_projection = None
+        try:
+            conn = self.storage._get_conn()
+            row = conn.execute(
+                "SELECT total_cost FROM skill_cost_projection WHERE skill_name = ?",
+                (skill_name,)
+            ).fetchone()
+            if row:
+                cost_projection = row[0]
+        except Exception:
+            pass
+
+        markup_min = float(self._config.get("pricing", {}).get("floors", {}).get("markup_minimum", 1.1))
+        static_floor = float(self._config.get("pricing", {}).get("min_price", 0.01))
+        skill_floor = float(self._config.get("skills", {}).get(skill_name, {}).get("min_price", static_floor) if isinstance(self._config.get("skills", {}).get(skill_name), dict) else static_floor)
+
+        if cost_projection is not None and cost_projection > 0:
+            dynamic_floor = cost_projection * markup_min
+            floor_price = max(dynamic_floor, skill_floor)
+        else:
+            floor_price = skill_floor
+
+        # 5. Clamp to floor
+        floor_applied = price < floor_price
+        if floor_applied:
+            price = floor_price
+
+        # v0.33.0 C-track: global minimum price floor from config
+        global_min = float(self._config.get("skills", {}).get("minimum_price", 0.0))
+        if price < global_min:
+            price = global_min
+            floor_applied = True
+
+        # 6. Build breakdown
+        breakdown = PriceBreakdown(
+            base_price=base_price,
+            cost_projection=cost_projection,
+            rules_applied=rules_applied,
+            discount_mode=discount_mode,
+            floor_price=max(floor_price, global_min),
+            floor_applied=floor_applied,
+            promotion_applied=False,  # interface only, no implementation yet
+            final_price=round(price, 6),
+        )
+
+        return (round(price, 6), breakdown)
+
+    def _get_skill_runtime_config(self, skill_name: str) -> Dict[str, Any]:
+        """Return runtime skill config from [skills."name"] in knarr.toml."""
+        skills_cfg = self._config.get("skills", {})
+        skill_cfg = skills_cfg.get(skill_name, {})
+        return dict(skill_cfg) if isinstance(skill_cfg, dict) else {}
 
     def _build_pricing_config(self, skill_name: str = ""):
+        """Build PricingConfig from node config."""
         from ..commerce.pricing_engine import PricingConfig
 
         pricing_cfg = self._config.get("pricing", {})
@@ -4272,50 +4289,297 @@ class DHTNode:
             markup_minimum=float(floors.get("markup_minimum", 1.1)),
             min_price=float(pricing_cfg.get("min_price", 0.01)),
             global_min_price=float(self._config.get("skills", {}).get("minimum_price", 0.0)),
-            bounty_decay=float(pricing_cfg.get("bounty_decay", 1.0)),
+            decay=float(pricing_cfg.get("decay", 1.0)),
         )
 
-    @staticmethod
-    def _pricing_result_to_breakdown(pricing_result) -> PriceBreakdown:
-        return PriceBreakdown(
-            base_price=pricing_result.base_price,
-            cost_projection=pricing_result.cost_projection,
-            rules_applied=pricing_result.rules_applied,
-            discount_mode=pricing_result.discount_mode,
-            floor_price=pricing_result.floor_price,
-            floor_applied=pricing_result.floor_applied,
-            promotion_applied=False,
-            final_price=pricing_result.final_price,
+    async def _apply_provider_billing(
+        self,
+        msg: TaskRequest,
+        job_id_for_update: str,
+        skill_name: str,
+        skill_price: float,
+        skill_cfg: Optional[Dict[str, Any]] = None,
+        prepaid_action: str = "skip",
+        prepaid_amount: float = 0.0,
+    ):
+        """Apply provider-side billing: prepaid, held, or direct."""
+        skill_cfg = skill_cfg or {}
+        if prepaid_action == "deduct":
+            await self._enqueue_write(
+                self.storage.deduct_prepaid,
+                msg.public_key,
+                prepaid_amount or max(skill_price, 0.0),
+            )
+            return
+        if skill_cfg.get("hold"):
+            hold_amount = abs(skill_price)
+            await self._enqueue_write(self.storage.hold_balance, msg.public_key, hold_amount)
+            if self.bus:
+                self.bus.emit(
+                    "skill.held",
+                    task_id=job_id_for_update,
+                    skill=skill_name,
+                    peer=msg.public_key,
+                    amount=hold_amount,
+                    price=skill_price,
+                )
+            logger.info(f"SKILL_HELD task={job_id_for_update[:8]} amount={hold_amount}")
+            return
+
+        old_balance = self.storage.get_ledger_balance(msg.public_key)
+        await self._enqueue_write(self.storage.update_ledger_provider, msg.public_key, skill_price)
+        new_balance = self.storage.get_ledger_balance(msg.public_key)
+        if self.bus:
+            self.bus.emit(
+                "credit.change",
+                direction="provider",
+                counterparty=getattr(msg, "public_key", ""),
+                amount=skill_price,
+                reference=job_id_for_update,
+                identity=getattr(msg, "public_key", ""),
+            )
+        if old_balance is not None and new_balance is not None:
+            self._check_credit_restored(msg.public_key, old_balance, new_balance)
+
+    async def _handle_settlement_soft_threshold(self, item: dict):
+        """Evaluate a queued netting trigger and send a settlement request if needed."""
+        from ..commerce.settlement_engine import SettlementInput, evaluate_settlement
+        from ..commerce.settlement_execution import prepare_settlement
+
+        body = item.get("body") or {}
+        peer_key = self._resolve_settlement_peer_key(
+            item, key_names=("peer_public_key", "counterparty_key", "peer_key", "proposer_key")
         )
+        if not peer_key:
+            logger.warning(f"SETTLEMENT_SOFT_THRESHOLD_MISSING_PEER id={item.get('id')}")
+            return
 
-    def _resolve_price(self, node_id: str, base_price: float, skill_name: str = "") -> tuple:
-        """Compute final price with structured breakdown.
+        entry = self.storage.get_or_create_ledger_entry(peer_key)
+        soft_limit, hard_limit = self._resolve_policy(peer_key, "")
+        current_balance = float(body.get("current_balance", getattr(entry, "balance", 0.0) or 0.0))
+        credit_limit = abs(float(soft_limit) - float(hard_limit))
+        utilization_pct = body.get("utilization_pct")
+        if utilization_pct is None:
+            utilization = abs(current_balance) / abs(hard_limit) if hard_limit else 0.0
+        else:
+            utilization = float(utilization_pct) / 100.0
 
-        Returns (final_price: float, breakdown: PriceBreakdown).
-        """
-        from ..commerce.pricing_engine import PricingRequest, PricingResult, resolve_price
-
-        # Free skills (price=0.0) are intentional — skip pricing engine floor
-        if base_price == 0.0:
-            return 0.0, self._pricing_result_to_breakdown(PricingResult(
-                final_price=0.0, base_price=0.0, cost_projection=None,
-                rules_applied=[], discount_mode="none", floor_price=0.0,
-                floor_applied=False, cap_applied=False,
-            ))
-
-        pricing = resolve_price(
-            PricingRequest(
-                base_price=base_price,
-                skill_name=skill_name,
-                peer_node_id=node_id,
-                peer_groups=set(self._group_engine.get_groups(node_id)) if self._group_engine else set(),
-                discount_rules=self._load_discount_rules(node_id, skill_name),
-                cost_projection=self._get_cost_projection(skill_name),
-                skill_min_price=self._get_skill_min_price(skill_name),
+        decision = evaluate_settlement(
+            SettlementInput(
+                peer_key=peer_key,
+                balance=current_balance,
+                prepaid=float(body.get("prepaid", 0.0)),
+                pub_tab=float(body.get("pub_tab", 0.0)),
+                soft_limit=float(soft_limit),
+                hard_limit=float(hard_limit),
+                credit_limit=float(credit_limit),
+                tasks_provided=int(body.get("tasks_provided", getattr(entry, "tasks_provided", 0))),
+                tasks_consumed=int(body.get("tasks_consumed", getattr(entry, "tasks_consumed", 0))),
+                utilization=float(utilization),
             ),
-            self._build_pricing_config(skill_name),
+            self._config.get("settlement", {}),
         )
-        return pricing.final_price, self._pricing_result_to_breakdown(pricing)
+        if decision.action != "settle":
+            return
+
+        prepared_doc = await prepare_settlement(
+            node_id=self.node_info.node_id,
+            peer_key=peer_key,
+            amount=decision.amount,
+            formula=(
+                f"balance={current_balance:.6f} hard_limit={float(hard_limit):.6f} "
+                f"target_utilization={decision.target_utilization:.6f}"
+            ),
+            proposer_balance=current_balance,
+            counterparty_balance_claimed=float(body.get("counterparty_balance_claimed", -current_balance)),
+            utilization=float(utilization),
+            target_utilization=decision.target_utilization,
+            signing_key=self._signing_key,
+            storage=self.storage,
+            bus=self.bus,
+        )
+
+        await self._sync.enqueue(
+            to_node=self._resolve_settlement_target_node(peer_key),
+            msg_type="knarr/commerce/settle_request",
+            body={
+                "type": "knarr/commerce/settle_request",
+                "document": prepared_doc,
+                "peer_key": getattr(self, "_public_key_hex", "") or self.node_info.node_id,
+                "counterparty_key": peer_key,
+                "amount": abs(float(decision.amount)),
+                "current_balance": current_balance,
+                "credit_limit": float(credit_limit),
+                "provider_wallet": self._get_settlement_wallet(),
+                "requested_action": "settle_to_zero",
+                "target_utilization": decision.target_utilization,
+                "timestamp": time.time(),
+            },
+            system=True,
+            ttl_hours=24,
+        )
+
+    async def _handle_settlement_request(self, item: dict):
+        """Countersign and execute an inbound settlement request."""
+        from ..commerce.settlement_execution import execute_settlement
+        from ..core.proof import sign_document
+
+        body = item.get("body") or {}
+        prepared_doc = body.get("document")
+        if not isinstance(prepared_doc, dict):
+            logger.warning(f"SETTLEMENT_REQUEST_INVALID id={item.get('id')} missing document")
+            return
+        if self._signing_key is None:
+            raise RuntimeError("Settlement request processing requires a signing key")
+
+        payload = {key: value for key, value in prepared_doc.items() if key != "proof"}
+        countersigned_doc = sign_document(
+            payload,
+            self._signing_key,
+            f"did:knarr:{self.node_info.node_id}#cockpit-1",
+        )
+        peer_key = self._resolve_settlement_peer_key(
+            item, key_names=("peer_key", "proposer_key", "counterparty_key", "peer_public_key")
+        )
+
+        async def _send_confirmation_mail(to_node: str, msg_type: str, body: dict, system: bool = True):
+            await self._sync.enqueue(
+                to_node=item.get("from_node") or to_node,
+                msg_type="knarr/commerce/settlement_confirmation",
+                body=self._build_settlement_confirmation_body(
+                    peer_key=peer_key,
+                    amount=body.get("amount", 0.0),
+                    accepted_receipt_id=body.get("accepted_receipt_id", ""),
+                    settle_request_ref=prepared_doc.get("receipt_id", ""),
+                ),
+                system=system,
+                ttl_hours=24,
+            )
+
+        receipt_id = await execute_settlement(
+            prepared_doc=prepared_doc,
+            countersigned_doc=countersigned_doc,
+            node_verify_key=self._signing_key.verify_key,
+            authority_verify_key=self._signing_key.verify_key,
+            node_id=self.node_info.node_id,
+            signing_key=self._signing_key,
+            peer_key=peer_key,
+            storage=self.storage,
+            send_mail_fn=_send_confirmation_mail,
+            bus=self.bus,
+        )
+        if self.bus:
+            self.bus.emit(
+                "settlement.executed",
+                receipt_id=receipt_id,
+                peer=peer_key,
+                amount=abs(float(body.get("amount", 0.0))),
+                identity=self.node_info.node_id,
+            )
+
+    async def _handle_settlement_confirmation(self, item: dict):
+        """Finalize a confirmed settlement and zero the bilateral ledger position."""
+        from ..commerce.settlement_execution import write_settlement_processed
+
+        body = item.get("body") or {}
+        peer_key = self._resolve_settlement_peer_key(
+            item, key_names=("peer_key", "proposer_key", "counterparty_key", "peer_public_key")
+        )
+        if not peer_key:
+            logger.warning(f"SETTLEMENT_CONFIRM_INVALID id={item.get('id')} missing peer")
+            return
+        if self._signing_key is None:
+            raise RuntimeError("Settlement confirmation processing requires a signing key")
+
+        prior_balance = float(self.storage.get_ledger_balance(peer_key) or 0.0)
+        if prior_balance > 0:
+            await self._enqueue_write(self.storage.update_ledger_provider, peer_key, prior_balance)
+        elif prior_balance < 0:
+            await self._enqueue_write(self.storage.update_ledger_consumer, peer_key, abs(prior_balance))
+        final_balance = float(self.storage.get_ledger_balance(peer_key) or 0.0)
+
+        receipt_id = await write_settlement_processed(
+            node_id=self.node_info.node_id,
+            peer_key=peer_key,
+            amount_settled=abs(float(body.get("amount_settled", 0.0))),
+            ledger_delta=-prior_balance,
+            final_balance=final_balance,
+            accepted_receipt_id=str(body.get("accepted_receipt_id", "")),
+            settle_request_ref=str(body.get("settle_request_ref", "")),
+            signing_key=self._signing_key,
+            storage=self.storage,
+            bus=self.bus,
+        )
+        if self.bus:
+            self.bus.emit(
+                "settlement.confirmed",
+                receipt_id=receipt_id,
+                peer=peer_key,
+                amount=abs(float(body.get("amount_settled", 0.0))),
+                identity=self.node_info.node_id,
+            )
+
+    def _get_settlement_wallet(self) -> str:
+        """Return a wallet-like identifier compatible with settlement mail schema."""
+        wallet = getattr(self, "_wallet", "") or ""
+        if 32 <= len(wallet) <= 44:
+            return wallet
+        node_id = getattr(getattr(self, "node_info", None), "node_id", "") or ""
+        if len(node_id) >= 32:
+            return node_id[:44]
+        public_key = getattr(self, "_public_key_hex", "") or ""
+        if len(public_key) >= 32:
+            return public_key[:44]
+        return "0" * 32
+
+    def _resolve_settlement_target_node(self, peer_key: str) -> str:
+        """Resolve a peer public key to a node id for outbound settlement mail."""
+        node_id = None
+        if hasattr(self.storage, "get_node_id_for_public_key"):
+            node_id = self.storage.get_node_id_for_public_key(peer_key)
+        if node_id:
+            return node_id
+        try:
+            return hashlib.sha256(bytes.fromhex(peer_key)).hexdigest()
+        except Exception:
+            return peer_key
+
+    def _resolve_settlement_peer_key(
+        self,
+        item: dict,
+        key_names: Optional[tuple] = None,
+    ) -> str:
+        """Resolve the best available peer key from a queue item body."""
+        body = item.get("body") if isinstance(item, dict) else {}
+        if not isinstance(body, dict):
+            body = {}
+        for key in key_names or ("peer_public_key", "peer_key", "proposer_key", "counterparty_key"):
+            value = body.get(key)
+            if isinstance(value, str) and value:
+                return value
+        fallback = item.get("from_node") if isinstance(item, dict) else ""
+        return fallback if isinstance(fallback, str) else ""
+
+    def _build_settlement_confirmation_body(
+        self,
+        peer_key: str,
+        amount: float,
+        accepted_receipt_id: str,
+        settle_request_ref: str,
+    ) -> Dict[str, Any]:
+        """Build a settlement_confirmation message body."""
+        seed = hashlib.sha256(
+            f"{accepted_receipt_id}:{settle_request_ref}:{peer_key}".encode("utf-8")
+        ).hexdigest()
+        return {
+            "type": "knarr/commerce/settlement_confirmation",
+            "tx_hash": (seed + ("x" * 88))[:88],
+            "amount_settled": abs(float(amount)),
+            "timestamp": time.time(),
+            "peer_key": peer_key,
+            "accepted_receipt_id": accepted_receipt_id,
+            "settle_request_ref": settle_request_ref,
+        }
 
     def _resolve_policy(self, public_key: str, skill_name: str) -> tuple:
         """Returns (initial_credit, min_balance) for this peer+skill combination.
@@ -4378,6 +4642,65 @@ class DHTNode:
             except Exception:
                 logger.error("Heartbeat loop error", exc_info=True)
 
+    async def _settlement_consumer_loop(self):
+        """Process pending settlement queue items on a tick interval."""
+        interval = max(0.1, float(self._config.get("settlement", {}).get("consumer_interval", 60)))
+        while self._running:
+            await asyncio.sleep(interval)
+            try:
+                await self._settlement_consumer_tick()
+            except Exception:
+                logger.error("Settlement consumer error", exc_info=True)
+
+    async def _settlement_consumer_tick(self):
+        """Fetch pending settlement items, process them, and mark final status."""
+        items = self.storage.get_pending_settlements(limit=10)
+        if not items:
+            return
+
+        for item in items:
+            try:
+                await self._process_settlement_item(item)
+                await self._enqueue_write(
+                    self.storage.mark_settlement_processed, item["id"], "processed"
+                )
+            except Exception as exc:
+                logger.error(
+                    f"SETTLEMENT_ITEM_FAILED id={item['id']} type={item['item_type']}: {exc}"
+                )
+                await self._enqueue_write(
+                    self.storage.mark_settlement_processed, item["id"], "failed"
+                )
+
+    async def _process_settlement_item(self, item: dict):
+        """Route a settlement queue item to the appropriate handler."""
+        item_type = item.get("item_type", "")
+        if item_type == "soft_threshold":
+            await self._handle_settlement_soft_threshold(item)
+        elif item_type == "settle_request":
+            await self._handle_settlement_request(item)
+        elif item_type == "settlement_confirmation":
+            await self._handle_settlement_confirmation(item)
+        else:
+            logger.warning(f"SETTLEMENT_UNKNOWN_TYPE type={item_type} id={item.get('id')}")
+
+    def _run_netting_cycle_if_due(self, now: Optional[float] = None) -> int:
+        """Run the settlement netting cycle if its interval has elapsed."""
+        now = time.time() if now is None else now
+        netting_interval = float(self._config.get("settlement", {}).get("netting_interval", 3600))
+        if getattr(self, "_last_netting", 0.0) and (now - self._last_netting) <= netting_interval:
+            return 0
+        try:
+            from ..commerce.netting import run_netting_cycle
+            queued = run_netting_cycle(self)
+            self._last_netting = now
+            if queued:
+                logger.info(f"NETTING_CYCLE queued={queued}")
+            return queued
+        except Exception as exc:
+            logger.error(f"Netting cycle failed: {exc}")
+            return 0
+
     async def _heartbeat_tick(self):
         """Single heartbeat maintenance cycle. Separated for resilience."""
         await self._enqueue_write(self.storage.cleanup_expired_jobs)
@@ -4416,14 +4739,7 @@ class DHTNode:
         await self._pool.evict_idle(self._connection_idle_timeout)
 
         # Netting cycle (runs hourly, checks bilateral positions against soft threshold)
-        netting_interval = self._config.get("settlement", {}).get("netting_interval", 3600)
-        if not hasattr(self, '_last_netting') or (time.time() - self._last_netting) > netting_interval:
-            try:
-                from ..commerce.netting import run_netting_cycle
-                run_netting_cycle(self)
-                self._last_netting = time.time()
-            except Exception as e:
-                logger.error(f"Netting cycle failed: {e}")
+        self._run_netting_cycle_if_due()
 
         # Selective heartbeat based on peer activity
         now = time.monotonic()
