@@ -1231,7 +1231,7 @@ class DHTNode:
         credit_range = initial_credit - min_balance
         if credit_range <= 0:
             return
-        threshold = self._config.get("settlement", {}).get("tab_reminder_threshold", 80.0)
+        threshold = self._get_settlement_config().get("tab_reminder_threshold", 80.0)
         old_util = max(0.0, min(100.0, ((initial_credit - old_balance) / credit_range) * 100.0))
         new_util = max(0.0, min(100.0, ((initial_credit - new_balance) / credit_range) * 100.0))
         if old_util >= threshold and new_util < threshold:
@@ -2830,7 +2830,7 @@ class DHTNode:
             return
         utilization = max(0.0, min(100.0, ((initial_credit - balance) / credit_range) * 100.0))
 
-        threshold = self._config.get("settlement", {}).get("tab_reminder_threshold", 80.0)
+        threshold = self._get_settlement_config().get("tab_reminder_threshold", 80.0)
         if utilization < threshold:
             return
 
@@ -4455,7 +4455,7 @@ class DHTNode:
                 tasks_consumed=int(body.get("tasks_consumed", getattr(entry, "tasks_consumed", 0))),
                 utilization=float(utilization),
             ),
-            self._config.get("settlement", {}),
+            self._get_settlement_config(),
         )
         if decision.action != "settle":
             return
@@ -4659,6 +4659,13 @@ class DHTNode:
             "settle_request_ref": settle_request_ref,
         }
 
+    def _get_settlement_config(self) -> dict:
+        """Resolve settlement config from [settlement] or [economy.settlement]."""
+        cfg = self._config.get("settlement", {})
+        if not cfg:
+            cfg = self._config.get("economy", {}).get("settlement", {})
+        return cfg
+
     def _resolve_policy(self, public_key: str, skill_name: str) -> tuple:
         """Returns (initial_credit, min_balance) for this peer+skill combination.
 
@@ -4722,7 +4729,7 @@ class DHTNode:
 
     async def _settlement_consumer_loop(self):
         """Process pending settlement queue items on a tick interval."""
-        interval = max(0.1, float(self._config.get("settlement", {}).get("consumer_interval", 60)))
+        interval = max(0.1, float(self._get_settlement_config().get("consumer_interval", 60)))
         while self._running:
             await asyncio.sleep(interval)
             try:
@@ -4765,7 +4772,7 @@ class DHTNode:
     def _run_netting_cycle_if_due(self, now: Optional[float] = None) -> int:
         """Run the settlement netting cycle if its interval has elapsed."""
         now = time.time() if now is None else now
-        netting_interval = float(self._config.get("settlement", {}).get("netting_interval", 3600))
+        netting_interval = float(self._get_settlement_config().get("netting_interval", 3600))
         if getattr(self, "_last_netting", 0.0) and (now - self._last_netting) <= netting_interval:
             return 0
         try:

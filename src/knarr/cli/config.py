@@ -62,7 +62,7 @@ _KNOWN_KEYS = {
              "log_retention", "log_retention_hours", "housekeeping_retention_days"},
     "economy": {"default_soft_limit", "default_hard_limit"},
     "skills": {"minimum_price", "default_timeout"},
-    "settlement": {"tab_reminder_threshold", "netting_interval"},
+    "settlement": {"tab_reminder_threshold", "netting_interval", "consumer_interval"},
     "network": {"bootstrap", "upnp", "tls_cert", "tls_key", "max_connections", "connection_idle_timeout", "gossip_fanout", "heartbeat_silence_threshold", "peer_dead_timeout", "min_peers"},
     "sidecar": {"asset_dir"},
     "policy": {"initial_credit", "min_balance", "tit_for_tat", "group", "skill"},
