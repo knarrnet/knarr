@@ -527,6 +527,7 @@ async def cmd_serve(args):
 
     # 9. Wait for shutdown
     shutdown = asyncio.Event()
+    node._shutdown_event = shutdown  # upgrade loop can trigger clean shutdown
     loop = asyncio.get_running_loop()
     
     def signal_handler():

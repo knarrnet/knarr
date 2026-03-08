@@ -161,6 +161,7 @@ class DHTNode:
         self._secrets: Dict[str, Dict[str, str]] = {}  # skill_name -> {key: value}
         self._upgrading: bool = False
         self._restart_requested: bool = False
+        self._shutdown_event: Optional[asyncio.Event] = None  # set by main.py for clean upgrade restart
         self._notified_version: Optional[str] = getattr(self, "_notified_version", None)
         
         self._handler_pool = concurrent.futures.ThreadPoolExecutor(
@@ -5186,6 +5187,14 @@ class DHTNode:
 
                     self._restart_requested = True
                     self._running = False
+                    # Signal the main event loop to shut down cleanly.
+                    # Without this, main.py's shutdown.wait() blocks forever
+                    # and the node zombifies (sockets open, tasks dead).
+                    if self._shutdown_event:
+                        self._shutdown_event.set()
+                    else:
+                        import signal as _sig
+                        os.kill(os.getpid(), _sig.SIGTERM)
                 else:
                     logger.warning("UPGRADE installation failed (check_and_upgrade returned False), will retry next cycle")
                     # v0.33.0: node.upgrade_failed
