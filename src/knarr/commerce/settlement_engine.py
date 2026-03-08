@@ -53,7 +53,8 @@ def evaluate_settlement(inp: SettlementInput, config: dict) -> SettlementOutput:
     Default logic:
     - If utilization > soft_threshold (0.8): settle
     - Settlement amount brings utilization to soft_target (0.5)
-    - amount = balance - (soft_target * hard_limit)
+    - target_balance = soft_limit - (soft_target * credit_limit)
+    - amount = target_balance - balance
     - Skip if amount < min_settlement_amount (10.0)
 
     NaN/Inf rejection: all numeric inputs are validated. Non-finite values
@@ -129,9 +130,10 @@ def evaluate_settlement(inp: SettlementInput, config: dict) -> SettlementOutput:
             target_utilization=soft_target,
         )
 
-    # Calculate settlement amount: spec formula balance - (soft_target * hard_limit)
-    # Positive amount = they pay us, negative = we pay them
-    amount = inp.balance - (soft_target * inp.hard_limit)
+    # Calculate settlement amount: target at soft_target through full credit range
+    # Matches netting.py: target = ic - soft_target * (ic - mb), settle = target - balance
+    target_balance = inp.soft_limit - (soft_target * inp.credit_limit)
+    amount = target_balance - inp.balance
 
     # Check minimum settlement amount (use abs — direction doesn't matter for minimum)
     if abs(amount) < min_settlement_amount:

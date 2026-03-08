@@ -4691,11 +4691,12 @@ class DHTNode:
         }
 
     def _get_settlement_config(self) -> dict:
-        """Resolve settlement config from [settlement] or [economy.settlement]."""
-        cfg = self._config.get("settlement", {})
-        if not cfg:
-            cfg = self._config.get("economy", {}).get("settlement", {})
-        return cfg
+        """Resolve settlement config by merging [economy.settlement] (base) and [settlement] (override)."""
+        base = self._config.get("economy", {}).get("settlement", {})
+        override = self._config.get("settlement", {})
+        merged = dict(base)
+        merged.update(override)
+        return merged
 
     def _resolve_policy(self, public_key: str, skill_name: str) -> tuple:
         """Returns (initial_credit, min_balance) for this peer+skill combination.
