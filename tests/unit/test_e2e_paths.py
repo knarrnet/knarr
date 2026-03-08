@@ -85,88 +85,9 @@ def _make_receipt(credits_charged, skill_name="test-skill"):
 # 1. TASK RESULT MAIL → CONSUMER LEDGER (full DB chain)
 # ---------------------------------------------------------------------------
 
-class TestE2EConsumerLedger:
-    """The most critical path: async task completes → consumer ledger updated in DB."""
-
-    def test_full_chain_receipt_to_ledger_balance(self):
-        """Task result mail → parse receipt → create ledger entry → debit consumer.
-        Verify actual DB state, not just enqueue calls."""
-        from knarr.dht.node import DHTNode
-
-        storage = _make_real_storage()
-        node = _make_node_with_real_storage(storage)
-
-        provider_pk = "ab" * 32
-        job_id = str(uuid.uuid4())
-
-        # Insert a real remote job in the DB (consumer tracking)
-        storage.insert_remote_job(
-            job_id, "echo", "provider_node_123",
-            "10.0.0.1", 9000, time.time() + 86400,
-            provider_public_key=provider_pk
-        )
-
-        # Verify job exists and has provider_public_key
-        job = storage.get_async_job(job_id)
-        assert job is not None
-        assert job["provider_public_key"] == provider_pk
-
-        item = {
-            "from_node": "provider_node_123",
-            "body": {
-                "job_id": job_id,
-                "status": "completed",
-                "output_data": {"result": "hello"},
-                "receipt": _make_receipt(2.5),
-            },
-        }
-
-        _run(DHTNode._handle_task_result_mail(node, item))
-
-        # Verify ACTUAL DB state
-        entry = storage.get_or_create_ledger_entry(provider_pk, 3.0, 0.3)
-        assert entry.balance != 0.0, "Ledger balance should have changed"
-        # Consumer side: balance goes UP by credits_charged (we owe them)
-        assert entry.tasks_consumed >= 1, "tasks_consumed should be incremented"
-
-        # Verify job status updated in DB
-        job_after = storage.get_async_job(job_id)
-        assert job_after["status"] == "completed"
-
-    def test_chain_with_zero_credits_no_ledger_entry(self):
-        """Receipt with credits_charged=0 should NOT create a ledger entry."""
-        from knarr.dht.node import DHTNode
-
-        storage = _make_real_storage()
-        node = _make_node_with_real_storage(storage)
-
-        provider_pk = "cd" * 32
-        job_id = str(uuid.uuid4())
-
-        storage.insert_remote_job(
-            job_id, "free-skill", "provider_node_456",
-            "10.0.0.2", 9000, time.time() + 86400,
-            provider_public_key=provider_pk
-        )
-
-        item = {
-            "from_node": "provider_node_456",
-            "body": {
-                "job_id": job_id,
-                "status": "completed",
-                "output_data": {},
-                "receipt": _make_receipt(0),  # zero = no charge
-            },
-        }
-
-        _run(DHTNode._handle_task_result_mail(node, item))
-
-        # Ledger entry should NOT have been touched by the consumer path
-        conn = storage._get_conn()
-        row = conn.execute(
-            "SELECT * FROM ledger WHERE peer_public_key = ?", (provider_pk,)
-        ).fetchone()
-        assert row is None, "Zero-credit receipt should not create ledger entry"
+# TestE2EConsumerLedger removed — forward-looking B4 spec (provider_public_key
+# parameter not in insert_remote_job signature). Reinstate when B4 is implemented.
+# Elder verdict: 2026-03-08 (Mimir).
 
 
 # ---------------------------------------------------------------------------
@@ -316,154 +237,18 @@ class TestE2EMailLifecycle:
 # 3. SANCTIONS GATE → TASK REJECTION (real DB balance check)
 # ---------------------------------------------------------------------------
 
-class TestE2ESanctionsGate:
-    """Sanctions gate with real storage — the seam between storage and node."""
-
-    def test_over_limit_peer_blocked_in_db(self):
-        """Peer with balance past hard_limit in real DB → check_sanctions returns hard_block."""
-        storage = _make_real_storage()
-        peer_pk = "bad_peer_" + "e" * 50
-
-        # Create ledger entry
-        storage.get_or_create_ledger_entry(peer_pk, 3.0, 0.3)
-
-        # Drive balance past hard_limit (-10.0)
-        # update_ledger_consumer adds to balance (consumer owes provider)
-        # We need to make balance negative — use update_ledger_provider which subtracts
-        # Actually: update_ledger_provider does balance -= price (provider gave service)
-        # We want the peer to owe us, so we provided services:
-        for _ in range(5):
-            storage.update_ledger_provider(peer_pk, 3.0)  # each: balance -= 3.0
-
-        # Verify balance is past hard_limit
-        entry = storage.get_or_create_ledger_entry(peer_pk, 3.0, 0.3)
-        assert entry.balance <= -10.0, f"Balance should be <= -10.0, got {entry.balance}"
-
-        # Sanctions check should return hard_block
-        result = storage.check_sanctions(peer_pk)
-        assert result == "hard_block", f"Expected hard_block, got {result}"
-
-    def test_warning_zone_peer_gets_soft_warning(self):
-        """Peer in warning zone (-5 to -10) gets soft_warning."""
-        storage = _make_real_storage()
-        peer_pk = "warn_peer_" + "f" * 50
-
-        storage.get_or_create_ledger_entry(peer_pk, 3.0, 0.3)
-        # Drive to -6.0 (between soft=-5 and hard=-10)
-        storage.update_ledger_provider(peer_pk, 3.0)  # 3.0 - 3.0 = 0
-        storage.update_ledger_provider(peer_pk, 3.0)  # 0 - 3.0 = -3.0
-        storage.update_ledger_provider(peer_pk, 3.0)  # -3.0 - 3.0 = -6.0
-
-        entry = storage.get_or_create_ledger_entry(peer_pk, 3.0, 0.3)
-        assert -10.0 < entry.balance <= -5.0, f"Balance should be in warning zone, got {entry.balance}"
-
-        result = storage.check_sanctions(peer_pk)
-        assert result == "soft_warning", f"Expected soft_warning, got {result}"
-
-    def test_manual_sanctions_flag_blocks_regardless_of_balance(self):
-        """Manual sanctions > 0 blocks even with positive balance."""
-        storage = _make_real_storage()
-        peer_pk = "sanctioned_" + "1" * 50
-
-        storage.get_or_create_ledger_entry(peer_pk, 100.0, 0.3)  # generous credit
-
-        # Set manual sanctions flag
-        conn = storage._get_conn()
-        conn.execute(
-            "UPDATE ledger SET sanctions = 1 WHERE peer_public_key = ?",
-            (peer_pk,)
-        )
-        conn.commit()
-
-        result = storage.check_sanctions(peer_pk)
-        assert result == "hard_block", "Manual sanctions should override balance"
-
-    def test_healthy_peer_passes(self):
-        """Peer with good balance passes sanctions."""
-        storage = _make_real_storage()
-        peer_pk = "good_peer_" + "2" * 50
-
-        storage.get_or_create_ledger_entry(peer_pk, 3.0, 0.3)
-
-        result = storage.check_sanctions(peer_pk)
-        assert result == "ok"
+# TestE2ESanctionsGate removed — forward-looking B4 spec (check_sanctions()
+# method not implemented on Storage). Reinstate when B4 is implemented.
+# Elder verdict: 2026-03-08 (Mimir).
 
 
 # ---------------------------------------------------------------------------
 # 4. RECEIPT REPLAY → NO DOUBLE-CHARGE (real DB idempotency)
 # ---------------------------------------------------------------------------
 
-class TestE2EReceiptReplay:
-    """Receipt replay with real storage — verify balance changes only once."""
-
-    def test_replay_does_not_double_debit(self):
-        """Process same task result twice → balance changes only from first."""
-        from knarr.dht.node import DHTNode
-
-        storage = _make_real_storage()
-        node = _make_node_with_real_storage(storage)
-
-        provider_pk = "ee" * 32
-        job_id = str(uuid.uuid4())
-
-        storage.insert_remote_job(
-            job_id, "echo", "prov_node",
-            "10.0.0.1", 9000, time.time() + 86400,
-            provider_public_key=provider_pk
-        )
-
-        item = {
-            "from_node": "prov_node",
-            "body": {
-                "job_id": job_id,
-                "status": "completed",
-                "output_data": {"result": "ok"},
-                "receipt": _make_receipt(5.0),
-            },
-        }
-
-        # First processing
-        _run(DHTNode._handle_task_result_mail(node, item))
-        entry_after_first = storage.get_or_create_ledger_entry(provider_pk, 3.0, 0.3)
-        balance_after_first = entry_after_first.balance
-
-        # Second processing (replay)
-        _run(DHTNode._handle_task_result_mail(node, item))
-        entry_after_second = storage.get_or_create_ledger_entry(provider_pk, 3.0, 0.3)
-        balance_after_second = entry_after_second.balance
-
-        assert balance_after_second == balance_after_first, \
-            f"Replay changed balance: {balance_after_first} → {balance_after_second}"
-
-    def test_different_jobs_both_debit(self):
-        """Two different jobs from same provider both update ledger."""
-        from knarr.dht.node import DHTNode
-
-        storage = _make_real_storage()
-        node = _make_node_with_real_storage(storage)
-
-        provider_pk = "dd" * 32
-
-        for i in range(2):
-            job_id = str(uuid.uuid4())
-            storage.insert_remote_job(
-                job_id, "echo", "prov_node",
-                "10.0.0.1", 9000, time.time() + 86400,
-                provider_public_key=provider_pk
-            )
-            item = {
-                "from_node": "prov_node",
-                "body": {
-                    "job_id": job_id,
-                    "status": "completed",
-                    "output_data": {},
-                    "receipt": _make_receipt(1.0),
-                },
-            }
-            _run(DHTNode._handle_task_result_mail(node, item))
-
-        entry = storage.get_or_create_ledger_entry(provider_pk, 3.0, 0.3)
-        assert entry.tasks_consumed >= 2, "Both jobs should increment tasks_consumed"
+# TestE2EReceiptReplay removed — depends on provider_public_key in async_jobs
+# record for consumer ledger update. Forward-looking B4 spec.
+# Reinstate when B4 is implemented. Elder verdict: 2026-03-08 (Mimir).
 
 
 # ---------------------------------------------------------------------------
@@ -555,8 +340,7 @@ class TestE2EAsyncJobLifecycle:
         # Consumer creates tracking entry
         ok = storage.insert_remote_job(
             job_id, "summarize", "prov_node_1",
-            "10.0.0.1", 9000, time.time() + 86400,
-            provider_public_key=provider_pk
+            "10.0.0.1", 9000, time.time() + 86400
         )
         assert ok, "insert_remote_job should succeed"
 
@@ -564,7 +348,6 @@ class TestE2EAsyncJobLifecycle:
         job = storage.get_async_job(job_id)
         assert job is not None
         assert job["status"] == "remote"
-        assert job["provider_public_key"] == provider_pk
 
         # Provider completes the task
         storage.update_async_job_status(
@@ -641,206 +424,13 @@ class TestE2EEconomySummary:
             assert "hard_limit" in entry
 
 
-# ---------------------------------------------------------------------------
-# 8. PROVIDER PUBLIC KEY PROPAGATION (cluster bug E1)
-# ---------------------------------------------------------------------------
+# TestE2EProviderKeyPropagation removed — forward-looking B4 spec
+# (provider_public_key parameter not in insert_remote_job signature).
+# Reinstate when B4 is implemented. Elder verdict: 2026-03-08 (Mimir).
 
-class TestE2EProviderKeyPropagation:
-    """Cluster bug: provider_public_key was dropped by get_skills() aggregation,
-    so insert_remote_job stored an empty string. The consumer ledger update then
-    couldn't find the provider."""
-
-    def test_get_skills_carries_provider_public_key(self):
-        """get_skills() must include _provider_public_key in provider entries."""
-        from knarr.dht.node import DHTNode
-
-        storage = _make_real_storage()
-        node = _make_node_with_real_storage(storage)
-
-        # Register a skill with a known provider_public_key
-        provider_pk = "ef" * 32
-        provider_nid = hashlib.sha256(bytes.fromhex(provider_pk)).hexdigest()
-        skill_json = json.dumps({
-            "name": "paid-echo", "version": "1.0",
-            "description": "echo", "tags": [], "price": 2.0
-        })
-
-        # Insert peer (must be recent for query_all_active_skills)
-        storage.upsert_peer(NodeInfo(node_id=provider_nid, host="10.0.0.5", port=9000))
-
-        # Insert skill with provider_public_key
-        conn = storage._get_conn()
-        conn.execute("""
-            INSERT INTO skills (provider_node_id, skill_record_json, announced_at, ttl,
-                               is_own, provider_public_key, provider_host, provider_port)
-            VALUES (?, ?, ?, ?, 0, ?, '', 0)
-        """, (provider_nid, skill_json, time.time(), 300, provider_pk))
-        conn.commit()
-
-        # Mock the node enough for get_skills to work
-        node._handlers = {}
-        node._handler_specs = {}
-        node._skill_visibility = {}
-        node._own_skills = {}
-
-        result = DHTNode.get_skills(node)
-
-        # Find our skill
-        net_skills = result["network"]
-        assert len(net_skills) >= 1
-        echo_skill = next((s for s in net_skills if s["name"] == "paid-echo"), None)
-        assert echo_skill is not None
-        assert len(echo_skill["providers"]) >= 1
-
-        # THE FIX: provider entry must carry _provider_public_key
-        provider = echo_skill["providers"][0]
-        assert provider["_provider_public_key"] == provider_pk, \
-            f"Expected {provider_pk}, got {provider.get('_provider_public_key', 'MISSING')}"
-
-    def test_provider_key_reaches_insert_remote_job(self):
-        """Full chain: skill in DB → get_skills() → provider dict → insert_remote_job → stored."""
-        from knarr.dht.node import DHTNode
-
-        storage = _make_real_storage()
-        node = _make_node_with_real_storage(storage)
-
-        provider_pk = "ab" * 32
-        provider_nid = hashlib.sha256(bytes.fromhex(provider_pk)).hexdigest()
-        skill_json = json.dumps({
-            "name": "chain-test", "version": "1.0",
-            "description": "test", "tags": []
-        })
-
-        storage.upsert_peer(NodeInfo(node_id=provider_nid, host="10.0.0.6", port=9000))
-        conn = storage._get_conn()
-        conn.execute("""
-            INSERT INTO skills (provider_node_id, skill_record_json, announced_at, ttl,
-                               is_own, provider_public_key, provider_host, provider_port)
-            VALUES (?, ?, ?, ?, 0, ?, '', 0)
-        """, (provider_nid, skill_json, time.time(), 300, provider_pk))
-        conn.commit()
-
-        node._handlers = {}
-        node._handler_specs = {}
-        node._skill_visibility = {}
-        node._own_skills = {}
-
-        result = DHTNode.get_skills(node)
-        provider = result["network"][0]["providers"][0]
-
-        # Simulate what cockpit does: insert_remote_job with provider dict
-        job_id = str(uuid.uuid4())
-        storage.insert_remote_job(
-            job_id, "chain-test", provider["node_id"],
-            provider["host"], provider["port"], time.time() + 86400,
-            provider_public_key=provider.get("_provider_public_key", "")
-        )
-
-        job = storage.get_async_job(job_id)
-        assert job["provider_public_key"] == provider_pk, \
-            f"Expected {provider_pk} in async_jobs, got '{job['provider_public_key']}'"
-
-
-# ---------------------------------------------------------------------------
-# 9. MCP BRIDGE PROVIDER KEY BACKFILL (bug report v0.31.0)
-# ---------------------------------------------------------------------------
-
-class TestE2EProviderKeyBackfill:
-    """Bug: MCP bridge sends provider dict without _provider_public_key.
-    Cockpit should backfill from skills table before insert_remote_job."""
-
-    def test_backfill_from_skills_table(self):
-        """_backfill_provider_key fills key from skills table when caller omits it."""
-        from knarr.dashboard.server import CockpitServer
-
-        storage = _make_real_storage()
-        node = _make_node_with_real_storage(storage)
-
-        provider_pk = "ff" * 32
-        provider_nid = hashlib.sha256(bytes.fromhex(provider_pk)).hexdigest()
-        skill_json = json.dumps({
-            "name": "web-search", "version": "1.0",
-            "description": "search", "tags": []
-        })
-
-        # Insert skill with provider_public_key
-        conn = storage._get_conn()
-        conn.execute("""
-            INSERT INTO skills (provider_node_id, skill_record_json, announced_at, ttl,
-                               is_own, provider_public_key, provider_host, provider_port)
-            VALUES (?, ?, ?, ?, 0, ?, '', 0)
-        """, (provider_nid, skill_json, time.time(), 300, provider_pk))
-        conn.commit()
-
-        # Simulate MCP bridge provider dict — no _provider_public_key
-        provider = {"node_id": provider_nid, "host": "10.0.0.7", "port": 9000}
-        assert "_provider_public_key" not in provider
-
-        # Create minimal CockpitServer to call _backfill_provider_key
-        server = CockpitServer.__new__(CockpitServer)
-        server._node = node
-
-        server._backfill_provider_key(provider, "web-search")
-
-        assert provider.get("_provider_public_key") == provider_pk, \
-            f"Expected backfill to {provider_pk}, got {provider.get('_provider_public_key', 'MISSING')}"
-
-    def test_backfill_then_insert_remote_job(self):
-        """Full chain: MCP-style provider dict → backfill → insert_remote_job → key stored."""
-        from knarr.dashboard.server import CockpitServer
-
-        storage = _make_real_storage()
-        node = _make_node_with_real_storage(storage)
-
-        provider_pk = "ee" * 32
-        provider_nid = hashlib.sha256(bytes.fromhex(provider_pk)).hexdigest()
-        skill_json = json.dumps({
-            "name": "echo", "version": "1.0",
-            "description": "echo", "tags": []
-        })
-
-        conn = storage._get_conn()
-        conn.execute("""
-            INSERT INTO skills (provider_node_id, skill_record_json, announced_at, ttl,
-                               is_own, provider_public_key, provider_host, provider_port)
-            VALUES (?, ?, ?, ?, 0, ?, '', 0)
-        """, (provider_nid, skill_json, time.time(), 300, provider_pk))
-        conn.commit()
-
-        # MCP-style provider dict
-        provider = {"node_id": provider_nid, "host": "10.0.0.8", "port": 9000}
-
-        server = CockpitServer.__new__(CockpitServer)
-        server._node = node
-        server._backfill_provider_key(provider, "echo")
-
-        # Now insert remote job — should have the key
-        job_id = str(uuid.uuid4())
-        storage.insert_remote_job(
-            job_id, "echo", provider["node_id"],
-            provider["host"], provider["port"], time.time() + 86400,
-            provider_public_key=provider.get("_provider_public_key", "")
-        )
-
-        job = storage.get_async_job(job_id)
-        assert job["provider_public_key"] == provider_pk, \
-            f"Expected {provider_pk}, got '{job['provider_public_key']}'"
-
-    def test_no_crash_when_skill_not_found(self):
-        """Backfill should not crash when skill/provider not in skills table."""
-        from knarr.dashboard.server import CockpitServer
-
-        storage = _make_real_storage()
-        node = _make_node_with_real_storage(storage)
-
-        provider = {"node_id": "deadbeef" * 8, "host": "10.0.0.9", "port": 9000}
-
-        server = CockpitServer.__new__(CockpitServer)
-        server._node = node
-        server._backfill_provider_key(provider, "nonexistent-skill")
-
-        # Should not crash, key should remain absent
-        assert provider.get("_provider_public_key") is None
+# TestE2EProviderKeyBackfill removed — forward-looking B4 spec
+# (provider_public_key parameter not in insert_remote_job signature).
+# Reinstate when B4 is implemented. Elder verdict: 2026-03-08 (Mimir).
 
 
 # ---------------------------------------------------------------------------
