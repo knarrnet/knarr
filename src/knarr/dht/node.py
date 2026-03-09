@@ -87,6 +87,7 @@ class DHTNode:
         self._sidecar: Optional[AssetSidecar] = None
         self._sidecar_port: int = 0
         self._asset_dir: str = ""
+        self._generated_identity_certs = False
 
         self._signing_key: Optional[SigningKey] = None
         self._public_key_hex: str = ""
@@ -181,7 +182,6 @@ class DHTNode:
         # v0.17.0: Mail v2 Sync Engine (before plugins so mail callbacks are available)
         from ..mail.sync import SyncEngine
         self._sync = SyncEngine(self, plugins=None)  # plugins wired after PluginLoader init
-        self._last_pull_sweep = time.time()  # M-015: pre-init to avoid pull storm on first tick
 
         # Register core realms
         self.register_meta_realm("node", RealmConfig(
@@ -227,6 +227,9 @@ class DHTNode:
 
         # V015: Plugin system
         config_dir = Path(self._config.get("_config_dir", os.getcwd()))
+        data_dir = None
+        if self._config.get("_data_dir_explicit"):
+            data_dir = Path(self._config.get("_data_dir", config_dir))
         self._plugins = PluginLoader(
             config_dir=config_dir,
             get_peers_cb=lambda: self.storage.get_peers(),
@@ -244,6 +247,7 @@ class DHTNode:
             subscribe_events_cb=self.bus.subscribe,   # v0.32.0
             emit_event_cb=self.bus.emit,              # v0.32.0
             bus=self.bus,                             # v0.33.0: EventBus for plugins
+            data_dir=data_dir,
         )
 
         # M-016: Wire plugins into SyncEngine for on_mail_received hook
@@ -938,7 +942,9 @@ class DHTNode:
         self._egress.register_sensitive_material(key_bytes)
         
         from ..core.vault import KeyringVault
-        vault_path = os.path.join(self._config.get("_config_dir", "."), "vault.db")
+        data_dir = self._config.get("_data_dir", self._config.get("_config_dir", "."))
+        os.makedirs(data_dir, exist_ok=True)
+        vault_path = os.path.join(data_dir, "vault.db")
         self._vault = KeyringVault(vault_path, key_bytes)
         
         verify_key = self._signing_key.verify_key
@@ -1257,14 +1263,16 @@ class DHTNode:
         
         # Auto-generate TLS cert if missing (only for default paths, not custom)
         config_dir = self._config.get("_config_dir", os.getcwd())
+        data_dir = self._config.get("_data_dir", config_dir)
         from ..mail.tls import generate_tls_cert, resolve_cert_paths
-        cert_path, key_path = resolve_cert_paths(self._config, config_dir)
+        cert_path, key_path = resolve_cert_paths(self._config, data_dir)
         network_cfg = self._config.get("network", {})
         custom_tls = "tls_cert" in network_cfg or "tls_key" in network_cfg
         if not custom_tls and (not os.path.exists(cert_path) or not os.path.exists(key_path)):
             key_bytes = self.storage.get_node_key()
             if key_bytes:
-                generate_tls_cert(key_bytes, self.node_info.node_id, config_dir)
+                generate_tls_cert(key_bytes, self.node_info.node_id, data_dir)
+                self._generated_identity_certs = True
         self._cert_path = cert_path
         self._key_path = key_path
 
@@ -1393,6 +1401,11 @@ class DHTNode:
         if self._wallet and self._token_mint:
             self.background_tasks.append(asyncio.create_task(self._balance_refresh_loop()))
 
+        # v0.41.0 A2: Independent background loops for network I/O (extracted from _heartbeat_tick)
+        self.background_tasks.append(asyncio.create_task(self._flush_outbox_loop()))
+        self.background_tasks.append(asyncio.create_task(self._pull_from_correspondents_loop()))
+        self.background_tasks.append(asyncio.create_task(self._peer_heartbeat_sweep_loop()))
+
     async def stop(self):
         """Stops the server, MCP bridges, and background tasks."""
         self._running = False
@@ -1409,7 +1422,8 @@ class DHTNode:
 
         for task in self.background_tasks:
             task.cancel()
-        
+        await asyncio.gather(*self.background_tasks, return_exceptions=True)
+
         await self._pool.close_all()
 
         if self.server:
@@ -4195,6 +4209,19 @@ class DHTNode:
         """
         from ..core.pricing import PriceBreakdown
 
+        # B2/FINDING-G: Free skills stay free — bypass all discount/floor/surcharge logic
+        if base_price == 0.0:
+            return (0.0, PriceBreakdown(
+                base_price=0.0,
+                cost_projection=None,
+                rules_applied=[],
+                discount_mode="",
+                floor_price=0.0,
+                floor_applied=False,
+                promotion_applied=False,
+                final_price=0.0,
+            ))
+
         # 1. Load applicable discounts from SQL
         rules_applied = []
         groups = set()
@@ -4760,6 +4787,64 @@ class DHTNode:
             except Exception:
                 logger.error("Heartbeat loop error", exc_info=True)
 
+    # v0.41.0 A2: Independent background task loops for network I/O
+    async def _flush_outbox_loop(self):
+        """Independent background loop for flushing mail outbox."""
+        interval = max(1.0, float(self._config.get("node", {}).get("flush_interval", 10)))
+        while self._running:
+            await asyncio.sleep(interval)
+            try:
+                await asyncio.wait_for(self._sync.flush_outbox(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("FLUSH_TIMEOUT flush_outbox exceeded 5s deadline")
+            except Exception as e:
+                logger.warning(f"FLUSH_OUTBOX_FAIL: {e}")
+
+    async def _pull_from_correspondents_loop(self):
+        """Independent background loop for pulling mail from correspondents."""
+        interval = max(1.0, float(self._config.get("mail", {}).get("pull_interval", 300)))
+        while self._running:
+            await asyncio.sleep(interval)
+            try:
+                await asyncio.wait_for(self._sync.pull_from_correspondents(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("PULL_TIMEOUT pull_from_correspondents exceeded 5s deadline")
+            except Exception as e:
+                logger.warning(f"PULL_FROM_CORRESPONDENTS_FAIL: {e}")
+
+    async def _peer_heartbeat_sweep_loop(self):
+        """Independent background loop for peer heartbeat sweep."""
+        interval = max(1.0, float(self._config.get("node", {}).get("sweep_interval", 10)))
+        while self._running:
+            await asyncio.sleep(interval)
+            try:
+                peers = self.storage.get_peers()
+                if not peers:
+                    if self._bootstrap_peers:
+                        logger.warning("No peers — attempting re-bootstrap")
+                        if self.bus:
+                            self.bus.emit("node.rebootstrap", reason="no_peers", identity=self.node_info.node_id)
+                        try:
+                            await self.join(self._bootstrap_peers)
+                        except Exception as e:
+                            logger.warning(f"Re-bootstrap failed: {e}")
+                            if self.bus:
+                                self.bus.emit("node.rebootstrap_failed", error=str(e), identity=self.node_info.node_id)
+                    continue
+
+                now = time.monotonic()
+                await asyncio.wait_for(
+                    self._peer_heartbeat_sweep(peers, now),
+                    timeout=PEER_HEARTBEAT_SWEEP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "PEER_SWEEP_TIMEOUT peer heartbeat sweep exceeded %.1fs",
+                    PEER_HEARTBEAT_SWEEP_TIMEOUT,
+                )
+            except Exception as e:
+                logger.warning(f"PEER_HEARTBEAT_SWEEP_FAIL: {e}")
+
     async def _settlement_consumer_loop(self):
         """Process pending settlement queue items on a tick interval."""
         interval = max(0.1, float(self._get_settlement_config().get("consumer_interval", 60)))
@@ -4890,27 +4975,13 @@ class DHTNode:
                                 self.bus.emit("node.upgrade_available", current_version=__version__, available_version=resp.version, identity=self.node_info.node_id)
 
     async def _heartbeat_tick(self):
-        """Single heartbeat maintenance cycle. Separated for resilience."""
+        """Single heartbeat maintenance cycle. Separated for resilience.
+
+        v0.41.0: flush_outbox, pull_from_correspondents, and _peer_heartbeat_sweep
+        have been extracted to independent background task loops.
+        """
         await self._enqueue_write(self.storage.cleanup_expired_jobs)
         await self._sync.cleanup()
-        # v0.17.5: Flush outbox to recipients not in peer table (peer_override delivery)
-        # M-015: Timeout guard — dead peers must not block entire heartbeat cycle
-        try:
-            await asyncio.wait_for(self._sync.flush_outbox(), timeout=5.0)
-        except asyncio.TimeoutError:
-            logger.warning("FLUSH_TIMEOUT flush_outbox exceeded 5s deadline")
-
-        # v0.26.0: Periodic mail pull from correspondents
-        pull_interval = self._config.get("mail", {}).get("pull_interval", 300)
-        if time.time() - self._last_pull_sweep >= pull_interval:
-            try:
-                await asyncio.wait_for(self._sync.pull_from_correspondents(), timeout=5.0)
-            except asyncio.TimeoutError:
-                logger.warning("PULL_TIMEOUT pull_from_correspondents exceeded 5s deadline")
-            except Exception as e:
-                logger.error(f"Mail pull sweep failed: {e}")
-            finally:
-                self._last_pull_sweep = time.time()
 
         # V015: Plugin tick
         peers = self.storage.get_peers()
@@ -4932,36 +5003,6 @@ class DHTNode:
 
         # Netting cycle (runs hourly, checks bilateral positions against soft threshold)
         self._run_netting_cycle_if_due()
-
-        # Selective heartbeat based on peer activity
-        now = time.monotonic()
-        peers = self.storage.get_peers()
-        if not peers:
-            # Isolated — re-bootstrap if we have bootstrap addresses
-            if self._bootstrap_peers:
-                logger.warning("No peers — attempting re-bootstrap")
-                # v0.33.0: node.rebootstrap
-                if self.bus:
-                    self.bus.emit("node.rebootstrap", reason="no_peers", identity=self.node_info.node_id)
-                try:
-                    await self.join(self._bootstrap_peers)
-                except Exception as e:
-                    logger.warning(f"Re-bootstrap failed: {e}")
-                    # v0.33.0: node.rebootstrap_failed
-                    if self.bus:
-                        self.bus.emit("node.rebootstrap_failed", error=str(e), identity=self.node_info.node_id)
-            return
-
-        try:
-            await asyncio.wait_for(
-                self._peer_heartbeat_sweep(peers, now),
-                timeout=PEER_HEARTBEAT_SWEEP_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "PEER_SWEEP_TIMEOUT peer heartbeat sweep exceeded %.1fs",
-                PEER_HEARTBEAT_SWEEP_TIMEOUT,
-            )
 
     async def _event_loop_watchdog(self):
         """Detects event loop blocking by measuring scheduling latency."""
@@ -5164,7 +5205,8 @@ class DHTNode:
 
                 logger.info(f"UPGRADE proceeding: {__version__} -> {latest}")
                 config_dir = self._config.get("_config_dir", "")
-                backup_dir = backup_config(config_dir, __version__)
+                data_dir = self._config.get("_data_dir", config_dir)
+                backup_dir = backup_config(config_dir, __version__, data_dir=data_dir)
                 if not backup_dir:
                     logger.warning("UPGRADE abort: backup failed")
                     self._upgrading = False
@@ -5176,7 +5218,7 @@ class DHTNode:
                     # H14: Verify installation and rollback if necessary
                     if not verify_installation(latest):
                         logger.error("UPGRADE verification failed, rolling back")
-                        rollback_installation(backup_dir, config_dir)
+                        rollback_installation(backup_dir, config_dir, data_dir=data_dir)
                         continue
 
                     logger.info(f"UPGRADE complete: {__version__} -> {latest}, requesting restart...")

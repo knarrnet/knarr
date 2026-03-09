@@ -69,6 +69,48 @@ class SyncEngine:
         """Register a dispatch handler for a system mail msg_type."""
         self._mail_handlers[msg_type] = handler
 
+    async def _run_mail_admission(self, sender_node_id: str, sender_key: str):
+        import hashlib
+        from ..commerce.admission_pipeline import AdmissionContext, run_admission
+
+        skill_name = "knarr-mail"
+        initial_credit, min_balance = self._node._resolve_policy(sender_key, skill_name)
+        initial_trust = self._node._get_initial_trust(sender_node_id)
+        entry = await self._node._enqueue_write(
+            self._node.storage.get_or_create_ledger_entry,
+            sender_key, initial_credit, initial_trust
+        )
+
+        peer_nid = hashlib.sha256(bytes.fromhex(sender_key)).hexdigest()
+        group_engine = getattr(self._node, "_group_engine", None)
+        meter = await self._node._enqueue_write(
+            self._node.storage.meter_get, peer_nid, skill_name, ""
+        )
+        meter_count = meter["count"] if meter else 0
+        skill_sheet = getattr(self._node, "_own_skills", {}).get(skill_name)
+        skill_cfg = self._node._get_skill_runtime_config(skill_name)
+
+        result = run_admission(AdmissionContext(
+            caller_key=sender_key,
+            skill_name=skill_name,
+            base_price=skill_sheet.price if skill_sheet else float(self._node._config.get("mail", {}).get("price", 1.0)),
+            balance=entry.balance,
+            soft_limit=min_balance,
+            hard_limit=min_balance,
+            tit_for_tat=self._node.policy.tit_for_tat,
+            peer_node_id=peer_nid,
+            peer_groups=set(group_engine.get_groups(peer_nid)) if group_engine else set(),
+            discount_rules=self._node._load_discount_rules(peer_nid, skill_name),
+            cost_projection=self._node._get_cost_projection(skill_name),
+            pricing_config=self._node._build_pricing_config(skill_name),
+            prepaid_balance=getattr(entry, "prepaid", 0.0),
+            meter_count=meter_count,
+            meter_max_count=int(skill_cfg.get("meter_max_count", 0)),
+            identity=self._node.node_info.node_id,
+            counterparty=peer_nid,
+        ))
+        return result, entry, initial_credit, min_balance
+
     async def enqueue(self, to_node: str, msg_type: str, body: dict,
                       session_id: str = None, reply_to: str = None,
                       system: bool = False, ttl_hours: float = 168):
@@ -497,9 +539,33 @@ class SyncEngine:
                     self._log.warning(f"MailSync: group engine not available, rejecting")
                     break
 
-            # System flag: dispatch if msg_type has a registered handler
+            # System flag: only knarr/-prefixed msg_types are system mail
             msg_type = item.get("msg_type", "")
-            is_system = msg_type in self._mail_handlers
+            is_system = msg_type.startswith("knarr/")
+            if not is_system:
+                sender_key = getattr(msg, "public_key", "")
+                if not sender_key:
+                    self._log.warning("MAIL_REJECT: empty public_key on push path, item=%s", item_id[:8])
+                    confirmed_ids.append(item_id)
+                    continue
+                try:
+                    result, entry, initial_credit, min_balance = await self._run_mail_admission(
+                        msg.sender_node_id, sender_key
+                    )
+                except ValueError:
+                    self._log.warning("MAIL_REJECT: invalid hex public_key on push path, item=%s", item_id[:8])
+                    confirmed_ids.append(item_id)
+                    continue
+                if result.gate.outcome == "hard_block":
+                    if getattr(self._node, "bus", None):
+                        self._node.bus.emit(
+                            "credit.sanctioned",
+                            counterparty=sender_key,
+                            limit_type="hard",
+                            identity=sender_key,
+                        )
+                    confirmed_ids.append(item_id)
+                    continue
             
             # Store in inbox — force from_node to authenticated sender (anti-spoof)
             stored = await self._node._enqueue_write(
@@ -511,6 +577,17 @@ class SyncEngine:
             )
             
             if stored:
+                if not is_system:
+                    await self._node._enqueue_write(
+                        self._node.storage.update_ledger_provider,
+                        msg.public_key, max(0.0, result.pricing.final_price)
+                    )
+                    await self._node._maybe_send_tab_reminder(
+                        msg.public_key,
+                        result.gate.balance_after if result.gate.balance_after is not None else entry.balance,
+                        initial_credit,
+                        min_balance,
+                    )
                 confirmed_ids.append(item_id)
                 self._fire_mail_received(item, msg.sender_node_id, self._node.node_info.node_id)
                 # v0.33.0: mail.received (push path)
@@ -911,7 +988,31 @@ class SyncEngine:
 
             # Store
             msg_type = item.get("msg_type", "")
-            is_system = msg_type in self._mail_handlers
+            is_system = msg_type.startswith("knarr/")
+            if not is_system:
+                sender_key = getattr(resp, "public_key", "")
+                if not sender_key:
+                    self._log.warning("MAIL_REJECT: empty public_key on pull path, item=%s", item_id[:8])
+                    confirmed_ids.append(item_id)
+                    continue
+                try:
+                    result, entry, initial_credit, min_balance = await self._run_mail_admission(
+                        peer_node_id, sender_key
+                    )
+                except ValueError:
+                    self._log.warning("MAIL_REJECT: invalid hex public_key on pull path, item=%s", item_id[:8])
+                    confirmed_ids.append(item_id)
+                    continue
+                if result.gate.outcome == "hard_block":
+                    if getattr(self._node, "bus", None):
+                        self._node.bus.emit(
+                            "credit.sanctioned",
+                            counterparty=sender_key,
+                            limit_type="hard",
+                            identity=sender_key,
+                        )
+                    confirmed_ids.append(item_id)
+                    continue
             stored = await self._node._enqueue_write(
                 self._node.storage.store_mail_from_sync,
                 item_id, peer_node_id, self._node.node_info.node_id,
@@ -921,6 +1022,17 @@ class SyncEngine:
             )
             confirmed_ids.append(item_id)
             if stored:
+                if not is_system:
+                    await self._node._enqueue_write(
+                        self._node.storage.update_ledger_provider,
+                        resp.public_key, max(0.0, result.pricing.final_price)
+                    )
+                    await self._node._maybe_send_tab_reminder(
+                        resp.public_key,
+                        result.gate.balance_after if result.gate.balance_after is not None else entry.balance,
+                        initial_credit,
+                        min_balance,
+                    )
                 self._fire_mail_received(item, peer_node_id, self._node.node_info.node_id)
                 # v0.33.0: mail.received (pull path)
                 _bus = getattr(self._node, 'bus', None)

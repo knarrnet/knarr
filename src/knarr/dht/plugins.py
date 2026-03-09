@@ -93,6 +93,7 @@ class PluginContext:
     send_fire_forget: Callable[[NodeInfo, Message], Any]
     delivery_cb: Optional[Callable[[Message, str], Any]]
     log: logging.Logger
+    state_dir: Optional[Path] = None
     group_engine: Optional[Any] = None      # GroupEngine instance, set after engine init
     storage_path: Optional[str] = None      # Path to node.db for read-only queries
     register_mail_handler: Optional[Callable] = None
@@ -112,8 +113,9 @@ class PluginLoader:
     """
     Discovers, loads, and manages Knarr plugins from the specified plugin directories.
     """
-    def __init__(self, config_dir: Path, get_peers_cb: Callable, send_to_peer_cb: Callable, node_id: str, delivery_cb: Optional[Callable] = None, send_fire_forget_cb: Optional[Callable] = None, register_mail_handler_cb: Optional[Callable] = None, send_mail_cb: Optional[Callable] = None, register_egress_material_cb: Optional[Callable] = None, vault_get_cb: Optional[Callable] = None, vault_set_cb: Optional[Callable] = None, storage_path: Optional[str] = None, update_cache_cb: Optional[Callable] = None, subscribe_events_cb: Optional[Callable] = None, emit_event_cb: Optional[Callable] = None, bus: Optional[Any] = None):
+    def __init__(self, config_dir: Path, get_peers_cb: Callable, send_to_peer_cb: Callable, node_id: str, delivery_cb: Optional[Callable] = None, send_fire_forget_cb: Optional[Callable] = None, register_mail_handler_cb: Optional[Callable] = None, send_mail_cb: Optional[Callable] = None, register_egress_material_cb: Optional[Callable] = None, vault_get_cb: Optional[Callable] = None, vault_set_cb: Optional[Callable] = None, storage_path: Optional[str] = None, update_cache_cb: Optional[Callable] = None, subscribe_events_cb: Optional[Callable] = None, emit_event_cb: Optional[Callable] = None, bus: Optional[Any] = None, data_dir: Optional[Path] = None):
         self._plugin_root = config_dir / "plugins"
+        self._state_root = data_dir / "plugin_state" if data_dir else None
         self._get_peers_cb = get_peers_cb
         self._send_to_peer_cb = send_to_peer_cb
         self._send_fire_forget_cb = send_fire_forget_cb
@@ -196,10 +198,15 @@ class PluginLoader:
                         raise TypeError(f"Plugin {class_name} in {module_name} must inherit from PluginHooks.")
 
                     plugin_logger = logging.getLogger(f"knarr.plugin.{plugin_config['name']}")
+                    state_dir = plugin_path
+                    if self._state_root is not None:
+                        state_dir = self._state_root / plugin_path.name
+                        state_dir.mkdir(parents=True, exist_ok=True)
 
                     plugin_context = PluginContext(
                         node_id=self._node_id,
                         plugin_dir=plugin_path,
+                        state_dir=state_dir,
                         get_peers=self._get_peers_cb,
                         send_to_peer=self._send_to_peer_cb,
                         send_fire_forget=self._send_fire_forget_cb or self._send_to_peer_cb,
