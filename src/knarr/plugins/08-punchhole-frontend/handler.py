@@ -74,7 +74,8 @@ class PunchholeFrontendPlugin(PluginHooks):
 
         # Disclosure log DB (plugin-local SQLite)
         db_name = config.get("disclosure_log", "disclosure.db")
-        self._db_path = str(ctx.plugin_dir / db_name)
+        state_dir = ctx.state_dir or ctx.plugin_dir
+        self._db_path = str(state_dir / db_name)
         self._init_disclosure_log()
 
         # Subscribe to bus events

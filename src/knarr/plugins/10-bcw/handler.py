@@ -200,7 +200,7 @@ class BCWPlugin(PluginHooks):
         self._self_owned_addresses: set[str] = set()
         self._sub = None
 
-        self._store = WatchStore(ctx.plugin_dir / "bcw.sqlite3")
+        self._store = WatchStore((ctx.state_dir or ctx.plugin_dir) / "bcw.sqlite3")
         self._solana_modules: dict[str, SolanaWatcher] = {}
         for chain_cfg in self._config.get("chains", []):
             chain_id = str(chain_cfg.get("chain_id", ""))
