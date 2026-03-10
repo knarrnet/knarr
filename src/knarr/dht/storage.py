@@ -3,6 +3,7 @@ import sqlite3
 import time
 import logging
 from typing import List, Dict, Any, Optional
+from ..core import rfc8785
 from ..core.models import NodeInfo, SkillSheet, Task, LedgerEntry
 
 logger = logging.getLogger(__name__)
@@ -275,6 +276,32 @@ class Storage:
                 provider_node_id TEXT,
                 provider_host TEXT,
                 provider_port INTEGER
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dmz_quarantine (
+                id                TEXT PRIMARY KEY,
+                document_type     TEXT NOT NULL,
+                document_json     TEXT NOT NULL,
+                originator_pubkey TEXT,
+                status            TEXT NOT NULL DEFAULT 'pending',
+                gate_results      TEXT,
+                reason            TEXT,
+                received_at       REAL NOT NULL,
+                promoted_at       REAL,
+                resolved_at       REAL
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_dmz_status ON dmz_quarantine(status)")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS payment_receipts (
+                tx_digest   TEXT PRIMARY KEY,
+                amount      INTEGER NOT NULL,
+                asset       TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                verified_at REAL NOT NULL
             )
         """)
         
@@ -2292,3 +2319,159 @@ class Storage:
         """, (new_held, now, peer_public_key))
         conn.commit()
         return True
+
+    # --- DMZ quarantine methods (A1) ---
+
+    def quarantine_store(
+        self,
+        id: str,
+        document_type: str,
+        document_json: str | dict,
+        originator_pubkey: str | bytes,
+        status: str,
+        gate_results: str | dict,
+        reason: str | None,
+    ) -> None:
+        conn = self._get_conn()
+        if isinstance(originator_pubkey, bytes):
+            originator_pubkey = originator_pubkey.hex()
+        if not isinstance(gate_results, str):
+            gate_results = json.dumps(gate_results, sort_keys=True, separators=(",", ":"))
+        conn.execute(
+            """
+            INSERT INTO dmz_quarantine (
+                id, document_type, document_json, originator_pubkey, status,
+                gate_results, reason, received_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                id,
+                document_type,
+                self._canonical_json_text(document_json),
+                originator_pubkey or "",
+                status,
+                gate_results,
+                reason,
+                time.time(),
+            ),
+        )
+        conn.commit()
+
+    def quarantine_get(self, id: str) -> Optional[Dict[str, Any]]:
+        conn = self._get_conn()
+        row = conn.execute(
+            """
+            SELECT id, document_type, document_json, originator_pubkey, status,
+                   gate_results, reason, received_at, promoted_at, resolved_at
+            FROM dmz_quarantine
+            WHERE id = ?
+            """,
+            (id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_quarantine_dict(row)
+
+    def quarantine_update_status(
+        self,
+        id: str,
+        status: str,
+        reason: str | None = None,
+        promoted_at: float | None = None,
+        resolved_at: float | None = None,
+    ) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """
+            UPDATE dmz_quarantine
+            SET status = ?,
+                reason = COALESCE(?, reason),
+                promoted_at = COALESCE(?, promoted_at),
+                resolved_at = COALESCE(?, resolved_at)
+            WHERE id = ?
+            """,
+            (status, reason, promoted_at, resolved_at, id),
+        )
+        conn.commit()
+
+    def quarantine_list_pending(self) -> List[Dict[str, Any]]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            """
+            SELECT id, document_type, document_json, originator_pubkey, status,
+                   gate_results, reason, received_at, promoted_at, resolved_at
+            FROM dmz_quarantine
+            WHERE status = 'pending'
+               OR (status = 'approved' AND promoted_at IS NULL)
+            ORDER BY received_at ASC
+            """
+        ).fetchall()
+        return [self._row_to_quarantine_dict(row) for row in rows]
+
+    def quarantine_list_by_status(self, status: str) -> List[Dict[str, Any]]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            """
+            SELECT id, document_type, document_json, originator_pubkey, status,
+                   gate_results, reason, received_at, promoted_at, resolved_at
+            FROM dmz_quarantine
+            WHERE status = ?
+            ORDER BY received_at ASC
+            """,
+            (status,),
+        ).fetchall()
+        return [self._row_to_quarantine_dict(row) for row in rows]
+
+    def _row_to_quarantine_dict(self, row: Any) -> Dict[str, Any]:
+        return {
+            "id": row[0],
+            "document_type": row[1],
+            "document_json": row[2],
+            "originator_pubkey": row[3] or "",
+            "status": row[4],
+            "gate_results": row[5],
+            "reason": row[6],
+            "received_at": row[7],
+            "promoted_at": row[8],
+            "resolved_at": row[9],
+        }
+
+    def _canonical_json_text(self, value: str | dict) -> str:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                return value
+        try:
+            return rfc8785.dumps(value).decode("utf-8")
+        except Exception:
+            return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+    # --- x402 payment receipt methods (B5) ---
+
+    def check_payment_receipt(self, tx_digest: str) -> bool:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT 1 FROM payment_receipts WHERE tx_digest = ?",
+            (tx_digest,),
+        ).fetchone()
+        return row is not None
+
+    def store_payment_receipt(
+        self,
+        tx_digest: str,
+        amount: int,
+        asset: str,
+        destination: str,
+    ) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO payment_receipts
+            (tx_digest, amount, asset, destination, verified_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (tx_digest, amount, asset, destination, time.time()),
+        )
+        conn.commit()

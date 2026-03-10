@@ -23,7 +23,7 @@ import logging
 import math
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 from nacl.signing import VerifyKey
@@ -47,6 +47,8 @@ class IngestResult:
     quarantine_id: Optional[str]
     gate_results: dict              # {1: "pass", 2: "fail", ...}
     reason: Optional[str]
+    needs_countersign: bool = False
+    document: Optional[dict] = None
 
 
 # ---------- Schema validator registry ----------
@@ -55,10 +57,10 @@ class IngestResult:
 
 def _get_schema_validators() -> dict:
     """Build the schema validator registry. Deferred to avoid import cycles."""
+    from ..commerce.documents import _TYPE_REGISTRY
     from ..commerce.schemas import (
         validate_credit_note,
         validate_receipt,
-        validate_settle_request,
         validate_settlement_confirmation,
         validate_tab_reminder,
         validate_payment_received,
@@ -75,12 +77,26 @@ def _get_schema_validators() -> dict:
         validate_netting_acceptance,
         validate_netting_executed,
     )
+
+    def _document_validator(expected_type: str):
+        required = set(_TYPE_REGISTRY.get(expected_type, set()))
+
+        def _validate(body: dict) -> tuple[bool, str | None]:
+            if body.get("document_type") != expected_type:
+                return False, f"wrong document_type: {body.get('document_type')}"
+            missing = sorted(required - set(body.keys()))
+            if missing:
+                return False, f"missing required field: {missing[0]}"
+            return True, None
+
+        return _validate
+
     return {
         "credit_note": validate_credit_note,
         "execution_receipt": validate_receipt,
-        "settlement_prepared": validate_settle_request,
-        "settlement_accepted": validate_settle_request,
-        "settlement_processed": validate_settle_request,
+        "settlement_prepared": _document_validator("settlement_prepared"),
+        "settlement_accepted": _document_validator("settlement_accepted"),
+        "settlement_processed": _document_validator("settlement_processed"),
         "settlement_confirmation": validate_settlement_confirmation,
         "tab_reminder": validate_tab_reminder,
         # v0.37.0: BCW payment/wallet types
@@ -137,6 +153,7 @@ class WarehouseManager:
         self,
         node_id: str,
         identity_fragments: list[str],
+        internal_signer_keys: dict[str, bytes],
         bus,
         storage,
         config: dict,
@@ -144,6 +161,7 @@ class WarehouseManager:
     ):
         self._node_id = node_id
         self._identity_fragments = set(identity_fragments)
+        self._internal_signer_keys = dict(internal_signer_keys or {})
         self._bus = bus
         self._storage = storage
         self._write_receipt_cb = write_receipt_cb
@@ -185,13 +203,29 @@ class WarehouseManager:
         Returns:
             IngestResult with status, gate results, and quarantine ID if held.
         """
-        doc_type = document.get("document_type", document.get("type", "unknown"))
+        doc_type = self._resolve_document_type(document)
         rule = self._get_rule(doc_type)
         required_gates = rule["gates"]
         action = rule["action"]
 
         gate_results = {}
         qid = f"dmz_{secrets.token_hex(8)}"
+        internal_signer = False
+
+        if not originator_pubkey:
+            internal_signer = self._is_internal_signer(document)
+            if internal_signer:
+                required_gates = [3, 4]
+                action = "auto_promote"
+            else:
+                return self._quarantine(
+                    document,
+                    doc_type,
+                    qid,
+                    gate_results,
+                    b"",
+                    "Gate 1 failed: empty sender pubkey and unrecognized internal signer",
+                )
 
         # --- Gate 1: Authenticity ---
         if 1 in required_gates:
@@ -240,9 +274,11 @@ class WarehouseManager:
                     # Recognized type with no body validator — pass
                     gate_results[3] = "pass"
             else:
-                # Unknown type — not a hard fail, but trigger hold_for_review
+                # Unknown type — hold external docs for review, but let trusted
+                # internal docs continue through integrity + countersign.
                 gate_results[3] = "pass"
-                action = "hold_for_review"
+                if not internal_signer:
+                    action = "hold_for_review"
                 if self._debug:
                     logger.debug(f"WM unknown document_type={doc_type}, defaulting to hold_for_review")
         else:
@@ -271,7 +307,10 @@ class WarehouseManager:
 
         # --- All gates passed ---
         if action == "auto_promote":
-            return self._promote(document, doc_type, qid, gate_results, originator_pubkey)
+            result = self._promote(document, doc_type, qid, gate_results, originator_pubkey)
+            if internal_signer:
+                return replace(result, needs_countersign=True, document=document)
+            return result
         elif action == "hold_for_review":
             return self._hold(document, doc_type, qid, gate_results, originator_pubkey)
         else:
@@ -430,6 +469,43 @@ class WarehouseManager:
         # The hold_for_review action provides the human/agent review layer.
         return True
 
+    def _resolve_document_type(self, document: dict) -> str:
+        doc_type = document.get("document_type")
+        if isinstance(doc_type, str) and doc_type:
+            return doc_type
+
+        raw_type = document.get("type", "unknown")
+        if not isinstance(raw_type, str):
+            return "unknown"
+
+        legacy_map = {
+            "knarr/commerce/credit_note": "credit_note",
+            "knarr/commerce/receipt": "execution_receipt",
+            "knarr/commerce/settlement_confirmation": "settlement_confirmation",
+            "knarr/commerce/tab_reminder": "tab_reminder",
+        }
+        return legacy_map.get(raw_type, raw_type)
+
+    def _is_internal_signer(self, document: dict) -> bool:
+        if not self._internal_signer_keys:
+            return False
+
+        proof = document.get("proof", {})
+        if not isinstance(proof, dict):
+            return False
+
+        # Only trust the verificationMethod DID fragment — it names the key
+        # used for signing and is verified cryptographically by Gate 4.
+        # Do NOT check self-asserted fields like publicKeyHex which can be
+        # forged by an attacker to impersonate an internal signer.
+        vm = proof.get("verificationMethod") or ""
+        if isinstance(vm, str):
+            did_base, _, fragment = vm.partition("#")
+            if did_base == f"did:knarr:{self._node_id}" and fragment in self._internal_signer_keys:
+                return True
+
+        return False
+
     # ------------------------------------------------------------------
     # Internal actions
     # ------------------------------------------------------------------
@@ -439,15 +515,14 @@ class WarehouseManager:
         gate_results: dict, originator_pubkey: bytes, reason: str
     ) -> IngestResult:
         """Store a failed/held document in the quarantine table."""
-        now = time.time()
         pubkey_hex = originator_pubkey.hex() if originator_pubkey else ""
         self._storage.quarantine_store(
             id=qid,
             document_type=doc_type,
-            document_json=json.dumps(document, sort_keys=True, separators=(",", ":"), default=str),
+            document_json=document,
             originator_pubkey=pubkey_hex,
             status="rejected",
-            gate_results=json.dumps({str(k): v for k, v in gate_results.items()}),
+            gate_results={str(k): v for k, v in gate_results.items()},
             reason=reason,
         )
 
@@ -467,15 +542,14 @@ class WarehouseManager:
         gate_results: dict, originator_pubkey: bytes
     ) -> IngestResult:
         """Hold a document in quarantine for review."""
-        now = time.time()
         pubkey_hex = originator_pubkey.hex() if originator_pubkey else ""
         self._storage.quarantine_store(
             id=qid,
             document_type=doc_type,
-            document_json=json.dumps(document, sort_keys=True, separators=(",", ":"), default=str),
+            document_json=document,
             originator_pubkey=pubkey_hex,
             status="pending",
-            gate_results=json.dumps({str(k): v for k, v in gate_results.items()}),
+            gate_results={str(k): v for k, v in gate_results.items()},
             reason=None,
         )
 

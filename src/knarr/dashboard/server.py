@@ -1332,6 +1332,59 @@ class CockpitServer:
     def _respond_cors_error(self, writer, code, message):
         self._respond_cors(writer, f"{code} {self._sanitize_status(message)}", "text/plain", message.encode("utf-8"))
 
+    def _issue_x402_refund(self, x402_payment: dict) -> None:
+        """v0.42.0 B4: Issue credit note refund after x402 execution failure."""
+        if not x402_payment or x402_payment.get("refunded"):
+            return
+        payer_node_id = str(x402_payment.get("payer_node_id", "") or "").strip()
+        if not payer_node_id:
+            logger.warning("x402 refund skipped: missing payer_node_id")
+            x402_payment["refunded"] = True
+            return
+        try:
+            from ..commerce.conversion import get_conversion_rate, token_to_credits
+            from ..commerce.documents import credit_note
+            from ..commerce.handlers import _resolve_public_key
+            from ..core.proof import sign_document
+
+            if self._node._signing_key is None:
+                raise RuntimeError("missing node signing key for refund")
+
+            # Fix #5: convert token amount to credits for refund
+            rate = get_conversion_rate(self._node._config)
+            refund_credits = token_to_credits(float(x402_payment["charged_amount"]), rate)
+
+            refund_doc = credit_note(
+                provider=self._node.node_info.node_id,
+                consumer=payer_node_id,
+                amount=refund_credits,
+                skill_name=x402_payment["skill_name"],
+                reason="execution_failed",
+                original_receipt_id=x402_payment["payment_receipt_id"],
+            )
+            signed_refund = sign_document(
+                refund_doc.payload,
+                self._node._signing_key,
+                verification_method=f"did:knarr:{self._node.node_info.node_id}#key-1",
+            )
+            self._node._write_receipt(
+                document_type="credit_note",
+                payload=signed_refund,
+                counterparty=payer_node_id,
+                order_ref=x402_payment["payment_receipt_id"],
+                proof_purpose="assertionMethod",
+            )
+            # Fix #3: resolve node_id → peer_public_key for ledger update
+            peer_pubkey = _resolve_public_key(self._node, payer_node_id)
+            if peer_pubkey:
+                self._node.storage.update_ledger_refund(peer_pubkey, refund_credits)
+            else:
+                logger.warning("x402 refund ledger update failed: cannot resolve pubkey for %s", payer_node_id[:16])
+            x402_payment["refunded"] = True
+            logger.info(f"X402_REFUND issued for skill={x402_payment['skill_name']} amount={x402_payment['charged_amount']}")
+        except Exception as exc:
+            logger.error(f"X402_REFUND_FAILED: {type(exc).__name__}: {exc}")
+
     async def _route_exposure(self, method, path, body, query, writer, client_ip, headers=None):
         """Route /s/ requests to the appropriate exposure handler."""
         headers = headers or {}
@@ -1740,6 +1793,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
 
         headers = headers or {}
         payment_mode = exposure.get("payment", "none")
+        x402_payment = None
         if payment_mode != "none":
             payment_sig = headers.get("payment-signature", "")
             chain_cfg = self._node._chain
@@ -1794,12 +1848,6 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
                     self._respond_cors_error(writer, 403, verify_result.get("error", "Invalid payment"))
                     return
 
-                # Persist receipt before settlement — fail-closed on crash
-                self._node.storage.store_payment_receipt(
-                    _digest, verify_result["amount"],
-                    verify_result["asset"], verify_result["destination"],
-                )
-
                 settle_result = await settle_x402(
                     verify_result["tx_bytes"],
                     getattr(self._node, "_signing_key", None),
@@ -1808,6 +1856,23 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
                 if not settle_result.get("success"):
                     self._respond_cors_error(writer, 502, settle_result.get("error", "Payment settlement failed"))
                     return
+                self._node.storage.store_payment_receipt(
+                    _digest,
+                    verify_result["amount"],
+                    verify_result["asset"],
+                    verify_result["destination"],
+                )
+                x402_payment = {
+                    "charged_amount": verify_result["amount"],
+                    "payer_node_id": str(
+                        data.get("payer_node_id")
+                        or data.get("peer_key")
+                        or data.get("peer_public_key")
+                        or ""
+                    ).strip(),
+                    "payment_receipt_id": _digest,
+                    "skill_name": str(exposure.get("skill", "") or ""),
+                }
             except Exception as exc:
                 logger.error(f"x402 verify/settle failed: {type(exc).__name__}: {exc}")
                 self._respond_cors_error(writer, 502, "Payment verification failed")
@@ -1820,6 +1885,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
         allowed_keys = set(fields.keys())
         extra = set(data.keys()) - allowed_keys
         if extra:
+            self._issue_x402_refund(x402_payment)
             self._respond_cors_error(writer, 400, f"Unknown fields: {', '.join(sorted(extra))}")
             return
 
@@ -1827,6 +1893,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
         for field_name, field_cfg in fields.items():
             if isinstance(field_cfg, dict) and field_cfg.get("required", False):
                 if field_name not in data or data[field_name] == "":
+                    self._issue_x402_refund(x402_payment)
                     self._respond_cors_error(writer, 400, f"Missing required field: {field_name}")
                     return
 
@@ -1862,12 +1929,14 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
                     }).encode("utf-8"))
                 else:
                     reason = getattr(result, "reason", "") or result.status
+                    self._issue_x402_refund(x402_payment)
                     self._respond_cors(writer, "409 Conflict", "application/json", json.dumps({
                         "status": "failed",
                         "error": {"code": "TASK_REJECTED", "message": f"Task rejected: {reason}"}
                     }).encode("utf-8"))
             except Exception as e:
                 logger.error(f"Exposure local async execute failed: {type(e).__name__}: {e}")
+                self._issue_x402_refund(x402_payment)
                 self._respond_cors_json(writer, {
                     "status": "failed",
                     "error": {"code": "HANDLER_ERROR", "message": "Task submission failed"}
@@ -1902,6 +1971,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
                     break
             if not provider:
                 if strict:
+                    self._issue_x402_refund(x402_payment)
                     self._respond_cors_error(writer, 404,
                         f"No provider found in jurisdiction '{target_j}'")
                     return
@@ -1913,6 +1983,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
                 provider = candidates[0]
 
         if not provider:
+            self._issue_x402_refund(x402_payment)
             self._respond_cors_error(writer, 404, "No provider found")
             return
 
@@ -1947,12 +2018,14 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
                 }).encode("utf-8"))
             else:
                 reason = getattr(result, "reason", "") or result.status
+                self._issue_x402_refund(x402_payment)
                 self._respond_cors(writer, "409 Conflict", "application/json", json.dumps({
                     "status": "failed",
                     "error": {"code": "TASK_REJECTED", "message": f"Task rejected: {reason}"}
                 }).encode("utf-8"))
         except Exception as e:
             logger.error(f"Exposure async execute failed: {type(e).__name__}: {e}")
+            self._issue_x402_refund(x402_payment)
             self._respond_cors_json(writer, {
                 "status": "failed",
                 "error": {"code": "EXECUTION_ERROR", "message": "Task submission failed"}
@@ -2319,6 +2392,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
                 storage=self._node.storage,
                 send_mail_fn=self._node._sync.enqueue,
                 bus=getattr(self._node, "bus", None),
+                config=self._node._config,
             )
         except ValueError as exc:
             self._respond_error(writer, 400, str(exc))

@@ -250,6 +250,65 @@ class DHTNode:
             data_dir=data_dir,
         )
 
+        internal_signer_keys: Dict[str, bytes] = {}
+        thrall_path = os.path.join(
+            str(data_dir or config_dir),
+            "plugin_state",
+            "06-thrall",
+            "thrall_identity.key",
+        )
+        if os.path.exists(thrall_path):
+            try:
+                with open(thrall_path, "rb") as handle:
+                    thrall_signing_key = SigningKey(handle.read())
+                internal_signer_keys["thrall-1"] = thrall_signing_key.verify_key.encode()
+                self._thrall_signing_key = thrall_signing_key
+            except Exception as exc:
+                logger.warning(f"Failed to load thrall identity key from {thrall_path}: {exc}")
+
+        cockpit_signing_key = getattr(self, "_cockpit_signing_key", None)
+        if cockpit_signing_key is not None:
+            try:
+                internal_signer_keys["cockpit-1"] = cockpit_signing_key.verify_key.encode()
+            except Exception as exc:
+                logger.warning(f"Failed to register cockpit signing key: {exc}")
+
+        wm_cfg = dict(self._config.get("warehouse_manager", {}) or {})
+        if wm_cfg.get("enabled", False):
+            from ..core.warehouse_manager import WarehouseManager
+
+            identity_fragments = [
+                self.node_info.node_id,
+                self._public_key_hex,
+                f"did:knarr:{self.node_info.node_id}",
+                f"did:knarr:{self.node_info.node_id}#key-1",
+                f"did:knarr:{self.node_info.node_id}#cockpit-1",
+                f"did:knarr:{self.node_info.node_id}#thrall-1",
+            ]
+            rules_cfg = dict(wm_cfg.get("rules", {}) or {})
+            for settlement_type in (
+                "settlement_prepared",
+                "settlement_accepted",
+                "settlement_processed",
+                "settlement_confirmation",
+            ):
+                rules_cfg.setdefault(
+                    settlement_type,
+                    {"gates": [1, 2, 3, 4, 5], "action": "auto_promote"},
+                )
+            wm_cfg["rules"] = rules_cfg
+            self.wm = WarehouseManager(
+                node_id=self.node_info.node_id,
+                identity_fragments=identity_fragments,
+                internal_signer_keys=internal_signer_keys,
+                bus=self.bus,
+                storage=self.storage,
+                config=wm_cfg,
+                write_receipt_cb=self._write_receipt,
+            )
+        else:
+            self.wm = None
+
         # M-016: Wire plugins into SyncEngine for on_mail_received hook
         self._sync._plugins = self._plugins
 
@@ -1143,6 +1202,66 @@ class DHTNode:
 
         return receipt_id
 
+    async def _wm_ingest(self, document: dict, originator_pubkey: bytes):
+        if getattr(self, "wm", None) is None:
+            return None
+
+        from ..core.proof import sign_document
+        from ..core.warehouse_manager import IngestResult
+
+        doc_type = document.get("document_type", document.get("type", "unknown"))
+        loop = asyncio.get_running_loop()
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(self._handler_pool, self.wm.ingest, document, originator_pubkey),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"WM_INGEST_TIMEOUT type={doc_type}")
+            return IngestResult(
+                status="rejected",
+                document_type=doc_type,
+                quarantine_id=None,
+                gate_results={},
+                reason="timeout",
+            )
+        except Exception as exc:
+            logger.error(f"WM_INGEST_FAIL type={doc_type}: {exc}", exc_info=True)
+            return IngestResult(
+                status="rejected",
+                document_type=doc_type,
+                quarantine_id=None,
+                gate_results={},
+                reason=str(exc),
+            )
+
+        if result.status == "promoted" and result.needs_countersign:
+            try:
+                if self._signing_key is None:
+                    raise RuntimeError("missing node signing key for countersign")
+                payload = {
+                    key: value
+                    for key, value in (result.document or document).items()
+                    if key != "proof"
+                }
+                signed_doc = sign_document(
+                    payload,
+                    self._signing_key,
+                    f"did:knarr:{self.node_info.node_id}#key-1",
+                )
+                result = replace(result, document=signed_doc)
+            except Exception as exc:
+                logger.error(f"WM_COUNTERSIGN_FAIL type={doc_type}: {exc}", exc_info=True)
+                return IngestResult(
+                    status="rejected",
+                    document_type=result.document_type,
+                    quarantine_id=result.quarantine_id,
+                    gate_results=result.gate_results,
+                    reason=str(exc),
+                )
+
+        return result
+
     def _init_group_engine(self):
         """Initialize GroupEngine from config. Plugin can override later."""
         from ..core.groups import DefaultGroupEngine
@@ -1334,6 +1453,7 @@ class DHTNode:
                     ctx.send_mail = self._sync.enqueue
                 ctx.sign_document = _sign_cb       # v0.35.0
                 ctx.query_receipts = _query_cb     # v0.35.0
+                ctx.economy_config = dict(self._config.get("economy", {}))  # v0.42.0
                 # If plugin set itself as group_engine, pick it up
                 if ctx.group_engine is not None:
                     self._group_engine = ctx.group_engine
@@ -1405,6 +1525,21 @@ class DHTNode:
         self.background_tasks.append(asyncio.create_task(self._flush_outbox_loop()))
         self.background_tasks.append(asyncio.create_task(self._pull_from_correspondents_loop()))
         self.background_tasks.append(asyncio.create_task(self._peer_heartbeat_sweep_loop()))
+
+        if self.wm is not None:
+            try:
+                pending = self.storage.quarantine_list_pending()
+                for row in pending:
+                    self.bus.emit(
+                        f"wm.held.{row['document_type']}",
+                        document_type=row["document_type"],
+                        quarantine_id=row["id"],
+                        identity=self.node_info.node_id,
+                    )
+                if pending:
+                    logger.info(f"WM recovery re-emitted {len(pending)} held document(s)")
+            except Exception as exc:
+                logger.warning(f"WM_RECOVERY_ERROR: {exc}")
 
     async def stop(self):
         """Stops the server, MCP bridges, and background tasks."""
@@ -4604,6 +4739,7 @@ class DHTNode:
             storage=self.storage,
             send_mail_fn=_send_confirmation_mail,
             bus=self.bus,
+            config=self._config,
         )
         if self.bus:
             self.bus.emit(

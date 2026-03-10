@@ -628,6 +628,7 @@ class SyncEngine:
                     self._log.info(f"MAIL_STORE id={item_id[:8]} type={item.get('msg_type','?')} from={msg.sender_node_id[:16]} system={is_system}")
                 if is_system:
                     # Run system dispatch in background task
+                    item["_sender_pubkey"] = getattr(msg, "public_key", "")
                     asyncio.create_task(self._dispatch_system_item(item))
             else:
                 # Duplicate item_id — still confirm to sender
@@ -858,7 +859,48 @@ class SyncEngine:
             try:
                 if self._debug:
                     self._log.info(f"MAIL_DISPATCH type={msg_type} from={item.get('from_node', '?')[:16]}")
-                await handler(item)
+                dispatch_item = item
+                # v0.42.0 A3: WM dispatch gate — documents with proof fields
+                body = item.get("body", {})
+                if isinstance(body, dict):
+                    # Unwrap nested document from settlement/commerce envelopes
+                    if msg_type.startswith("knarr/commerce/"):
+                        wm_document = body.get("document", body)
+                    else:
+                        wm_document = body
+                    # Commerce types are documents — always route through WM.
+                    # Non-commerce system messages (task results, asset fetch)
+                    # only go through WM if they carry a proof field; unsigned
+                    # system messages are authenticated at the transport layer.
+                    if not msg_type.startswith("knarr/commerce/"):
+                        if not isinstance(wm_document, dict) or "proof" not in wm_document:
+                            await handler(dispatch_item)
+                            return
+                    originator_pubkey = b""
+                    sender_pubkey = item.get("_sender_pubkey", "")
+                    if isinstance(sender_pubkey, str) and sender_pubkey:
+                        try:
+                            originator_pubkey = bytes.fromhex(sender_pubkey)
+                        except ValueError:
+                            self._log.warning("MAIL_REJECT: invalid _sender_pubkey on dispatch path, type=%s", msg_type)
+                            return  # Fix #9: reject on corrupt sender identity
+                    result = await self._node._wm_ingest(wm_document, originator_pubkey)
+                    if result is not None:
+                        if result.status == "held":
+                            self._log.info("WM_HELD type=%s reason=%s", result.document_type, result.reason or "review")
+                            return
+                        if result.status == "rejected":
+                            self._log.warning("WM_REJECTED type=%s reason=%s", result.document_type, result.reason or "rejected")
+                            return
+                        if result.document is not None:
+                            dispatch_item = dict(item)
+                            if msg_type.startswith("knarr/commerce/") and "document" in body:
+                                dispatch_body = dict(body)
+                                dispatch_body["document"] = result.document
+                                dispatch_item["body"] = dispatch_body
+                            else:
+                                dispatch_item["body"] = result.document
+                await handler(dispatch_item)
             except Exception:
                 self._log.error(f"System mail handler failed for {msg_type}", exc_info=True)
         else:
@@ -1070,6 +1112,7 @@ class SyncEngine:
                     self._log.warning("RECEIPT_SKIP: node missing _write_receipt — mail receipts disabled")
                     self._receipt_skip_warned = True
                 if is_system:
+                    item["_sender_pubkey"] = getattr(resp, "public_key", "")
                     asyncio.create_task(self._dispatch_system_item(item))
 
         # M-014: Replicate referenced assets from sender's sidecar

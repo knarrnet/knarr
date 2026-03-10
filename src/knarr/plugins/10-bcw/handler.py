@@ -3,10 +3,12 @@ import json
 import logging
 import secrets
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from knarr.commerce.conversion import get_conversion_rate, token_to_credits
 from nacl.signing import SigningKey
 
 from knarr.commerce.transfer_event import ConfirmationStatus, TransferEvent
@@ -28,6 +30,17 @@ _PREFIX_BY_TYPE = {
     "wallet_withdrawal": "wwdr",
 }
 
+_SUPPORTED_SOLANA_CHAIN_IDS = {
+    "solana-devnet",
+    "solana-testnet",
+    "solana-mainnet",
+}
+_DEFAULT_RPC_BY_CHAIN = {
+    "solana-devnet": "https://api.devnet.solana.com",
+    "solana-testnet": "https://api.testnet.solana.com",
+}
+_LAMPORTS_PER_SOL = 1_000_000_000
+
 
 def derive_counterparty_address(master_seed: bytes, node_id: str, chain_id: str) -> str:
     if len(node_id) != 64:
@@ -39,7 +52,7 @@ def derive_counterparty_address(master_seed: bytes, node_id: str, chain_id: str)
     seed = hashlib.sha256(master_seed + node_id.encode("utf-8")).digest()
     if not isinstance(chain_id, str):
         raise ValueError(f"Unsupported chain: {chain_id}")
-    if chain_id.startswith("solana-"):
+    if chain_id in _SUPPORTED_SOLANA_CHAIN_IDS:
         return derive_solana_address(SigningKey(seed))
     raise ValueError(f"Unsupported chain: {chain_id}")
 
@@ -47,7 +60,7 @@ def derive_counterparty_address(master_seed: bytes, node_id: str, chain_id: str)
 def _derive_master_address(master_seed: bytes, chain_id: str) -> str:
     if not isinstance(chain_id, str):
         raise ValueError(f"Unsupported chain: {chain_id}")
-    if chain_id.startswith("solana-"):
+    if chain_id in _SUPPORTED_SOLANA_CHAIN_IDS:
         return derive_solana_address(SigningKey(master_seed))
     raise ValueError(f"Unsupported chain: {chain_id}")
 
@@ -145,6 +158,26 @@ class WatchStore:
             rows = conn.execute("SELECT address FROM bcw_watchlist").fetchall()
         return {row["address"] for row in rows if row["address"]}
 
+    def get_node_id_for_address(self, address: str) -> Optional[str]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT node_id FROM bcw_watchlist WHERE address = ? LIMIT 1",
+                (address,),
+            ).fetchone()
+        return row["node_id"] if row else None
+
+    def get_address(self, node_id: str, chain_id: str) -> Optional[str]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT address FROM bcw_watchlist
+                WHERE node_id = ? AND chain_id = ?
+                LIMIT 1
+                """,
+                (node_id, chain_id),
+            ).fetchone()
+        return row["address"] if row else None
+
     def mark_seen(self, chain_id: str, tx_hash: str, tx_index: int) -> bool:
         with self._connect() as conn:
             cur = conn.execute(
@@ -199,13 +232,22 @@ class BCWPlugin(PluginHooks):
         self._known_wallet_addresses: set[str] = set()
         self._self_owned_addresses: set[str] = set()
         self._sub = None
+        self._payment_sub = None
+        self._last_balance_check = 0.0
+        self._balance_check_interval = 300.0
 
         self._store = WatchStore((ctx.state_dir or ctx.plugin_dir) / "bcw.sqlite3")
         self._solana_modules: dict[str, SolanaWatcher] = {}
         for chain_cfg in self._config.get("chains", []):
-            chain_id = str(chain_cfg.get("chain_id", ""))
-            if chain_id.startswith("solana-"):
-                self._solana_modules[chain_id] = SolanaWatcher(chain_id, chain_cfg)
+            normalized_cfg = dict(chain_cfg or {})
+            chain_id = str(normalized_cfg.get("chain_id", ""))
+            if chain_id not in _SUPPORTED_SOLANA_CHAIN_IDS:
+                continue
+            if chain_id == "solana-mainnet" and not str(normalized_cfg.get("rpc_url", "")).strip():
+                self._log_warning("BCW mainnet chain requires explicit rpc_url: %s", chain_id)
+                continue
+            normalized_cfg.setdefault("rpc_url", _DEFAULT_RPC_BY_CHAIN.get(chain_id, ""))
+            self._solana_modules[chain_id] = SolanaWatcher(chain_id, normalized_cfg)
 
         self._master_seed = self._load_master_seed()
         if self._enabled and not self._master_seed:
@@ -219,8 +261,13 @@ class BCWPlugin(PluginHooks):
         if callable(subscribe):
             try:
                 self._sub = subscribe("bcw.watch_request", "bcw.unwatch", "bcw.poll")
+                self._payment_sub = subscribe("payment.finalized.*")
             except Exception as exc:
                 self._log_warning("BCW event subscription failed: %s", exc)
+
+        economy_cfg = self._economy_config()
+        if "conversion_rate" not in economy_cfg:
+            self._log_warning("conversion_rate is 1.0 (default) -- verify this is intentional")
 
     def _load_master_seed(self) -> Optional[bytes]:
         getter = getattr(self._ctx, "vault_get", None)
@@ -329,6 +376,19 @@ class BCWPlugin(PluginHooks):
         except Exception as exc:
             self._log_warning("BCW bus poll failed: %s", exc)
 
+    def _drain_payment_events(self) -> None:
+        if not self._payment_sub:
+            return
+        poll = getattr(self._payment_sub, "poll", None)
+        if not callable(poll):
+            return
+        for event in poll() or []:
+            try:
+                if isinstance(event, dict):
+                    self._handle_payment_finalized(event)
+            except Exception as exc:
+                self._log_warning("BCW payment event failed: %s", exc)
+
     def _handle_watch_request(self, node_id: str, chain_id: str) -> None:
         if not self._master_seed:
             return
@@ -388,6 +448,9 @@ class BCWPlugin(PluginHooks):
                 if not self._store.mark_seen(transfer.chain_id, transfer.tx_hash, transfer.tx_index):
                     continue
                 self._process_transfer(transfer)
+
+        self._drain_payment_events()
+        await self._check_sol_balance()
 
         if rpc_ok:
             self._publish_meta_once()
@@ -485,6 +548,127 @@ class BCWPlugin(PluginHooks):
             )
             self._emit_event("wallet_withdrawal", receipt_id=receipt_id, **common_fields)
 
+    def _handle_payment_finalized(self, event: dict) -> None:
+        if not str(event.get("event", "")).startswith("payment.finalized."):
+            return
+
+        assigned_node_id = self._store.get_node_id_for_address(str(event.get("to_address", "") or ""))
+        if not assigned_node_id or assigned_node_id in {"__master__", self._ctx.node_id}:
+            return
+
+        peer_public_key = self._resolve_peer_public_key(assigned_node_id)
+        if not peer_public_key:
+            self._log_warning(
+                "BCW deposit credit skipped: could not resolve public key for node_id=%s",
+                assigned_node_id[:16],
+            )
+            return
+
+        rate = get_conversion_rate({"economy": self._economy_config()})
+        credits = token_to_credits(float(event.get("amount", 0.0)), rate)
+        self._credit_ledger(peer_public_key, credits)
+
+    def _economy_config(self) -> dict[str, Any]:
+        # Fix #4: prefer global economy config from PluginContext over plugin-scoped config
+        ctx_economy = getattr(self._ctx, "economy_config", None)
+        if isinstance(ctx_economy, dict) and ctx_economy:
+            return ctx_economy
+        economy_cfg = self._config.get("economy", {})
+        return economy_cfg if isinstance(economy_cfg, dict) else {}
+
+    def _resolve_peer_public_key(self, node_id: str) -> Optional[str]:
+        # TODO: v1.01 — route through Storage API (requires exposing storage on PluginContext)
+        if not self._ctx.storage_path:
+            return None
+        try:
+            conn = sqlite3.connect(self._ctx.storage_path, timeout=5)
+            conn.execute("PRAGMA busy_timeout=5000")
+            rows = conn.execute("SELECT peer_public_key FROM ledger").fetchall()
+            conn.close()
+        except Exception as exc:
+            self._log_warning("BCW ledger scan failed: %s", exc)
+            return None
+
+        for row in rows:
+            peer_public_key = row[0]
+            try:
+                if hashlib.sha256(bytes.fromhex(peer_public_key)).hexdigest() == node_id:
+                    return peer_public_key
+            except Exception:
+                continue
+        return None
+
+    def _credit_ledger(self, peer_public_key: str, amount: float) -> None:
+        # TODO: v1.01 — route through Storage API (requires exposing storage on PluginContext)
+        if not self._ctx.storage_path:
+            return
+        now = time.time()
+        try:
+            conn = sqlite3.connect(self._ctx.storage_path, timeout=5)
+            conn.execute("PRAGMA busy_timeout=5000")
+            cur = conn.execute(
+                """
+                UPDATE ledger
+                SET balance = balance + ?, last_updated = ?
+                WHERE peer_public_key = ?
+                """,
+                (amount, now, peer_public_key),
+            )
+            if cur.rowcount == 0:
+                conn.execute(
+                    """
+                    INSERT INTO ledger
+                    (peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated)
+                    VALUES (?, ?, 0, 0, ?, ?)
+                    """,
+                    (peer_public_key, amount, now, now),
+                )
+            conn.commit()
+            conn.close()
+        except Exception as exc:
+            self._log_warning("BCW ledger credit failed for %s: %s", peer_public_key[:16], exc)
+
+    async def _check_sol_balance(self) -> None:
+        now = time.time()
+        if now - self._last_balance_check < self._balance_check_interval:
+            return
+        self._last_balance_check = now
+
+        try:
+            threshold = float(self._config.get("sol_min_balance", 0.01) or 0.01)
+        except (TypeError, ValueError):
+            threshold = 0.01
+
+        for chain_id, watcher in self._solana_modules.items():
+            address = self._store.get_address("__master__", chain_id)
+            if not address:
+                continue
+            try:
+                resp = await watcher._call_rpc(
+                    "getBalance",
+                    [address, {"commitment": watcher.commitment}],
+                )
+                lamports = int(((resp.get("result") or {}) if isinstance(resp, dict) else {}).get("value", 0) or 0)
+            except Exception as exc:
+                self._log_warning("BCW balance refresh failed for %s: %s", chain_id, exc)
+                continue
+
+            balance = lamports / _LAMPORTS_PER_SOL
+            if balance < threshold:
+                self._emit_event(
+                    "wallet.sol_low",
+                    chain_id=chain_id,
+                    address=address,
+                    balance=balance,
+                    threshold=threshold,
+                )
+                self._log_warning(
+                    "SOL balance below threshold chain=%s balance=%.9f threshold=%.9f",
+                    chain_id,
+                    balance,
+                    threshold,
+                )
+
     def _classify_transfer(self, transfer: TransferEvent) -> str:
         self_addresses = self._self_owned_addresses or self._store.all_addresses()
         from_self = transfer.from_address in self_addresses
@@ -559,8 +743,12 @@ class BCWPlugin(PluginHooks):
 
 
 def _chain_topic(chain_id: str) -> str:
-    if chain_id.startswith("solana-"):
+    if chain_id == "solana-mainnet":
         return "solana"
+    if chain_id == "solana-devnet":
+        return "solana_devnet"
+    if chain_id == "solana-testnet":
+        return "solana_testnet"
     return chain_id.replace("-", "_")
 
 
