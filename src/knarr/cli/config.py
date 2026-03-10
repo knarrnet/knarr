@@ -146,6 +146,7 @@ _KNOWN_KEYS = {
     "policy": {"initial_credit", "min_balance", "tit_for_tat", "group", "skill"},
     "mail": {"accept_from", "default_ttl_hours", "max_messages", "whitelist", "price", "debug", "stale_inbox_hours", "max_inbox", "pull_interval", "max_pull_batch", "accept_groups"},
     "cockpit": {"port", "bind", "auth_token", "tls", "tls_cert", "tls_key", "allowed_ips"},
+    "warehouse_manager": {"enabled", "debug", "rules"},
     "token": {"mint", "rpc_url"},
     "static": {"enabled", "max_deployments", "max_extracted_size"},
     # peer_overrides is a free-form section (node_id -> "host:port"), not validated per-key

@@ -22,6 +22,7 @@ from typing import Callable, Optional, Tuple
 
 from nacl.signing import SigningKey, VerifyKey
 
+from .conversion import credits_to_token, get_conversion_rate
 from .documents import Document, settlement_prepared, settlement_accepted, settlement_processed
 from .receipt_writer import write_receipt
 from ..core.proof import sign_document, verify_document
@@ -181,6 +182,7 @@ async def execute_settlement(
     storage,
     send_mail_fn: Callable,
     bus=None,
+    config: Optional[dict] = None,
 ) -> str:
     """Validate dual signatures, write accepted receipt, send settle_request mail.
 
@@ -218,7 +220,10 @@ async def execute_settlement(
 
     # Extract fields from the document for the accepted receipt
     doc_body = {k: v for k, v in countersigned_doc.items() if k != "proof"}
-    amount = doc_body.get("amount", 0.0)
+    amount = float(doc_body.get("amount", 0.0) or 0.0)
+    if amount <= 0:
+        raise ValueError(f"Settlement amount must be positive, got {amount}")
+    token_amount = credits_to_token(amount, get_conversion_rate(config or {}))
     prepared_receipt_id = doc_body.get("receipt_id", "")
 
     # Determine authority info from countersigned proof
@@ -279,7 +284,7 @@ async def execute_settlement(
         "prepared_proof": prepared_doc.get("proof"),
         "authority_proof": countersigned_doc.get("proof"),
         "peer_key": peer_key,
-        "amount": amount,
+        "amount": token_amount,
         "accepted_receipt_id": receipt_id,
         "schema_version": "1.0",
         "timestamp": time.time(),
@@ -300,7 +305,7 @@ async def execute_settlement(
 
     logger.info(
         f"SETTLEMENT_EXECUTED receipt={receipt_id[:16]} "
-        f"peer={peer_key[:16]} amount={amount:.2f}"
+        f"peer={peer_key[:16]} amount={token_amount:.2f}"
     )
 
     return receipt_id

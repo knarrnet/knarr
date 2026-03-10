@@ -107,6 +107,7 @@ class PluginContext:
     bus: Optional[Any] = None                     # v0.33.0: EventBus reference
     sign_document: Optional[Callable] = None      # v0.35.0: sign dict per eddsa-jcs-2022
     query_receipts: Optional[Callable] = None     # v0.35.0: query receipt_log with filters
+    economy_config: Optional[dict] = None         # v0.42.0: global [economy] config section
 
 
 class PluginLoader:
