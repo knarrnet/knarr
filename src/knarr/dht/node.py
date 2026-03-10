@@ -279,6 +279,7 @@ class DHTNode:
 
             identity_fragments = [
                 self.node_info.node_id,
+                self._public_key_hex,
                 f"did:knarr:{self.node_info.node_id}",
                 f"did:knarr:{self.node_info.node_id}#key-1",
                 f"did:knarr:{self.node_info.node_id}#cockpit-1",
