@@ -411,7 +411,7 @@ class CockpitServer:
                 pass
 
             # IP whitelist check (before auth)
-            allowed_ips = self._node._config.get("cockpit", {}).get("allowed_ips", [])
+            allowed_ips = (getattr(self._node, '_config', None) or {}).get("cockpit", {}).get("allowed_ips", [])
             if allowed_ips and not _check_ip_whitelist(client_ip, allowed_ips):
                 self._respond_error(writer, 403, "Forbidden")
                 return
@@ -469,7 +469,7 @@ class CockpitServer:
 
                         # Serve cached file
                         from pathlib import Path
-                        cache_file = Path(self._node._config.get("_config_dir", ".")) / "cache" / realm / f"{meta_query}.json"
+                        cache_file = Path((getattr(self._node, '_config', None) or {}).get("_config_dir", ".")) / "cache" / realm / f"{meta_query}.json"
                         if not cache_file.exists():
                             self._respond_error(writer, 404, f"No cached data for {realm}/{meta_query}")
                             return
@@ -1241,8 +1241,8 @@ class CockpitServer:
             ]
             
             # v0.28.0 also includes legacy config for visibility in the UI
-            legacy_groups = self._node._config.get("pricing", {}).get("groups", {})
-            legacy_discounts = self._node._config.get("pricing", {}).get("discounts", {})
+            legacy_groups = (getattr(self._node, '_config', None) or {}).get("pricing", {}).get("groups", {})
+            legacy_discounts = (getattr(self._node, '_config', None) or {}).get("pricing", {}).get("discounts", {})
             
             self._respond_json(writer, {
                 "discounts": discounts,
@@ -1251,7 +1251,7 @@ class CockpitServer:
                     "groups": legacy_groups,
                     "discounts": legacy_discounts
                 },
-                "discount_mode": self._node._config.get("pricing", {}).get("discount_mode", "multiplicative")
+                "discount_mode": (getattr(self._node, '_config', None) or {}).get("pricing", {}).get("discount_mode", "multiplicative")
             })
         except Exception as e:
             logger.error(f"Failed to list discounts: {e}")
@@ -1456,7 +1456,7 @@ class CockpitServer:
                 raise RuntimeError("missing node signing key for refund")
 
             # Fix #5: convert token amount to credits for refund
-            rate = get_conversion_rate(self._node._config)
+            rate = get_conversion_rate(getattr(self._node, '_config', None) or {})
             refund_credits = token_to_credits(float(x402_payment["charged_amount"]), rate)
 
             refund_doc = credit_note(
@@ -2604,7 +2604,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
                 storage=self._node.storage,
                 send_mail_fn=self._node._sync.enqueue,
                 bus=getattr(self._node, "bus", None),
-                config=self._node._config,
+                config=getattr(self._node, '_config', None) or {},
             )
         except ValueError as exc:
             self._respond_error(writer, 400, str(exc))
