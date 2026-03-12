@@ -3383,7 +3383,12 @@ class DHTNode:
         # Check admission result
         if result.gate.outcome == "hard_block":
             # Write admission decision receipt
-            self._write_receipt(result.receipt, counterparty=peer_nid, sign=True)
+            self._write_receipt(
+                document_type=result.receipt.document_type,
+                payload=result.receipt.payload,
+                counterparty=peer_nid,
+                sign=True,
+            )
             # v0.33.0: credit.sanctioned — hard limit block
             if self.bus:
                 self.bus.emit("credit.sanctioned", counterparty=msg.public_key, limit_type="hard", identity=msg.public_key)
