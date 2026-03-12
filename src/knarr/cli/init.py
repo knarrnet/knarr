@@ -22,12 +22,12 @@ port = 8090
 # rpc_url = ""               # Custom Solana RPC (default: mainnet-beta public)
 
 # URI taxonomy categories (convention, not enforced):
-#   compute/   — GPU-heavy: LLM, image, audio, embed, vision
-#   knowledge/ — maintained info: legal, medical, financial
-#   tools/     — utilities: web, document, communication, dev
-#   workflow/  — orchestration: pipeline, council, routing
-#   gateway/   — external bridges: email, telegram, webhook
-#   meta/      — skills about skills: classify, validate, monitor
+#   compute/   -GPU-heavy: LLM, image, audio, embed, vision
+#   knowledge/ -maintained info: legal, medical, financial
+#   tools/     -utilities: web, document, communication, dev
+#   workflow/  -orchestration: pipeline, council, routing
+#   gateway/   -external bridges: email, telegram, webhook
+#   meta/      -skills about skills: classify, validate, monitor
 
 [skills.echo]
 uri = "knarr:///tools/dev/echo@1.0"

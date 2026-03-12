@@ -263,6 +263,27 @@ def validate_netting_acceptance(body: dict) -> tuple[bool, str | None]:
     return True, None
 
 
+def validate_signed_credit_note(body: dict) -> tuple[bool, str | None]:
+    """Validate a signed credit note produced by receipts.create_credit_note.
+
+    This validates the raw signed document format (type: "credit_note"),
+    distinct from validate_credit_note which validates the mail message format.
+    """
+    if body.get("type") != "credit_note":
+        return False, "wrong type"
+    ok, err = _require_fields(body, ["amount", "issuer", "recipient", "reference", "signature", "version"])
+    if not ok:
+        return ok, err
+    if not _is_finite(body["amount"]) or body["amount"] < 0:
+        return False, f"amount must be >= 0 and finite, got {body['amount']}"
+    note_type = body.get("note_type")
+    if note_type not in ("debit", "credit", "zero"):
+        return False, f"invalid note_type: {note_type!r}"
+    if not isinstance(body["signature"], str) or not body["signature"].strip():
+        return False, "signature must be a non-empty string"
+    return True, None
+
+
 def validate_netting_executed(body: dict) -> tuple[bool, str | None]:
     ok, err = _require_fields(
         body,

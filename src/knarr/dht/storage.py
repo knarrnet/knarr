@@ -193,6 +193,8 @@ class Storage:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_mail_creditnote_from ON mail_creditnote(from_node)")
         # session_id used as reference (job_id) for credit note lookup
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_mail_creditnote_ref ON mail_creditnote(session_id)")
+        # C5 security fix: deduplicate credit notes by reference to prevent replay attacks
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_creditnote_ref_unique ON mail_creditnote(session_id)")
 
         # Legacy compat: keep 'mail' table if it exists (pre-v0.29.1 nodes)
         # The migration renames it to mail_legacy. Fresh nodes never create it.
@@ -1103,7 +1105,8 @@ class Storage:
         """Gets or creates a ledger entry. New entries get initial_balance and initial_trust."""
         conn = self._get_conn()
         cursor = conn.execute(
-            "SELECT peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated, held_balance "
+            "SELECT peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated, held_balance, "
+            "prepaid, hard_limit "
             "FROM ledger WHERE peer_public_key = ?", (peer_public_key,)
         )
         row = cursor.fetchone()
@@ -1112,7 +1115,9 @@ class Storage:
                 peer_public_key=row[0], balance=row[1],
                 tasks_provided=row[2], tasks_consumed=row[3],
                 first_seen=row[4], last_updated=row[5],
-                held_balance=row[6] if row[6] is not None else 0.0
+                held_balance=row[6] if row[6] is not None else 0.0,
+                prepaid=row[7] if row[7] is not None else 0.0,
+                hard_limit=row[8] if row[8] is not None else -10.0,
             )
         # Create new entry
         now = time.time()
@@ -1152,7 +1157,9 @@ class Storage:
 
     def update_ledger_provider(self, peer_public_key: str, price: float):
         """Provider side: consumer spent credit. Decrement their balance, increment tasks_provided."""
-        # print(f"DEBUG: update_ledger_provider key={peer_public_key[:8]}... price={price}")
+        import math
+        if not math.isfinite(price):
+            raise ValueError(f"price must be finite, got {price!r}")
         conn = self._get_conn()
         now = time.time()
         cursor = conn.execute("""
@@ -1167,6 +1174,9 @@ class Storage:
 
     def update_ledger_consumer(self, peer_public_key: str, price: float):
         """Consumer side: provider earned credit. Increment their balance, increment tasks_consumed."""
+        import math
+        if not math.isfinite(price):
+            raise ValueError(f"price must be finite, got {price!r}")
         conn = self._get_conn()
         now = time.time()
         conn.execute("""
@@ -1827,7 +1837,7 @@ class Storage:
         message_id = str(_uuid.uuid4())
         ttl_expires = now + (30 * 86400)  # 30-day TTL for credit notes
         conn.execute("""
-            INSERT INTO mail_creditnote
+            INSERT OR IGNORE INTO mail_creditnote
                 (message_id, from_node, to_node, timestamp, body,
                  session_id, msg_type, reply_to, ttl_expires, status, created_at, system)
             VALUES (?, ?, ?, ?, ?, ?, 'knarr/commerce/credit_note', NULL, ?, 'unread', ?, 0)
@@ -2216,15 +2226,20 @@ class Storage:
         
         if not row:
             return None
-        
+
+        count, first_at, last_at, window_seconds = row
+        # Return None if window has expired
+        if window_seconds > 0 and (time.time() - first_at) > window_seconds:
+            return None
+
         return {
             "actor": actor,
             "skill": skill,
             "qualifier": qualifier,
-            "count": row[0],
-            "first_at": row[1],
-            "last_at": row[2],
-            "window_seconds": row[3]
+            "count": count,
+            "first_at": first_at,
+            "last_at": last_at,
+            "window_seconds": window_seconds,
         }
 
     def meter_reset(self, actor: str, skill: str, qualifier: str = ""):
@@ -2241,6 +2256,49 @@ class Storage:
             (actor, skill, qualifier)
         )
         conn.commit()
+
+    def update_prepaid(self, peer_public_key: str, amount: float) -> None:
+        """Set the prepaid balance for a peer (absolute, not delta)."""
+        import math
+        if not math.isfinite(amount) or amount < 0:
+            raise ValueError(f"prepaid amount must be finite and >= 0, got {amount!r}")
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE ledger SET prepaid = ? WHERE peer_public_key = ?",
+            (amount, peer_public_key)
+        )
+        conn.commit()
+
+    def run_v038_balance_migration(self, shift_amount: float) -> int:
+        """Subtract shift_amount from all ledger balances (one-time idempotent migration).
+
+        Returns number of rows updated, or 0 if already applied.
+        Uses a migration_flags table to ensure the shift only runs once.
+        """
+        conn = self._get_conn()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS migration_flags (
+                name TEXT PRIMARY KEY,
+                applied_at REAL NOT NULL
+            )
+        """)
+        conn.commit()
+        row = conn.execute(
+            "SELECT applied_at FROM migration_flags WHERE name = 'v038_balance_migration'"
+        ).fetchone()
+        if row is not None:
+            return 0
+        cursor = conn.execute(
+            "UPDATE ledger SET balance = balance - ?, last_updated = ?",
+            (shift_amount, time.time())
+        )
+        rows_updated = cursor.rowcount
+        conn.execute(
+            "INSERT INTO migration_flags (name, applied_at) VALUES ('v038_balance_migration', ?)",
+            (time.time(),)
+        )
+        conn.commit()
+        return rows_updated
 
     # ── Bounty hold methods (F2 - Held balance for quality gates) ─────────────────
 
@@ -2312,16 +2370,15 @@ class Storage:
         
         current_held = row[0]
         current_balance = row[1]
-        
-        if current_held < amount:
-            return False  # Insufficient held balance
-        
-        new_held = current_held - amount
-        new_balance = current_balance + amount
-        
+
+        # Clamp to available (floor at zero)
+        release_amount = min(amount, current_held)
+        new_held = current_held - release_amount
+        new_balance = current_balance + release_amount
+
         conn.execute("""
-            UPDATE ledger SET 
-                held_balance = ?, 
+            UPDATE ledger SET
+                held_balance = ?,
                 balance = ?,
                 last_updated = ?
             WHERE peer_public_key = ?
@@ -2353,14 +2410,13 @@ class Storage:
             return False  # Peer doesn't exist
         
         current_held = row[0]
-        
-        if current_held < amount:
-            return False  # Insufficient held balance
-        
-        new_held = current_held - amount
-        
+
+        # Clamp to available (floor at zero)
+        return_amount = min(amount, current_held)
+        new_held = current_held - return_amount
+
         conn.execute("""
-            UPDATE ledger SET 
+            UPDATE ledger SET
                 held_balance = ?,
                 last_updated = ?
             WHERE peer_public_key = ?

@@ -123,6 +123,14 @@ def make_commerce_handlers(node) -> dict:
             logger.warning(f"Invalid settle_request: {err}")
             return
 
+        # Dedup: reject if this accepted_receipt_id was already processed
+        accepted_receipt_id = body.get("accepted_receipt_id")
+        if accepted_receipt_id:
+            existing = node.storage.get_receipt(accepted_receipt_id)
+            if existing is not None:
+                logger.warning(f"SETTLE_REQUEST replay detected: receipt_id={accepted_receipt_id[:16]} already seen")
+                return
+
         await node._enqueue_write(
             node.storage.queue_settlement,
             "settle_request",
@@ -156,11 +164,76 @@ def make_commerce_handlers(node) -> dict:
                     f"tx={body['tx_hash'][:16]} amount={body['amount_settled']} "
                     f"token={body.get('token', 'KNARR')}")
 
+    # FIX-004/005/006: Netting session store — tracks active proposals by netting_id.
+    # Keyed by netting_id; value is from_node and proposal details.
+    _netting_sessions: dict = {}
+
+    async def handle_netting_proposal(item: dict) -> None:
+        """Process knarr/commerce/netting_proposal mail.
+
+        Validates chain_id against node config.  Rejects proposals for unknown
+        or mismatched chains.  Stores session for later acceptance verification.
+        """
+        body = _parse_body(item)
+        if body is None:
+            return
+
+        our_chain = node._config.get("blockchain", {}).get("chain", "")
+        proposal_chain_id = body.get("chain_id", "")
+        if not proposal_chain_id or proposal_chain_id != our_chain:
+            logger.warning(
+                f"NETTING_PROPOSAL rejected: chain_id mismatch: "
+                f"got={proposal_chain_id!r} want={our_chain!r}"
+            )
+            return
+
+        netting_id = body.get("netting_id")
+        if not netting_id:
+            logger.warning("NETTING_PROPOSAL rejected: missing netting_id")
+            return
+
+        _netting_sessions[netting_id] = {
+            "from_node": item.get("from_node"),
+            "chain_id": proposal_chain_id,
+            "settlement_amount": body.get("settlement_amount"),
+        }
+        logger.info(f"NETTING_PROPOSAL netting_id={netting_id[:16]} chain={proposal_chain_id}")
+
+    async def handle_netting_acceptance(item: dict) -> None:
+        """Process knarr/commerce/netting_acceptance mail.
+
+        Verifies that a matching netting_proposal session exists.  Rejects
+        acceptances that arrive without a prior proposal (replay / forgery guard).
+        """
+        body = _parse_body(item)
+        if body is None:
+            return
+
+        netting_id = body.get("netting_id")
+        if not netting_id:
+            logger.warning("NETTING_ACCEPTANCE rejected: missing netting_id")
+            return
+
+        if netting_id not in _netting_sessions:
+            logger.warning(
+                f"NETTING_ACCEPTANCE rejected: no active session for "
+                f"netting_id={netting_id[:16]} (replay or forgery)"
+            )
+            return
+
+        session = _netting_sessions.pop(netting_id)
+        logger.info(
+            f"NETTING_ACCEPTANCE accepted netting_id={netting_id[:16]} "
+            f"from={item.get('from_node', '?')[:16]}"
+        )
+
     return {
         "knarr/commerce/receipt": handle_receipt,
         "knarr/commerce/credit_note": handle_credit_note,
         "knarr/commerce/settle_request": handle_settle_request,
         "knarr/commerce/settlement_confirmation": handle_settlement_confirmation,
+        "knarr/commerce/netting_proposal": handle_netting_proposal,
+        "knarr/commerce/netting_acceptance": handle_netting_acceptance,
     }
 
 

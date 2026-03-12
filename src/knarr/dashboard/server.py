@@ -561,6 +561,13 @@ class CockpitServer:
                     elif path.startswith("/api/assets/"):
                         asset_hash = path[len("/api/assets/"):]
                         await self._handle_asset_download(writer, asset_hash, query)
+                    elif path.startswith("/api/skills/") and path.endswith("/schema"):
+                        skill_name = path[len("/api/skills/"):-len("/schema")]
+                        schema = self._node.get_skill_schema(skill_name)
+                        if schema is None:
+                            self._respond_404(writer)
+                        else:
+                            self._respond_json(writer, schema)
                     elif path.startswith("/api/receipts/"):
                         # v0.32.0: GET /api/receipts/{reference} — fetch credit note by job_id
                         reference = path[len("/api/receipts/"):]

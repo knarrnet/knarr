@@ -1003,7 +1003,7 @@ class DHTNode:
         """
         from .mcp_bridge import MCPTimeoutError
         import inspect
-        from ..static.handler import TaskContext
+        from .sidecar import TaskContext
 
         start_time = time.time()
         input_size = len(json.dumps(msg.input_data)) if msg.input_data else 0
@@ -1033,6 +1033,15 @@ class DHTNode:
 
             # Prepare input data (same as _execute_queued_task)
             input_data = dict(msg.input_data)
+            # Auto-resolve knarr-asset:// URIs (parity with _execute_queued_task)
+            if self._asset_dir:
+                for _k, _v in list(input_data.items()):
+                    if isinstance(_v, str) and _v.startswith("knarr-asset://"):
+                        _hash = _v[len("knarr-asset://"):]
+                        if len(_hash) == 64 and all(c in '0123456789abcdef' for c in _hash):
+                            _path = os.path.join(self._asset_dir, _hash)
+                            if os.path.exists(_path):
+                                input_data[_k] = _path
             input_data["_job_id"] = job_id
             input_data["_caller_node_id"] = caller_node_id
             input_data["_node_encrypt"] = self.encrypt_for_peer
@@ -1144,7 +1153,7 @@ class DHTNode:
             )
 
             # Return success result
-            return self._sign(TaskResult(task_id=job_id, status="completed", result=result_data))
+            return self._sign(TaskResult(task_id=job_id, status="completed", output_data=result_data))
 
         except asyncio.TimeoutError:
             err = {"code": "TIMEOUT", "message": f"Handler exceeded {handler_timeout}s timeout"}
@@ -3417,6 +3426,19 @@ class DHTNode:
             active = self._skill_active.get(skill_name, 0)
             max_concurrent = self._get_skill_max_concurrent(skill_name)
             if active < max_concurrent:
+                # Insert task record so telemetry (get_skill_task_stats, get_recent_tasks) works
+                _fp_task = Task(
+                    task_id=job_id,
+                    skill_name=skill_name,
+                    requester_node_id=msg.requester_node_id,
+                    provider_node_id=self.node_info.node_id,
+                    status="accepted",
+                    input_data=msg.input_data,
+                    created_at=time.time(),
+                    updated_at=time.time(),
+                    timeout_ms=msg.timeout_ms
+                )
+                await self._enqueue_write(self.storage.insert_task, _fp_task, self._public_key_hex)
                 self._skill_active[skill_name] = active + 1
                 try:
                     result_msg = await self._execute_local_fast_path(
