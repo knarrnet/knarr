@@ -99,6 +99,16 @@ class CockpitServer:
         self._exposures = self._build_exposure_index(exposures or {})
         self._rate_limits: Dict[str, Dict[str, list]] = {}  # path -> {ip: [timestamps]}
         self._token_counters: Dict[str, Dict[str, dict]] = {}  # path -> {token: {count, day}}
+        # v0.38.0 A3.2: Wallet HMAC auth + spending caps
+        self._wallet_daily_spent: float = 0.0
+        self._wallet_daily_reset: float = time.time()
+        # FIX-002: HMAC replay guard — track seen signatures within timestamp window
+        self._seen_wallet_sigs: dict = {}  # {sig_hex: expiry_time}
+        self._sig_sweep_interval: float = 60.0
+        self._last_sig_sweep: float = time.time()
+        # FIX-003: Spend cap lock to prevent TOCTOU race
+        import asyncio as _asyncio
+        self._wallet_send_lock = _asyncio.Lock()
         self._routing_policy = self._load_routing_policy()
         self._log_handler = RingBufferHandler(maxlen=1000)
         logging.getLogger().addHandler(self._log_handler)
@@ -255,7 +265,11 @@ class CockpitServer:
                 score *= local_weight
             scored.append((score, 0 if normalized.get("_local") else 1, index, normalized))
         scored.sort(key=lambda entry: (-entry[0], entry[1], entry[2]))
-        return scored[0][3]
+        # Pick randomly among all equal-scored top-tier candidates to distribute load.
+        top_score, top_local = scored[0][0], scored[0][1]
+        top_tier = [c for c in scored if c[0] == top_score and c[1] == top_local]
+        import random
+        return random.choice(top_tier)[3]
 
     _MAX_RATE_LIMIT_IPS = 4096  # per path
 
@@ -401,7 +415,7 @@ class CockpitServer:
                 pass
 
             # IP whitelist check (before auth)
-            allowed_ips = self._node._config.get("cockpit", {}).get("allowed_ips", [])
+            allowed_ips = (getattr(self._node, '_config', None) or {}).get("cockpit", {}).get("allowed_ips", [])
             if allowed_ips and not _check_ip_whitelist(client_ip, allowed_ips):
                 self._respond_error(writer, 403, "Forbidden")
                 return
@@ -459,7 +473,7 @@ class CockpitServer:
 
                         # Serve cached file
                         from pathlib import Path
-                        cache_file = Path(self._node._config.get("_config_dir", ".")) / "cache" / realm / f"{meta_query}.json"
+                        cache_file = Path((getattr(self._node, '_config', None) or {}).get("_config_dir", ".")) / "cache" / realm / f"{meta_query}.json"
                         if not cache_file.exists():
                             self._respond_error(writer, 404, f"No cached data for {realm}/{meta_query}")
                             return
@@ -551,6 +565,13 @@ class CockpitServer:
                     elif path.startswith("/api/assets/"):
                         asset_hash = path[len("/api/assets/"):]
                         await self._handle_asset_download(writer, asset_hash, query)
+                    elif path.startswith("/api/skills/") and path.endswith("/schema"):
+                        skill_name = path[len("/api/skills/"):-len("/schema")]
+                        schema = self._node.get_skill_schema(skill_name)
+                        if schema is None:
+                            self._respond_404(writer)
+                        else:
+                            self._respond_json(writer, schema)
                     elif path.startswith("/api/receipts/"):
                         # v0.32.0: GET /api/receipts/{reference} — fetch credit note by job_id
                         reference = path[len("/api/receipts/"):]
@@ -1231,8 +1252,8 @@ class CockpitServer:
             ]
             
             # v0.28.0 also includes legacy config for visibility in the UI
-            legacy_groups = self._node._config.get("pricing", {}).get("groups", {})
-            legacy_discounts = self._node._config.get("pricing", {}).get("discounts", {})
+            legacy_groups = (getattr(self._node, '_config', None) or {}).get("pricing", {}).get("groups", {})
+            legacy_discounts = (getattr(self._node, '_config', None) or {}).get("pricing", {}).get("discounts", {})
             
             self._respond_json(writer, {
                 "discounts": discounts,
@@ -1241,7 +1262,7 @@ class CockpitServer:
                     "groups": legacy_groups,
                     "discounts": legacy_discounts
                 },
-                "discount_mode": self._node._config.get("pricing", {}).get("discount_mode", "multiplicative")
+                "discount_mode": (getattr(self._node, '_config', None) or {}).get("pricing", {}).get("discount_mode", "multiplicative")
             })
         except Exception as e:
             logger.error(f"Failed to list discounts: {e}")
@@ -1446,7 +1467,7 @@ class CockpitServer:
                 raise RuntimeError("missing node signing key for refund")
 
             # Fix #5: convert token amount to credits for refund
-            rate = get_conversion_rate(self._node._config)
+            rate = get_conversion_rate(getattr(self._node, '_config', None) or {})
             refund_credits = token_to_credits(float(x402_payment["charged_amount"]), rate)
 
             refund_doc = credit_note(
@@ -2193,6 +2214,113 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
                 _bus.emit("security.auth_failed", source_ip=(source_ip or "")[:20], endpoint=(endpoint or "")[:40])
         return result
 
+    def _check_wallet_auth(
+        self, method: str, path: str, body: bytes | str, headers: dict
+    ) -> bool:
+        """v0.38.0 A3.2: HMAC authentication for wallet write operations.
+
+        Verifies X-Wallet-Signature header using:
+            HMAC-SHA256(send_secret, timestamp + "\\n" + method + "\\n" + path + "\\n" + body)
+
+        Also verifies X-Wallet-Timestamp is within ±30 seconds.
+        """
+        import hashlib as _hashlib
+        wallet_cfg = (getattr(self._node, '_config', None) or {}).get("cockpit", {}).get("wallet", {})
+        send_secret = wallet_cfg.get("send_secret", "")
+        if not send_secret:
+            # No secret configured — reject all wallet write requests
+            logger.warning("WALLET_AUTH_FAIL: send_secret not configured")
+            return False
+
+        timestamp_window = int(wallet_cfg.get("timestamp_window_seconds", 30))
+
+        # Get and validate timestamp
+        ts_header = headers.get("x-wallet-timestamp", "")
+        if not ts_header:
+            logger.warning("WALLET_AUTH_FAIL: missing X-Wallet-Timestamp")
+            return False
+        try:
+            ts = int(ts_header)
+        except (ValueError, TypeError):
+            logger.warning(f"WALLET_AUTH_FAIL: unparseable timestamp {ts_header!r}")
+            return False
+
+        if abs(time.time() - ts) > timestamp_window:
+            logger.warning(
+                f"WALLET_AUTH_FAIL: timestamp {ts} outside window "
+                f"(now={int(time.time())} window={timestamp_window}s)"
+            )
+            return False
+
+        # Get signature from header
+        sig_header = headers.get("x-wallet-signature", "")
+        if not sig_header:
+            logger.warning("WALLET_AUTH_FAIL: missing X-Wallet-Signature")
+            return False
+
+        # Build body string for signing
+        if isinstance(body, bytes):
+            body_str = body.decode("utf-8", errors="replace")
+        else:
+            body_str = body or ""
+
+        # Compute expected HMAC
+        msg = f"{ts}\n{method}\n{path}\n{body_str}"
+        expected_sig = hmac.new(
+            send_secret.encode("utf-8"),
+            msg.encode("utf-8"),
+            _hashlib.sha256,
+        ).hexdigest()
+
+        # Constant-time compare
+        if not hmac.compare_digest(sig_header.encode(), expected_sig.encode()):
+            logger.warning("WALLET_AUTH_FAIL: signature mismatch")
+            return False
+
+        # FIX-002: Replay guard — reject duplicate (timestamp, signature) tuples
+        sig_key = f"{ts}:{sig_header}"
+        now_replay = time.time()
+        if sig_key in self._seen_wallet_sigs:
+            logger.warning("WALLET_AUTH_FAIL: replayed signature")
+            return False
+        # Record signature with expiry (window + margin)
+        self._seen_wallet_sigs[sig_key] = now_replay + timestamp_window + 5
+        # Periodic sweep of expired entries
+        if now_replay - self._last_sig_sweep > self._sig_sweep_interval:
+            self._seen_wallet_sigs = {
+                k: v for k, v in self._seen_wallet_sigs.items() if v > now_replay
+            }
+            self._last_sig_sweep = now_replay
+
+        return True
+
+    def _check_wallet_spend_cap(self, amount: float) -> tuple[bool, str]:
+        """v0.38.0 A3.3: Check per-tx and daily spending caps.
+
+        Returns (allowed, reason).
+        """
+        wallet_cfg = (getattr(self._node, '_config', None) or {}).get("cockpit", {}).get("wallet", {})
+        max_per_tx = float(wallet_cfg.get("max_per_tx", 100.0))
+        max_daily = float(wallet_cfg.get("max_daily", 1000.0))
+
+        # Per-tx cap
+        if amount > max_per_tx:
+            return False, f"amount {amount} exceeds per-tx cap {max_per_tx}"
+
+        # Daily rolling cap: reset if > 24h since last reset
+        now = time.time()
+        if now - self._wallet_daily_reset > 86400:
+            self._wallet_daily_spent = 0.0
+            self._wallet_daily_reset = now
+
+        if self._wallet_daily_spent + amount > max_daily:
+            return False, (
+                f"daily cap exceeded: spent={self._wallet_daily_spent:.2f} "
+                f"+ requested={amount:.2f} > max={max_daily:.2f}"
+            )
+
+        return True, ""
+
     def _serve_static(self, path: str) -> tuple[bytes, str]:
         """Returns (content_bytes, content_type). Raises FileNotFoundError."""
         if path == "/" or path == "" or path == "/index.html":
@@ -2487,7 +2615,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
                 storage=self._node.storage,
                 send_mail_fn=self._node._sync.enqueue,
                 bus=getattr(self._node, "bus", None),
-                config=self._node._config,
+                config=getattr(self._node, '_config', None) or {},
             )
         except ValueError as exc:
             self._respond_error(writer, 400, str(exc))
