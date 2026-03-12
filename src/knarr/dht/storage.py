@@ -275,7 +275,8 @@ class Storage:
                 expires_at REAL,
                 provider_node_id TEXT,
                 provider_host TEXT,
-                provider_port INTEGER
+                provider_port INTEGER,
+                provider_public_key TEXT
             )
         """)
 
@@ -580,11 +581,16 @@ class Storage:
             WHERE s.is_own = 1
         """)
         for row in own_cursor.fetchall():
+            try:
+                skill_sheet = json.loads(row[1])
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("query_all_active_skills: malformed skill_record_json for own skill %s — skipping", row[0])
+                continue
             results.append({
                 "node_id": row[0],
                 "host": row[5] or "127.0.0.1",
                 "port": row[6] or 0,
-                "skill_sheet": json.loads(row[1]),
+                "skill_sheet": skill_sheet,
                 "_last_seen": now,
                 "_announced_at": row[2],
                 "_load": 0,
@@ -815,7 +821,8 @@ class Storage:
             SELECT job_id, skill_name, consumer_node_id, input_hash,
                    status, queue_position, result_json, error_json,
                    created_at, updated_at, expires_at,
-                   provider_node_id, provider_host, provider_port
+                   provider_node_id, provider_host, provider_port,
+                   provider_public_key
             FROM async_jobs WHERE job_id = ?
         """, (job_id,))
         r = cursor.fetchone()
@@ -826,7 +833,8 @@ class Storage:
             "result": json.loads(r[6]) if r[6] else None,
             "error": json.loads(r[7]) if r[7] else None,
             "created_at": r[8], "updated_at": r[9], "expires_at": r[10],
-            "provider_node_id": r[11], "provider_host": r[12], "provider_port": r[13]
+            "provider_node_id": r[11], "provider_host": r[12], "provider_port": r[13],
+            "provider_public_key": r[14] or ""
         }
 
     def get_async_job_by_hash(self, input_hash: str) -> Optional[Dict[str, Any]]:
@@ -1117,11 +1125,24 @@ class Storage:
                     SELECT peer_public_key FROM ledger ORDER BY last_updated ASC LIMIT 1
                 )
             """)
-        conn.execute(
-            "INSERT INTO ledger (peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated, trust, held_balance) "
-            "VALUES (?, ?, 0, 0, ?, ?, ?, ?)",
-            (peer_public_key, initial_balance, now, now, initial_trust, 0.0)
-        )
+        # A1.2: New entries always start at balance=0.0 (security rule — prevents
+        # callers from inflating peer balances at creation time via initial_balance).
+        # soft_limit and hard_limit use the intended migration defaults (-5.0/-10.0)
+        # rather than the column DEFAULT (0.0 from v0.31.0, a migration artefact).
+        try:
+            conn.execute(
+                "INSERT INTO ledger (peer_public_key, balance, tasks_provided, tasks_consumed, "
+                "first_seen, last_updated, trust, held_balance, soft_limit, hard_limit) "
+                "VALUES (?, 0.0, 0, 0, ?, ?, ?, ?, -5.0, -10.0)",
+                (peer_public_key, now, now, initial_trust, 0.0)
+            )
+        except Exception:
+            # soft_limit/hard_limit columns may not exist on pre-migration DBs
+            conn.execute(
+                "INSERT INTO ledger (peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated, trust, held_balance) "
+                "VALUES (?, 0.0, 0, 0, ?, ?, ?, ?)",
+                (peer_public_key, now, now, initial_trust, 0.0)
+            )
         conn.commit()
         return LedgerEntry(
             peer_public_key=peer_public_key, balance=initial_balance,
@@ -1194,16 +1215,43 @@ class Storage:
                 ext = ext_map.get(entry["peer_public_key"], {})
                 entry["prepaid"] = ext.get("prepaid", 0.0)
                 entry["pub_tab"] = ext.get("pub_tab", 0.0)
-                entry["soft_limit"] = ext.get("soft_limit", 0.0)
-                entry["hard_limit"] = ext.get("hard_limit", 0.0)
+                entry["soft_limit"] = ext.get("soft_limit") if ext.get("soft_limit") is not None else -5.0  # noqa: E501
+                entry["hard_limit"] = ext.get("hard_limit") if ext.get("hard_limit") is not None else -10.0  # noqa: E501
         except Exception:
             # Columns don't exist yet (pre-migration) — return defaults
             for entry in results:
                 entry["prepaid"] = 0.0
                 entry["pub_tab"] = 0.0
-                entry["soft_limit"] = 0.0
-                entry["hard_limit"] = 0.0
+                entry["soft_limit"] = -5.0
+                entry["hard_limit"] = -10.0
         return results
+
+    def check_sanctions(self, peer_public_key: str) -> str:
+        """v0.31.0 E2: Check peer credit position against sanctions thresholds.
+
+        Returns 'ok', 'soft_warning', or 'hard_block'.
+        Unknown peers return 'ok' (admission gate handles first-contact policy).
+        """
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT balance, soft_limit, hard_limit FROM ledger WHERE peer_public_key = ?",
+                (peer_public_key,)
+            ).fetchone()
+        except Exception:
+            # GPT V-10: fail-closed on DB error — do not silently grant access
+            logger.warning("check_sanctions DB error for %s — failing closed", peer_public_key[:16])
+            return "hard_block"
+        if not row:
+            return "ok"
+        balance = row[0] or 0.0
+        soft_limit = row[1] if row[1] is not None else -5.0
+        hard_limit = row[2] if row[2] is not None else -10.0
+        if balance < hard_limit:
+            return "hard_block"
+        if balance < soft_limit:
+            return "soft_warning"
+        return "ok"
 
     def poll_task_results(self, limit: int = 20, status: str = "unread") -> list:
         """E4: Query mail_jobreport + mail_system, merged and sorted by timestamp."""

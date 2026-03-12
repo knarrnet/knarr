@@ -26,6 +26,8 @@ def _run_async(coro):
 
 def _make_mock_node(provider_pk, job_id, provider_pubkey=None, credits_charged=2.5):
     """Build a mock node for E1 tests. provider_pubkey defaults to provider_pk."""
+    from knarr.dht.mail_handlers import MailHandlers
+
     mock_node = MagicMock()
     mock_node.storage = MagicMock()
     mock_node.storage.get_async_job.return_value = {
@@ -34,6 +36,7 @@ def _make_mock_node(provider_pk, job_id, provider_pubkey=None, credits_charged=2
         "provider_public_key": provider_pubkey or provider_pk,
         "status": "pending",
     }
+    mock_node.storage.get_ledger_balance.return_value = 0.0
     mock_node.policy = Policy(initial_credit=3.0, min_balance=-10.0)
     mock_node._plugins = None
     mock_node._ledger_update_callback = None
@@ -47,6 +50,16 @@ def _make_mock_node(provider_pk, job_id, provider_pubkey=None, credits_charged=2
             return MagicMock(balance=0.0)
     mock_node._enqueue_write = AsyncMock(side_effect=mock_enqueue)
     mock_node._enqueue_write_calls = calls
+
+    # Wire real MailHandlers so mail handling logic actually runs
+    mh = MailHandlers(mock_node.storage, None, None, None)
+    mh.bind_runtime(
+        enqueue_write=mock_node._enqueue_write,
+        get_initial_trust=lambda nid: 0.3,
+        initial_credit=3.0,
+    )
+    mock_node._mail_handlers = mh
+
     return mock_node
 
 
