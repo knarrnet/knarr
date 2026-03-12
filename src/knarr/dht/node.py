@@ -4949,6 +4949,7 @@ class DHTNode:
             "amount_settled": abs(float(amount)),
             "timestamp": time.time(),
             "peer_key": peer_key,
+            "recipient": peer_key,   # Gate 2 (_check_addressing) scans "recipient", not "peer_key"
             "accepted_receipt_id": accepted_receipt_id,
             "settle_request_ref": settle_request_ref,
         }
