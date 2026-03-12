@@ -265,7 +265,11 @@ class CockpitServer:
                 score *= local_weight
             scored.append((score, 0 if normalized.get("_local") else 1, index, normalized))
         scored.sort(key=lambda entry: (-entry[0], entry[1], entry[2]))
-        return scored[0][3]
+        # Pick randomly among all equal-scored top-tier candidates to distribute load.
+        top_score, top_local = scored[0][0], scored[0][1]
+        top_tier = [c for c in scored if c[0] == top_score and c[1] == top_local]
+        import random
+        return random.choice(top_tier)[3]
 
     _MAX_RATE_LIMIT_IPS = 4096  # per path
 
