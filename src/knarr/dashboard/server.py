@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import time
+import tomllib
 import urllib.parse
 from typing import Dict, Any, Optional
 import ipaddress
@@ -98,6 +99,7 @@ class CockpitServer:
         self._exposures = self._build_exposure_index(exposures or {})
         self._rate_limits: Dict[str, Dict[str, list]] = {}  # path -> {ip: [timestamps]}
         self._token_counters: Dict[str, Dict[str, dict]] = {}  # path -> {token: {count, day}}
+        self._routing_policy = self._load_routing_policy()
         self._log_handler = RingBufferHandler(maxlen=1000)
         logging.getLogger().addHandler(self._log_handler)
 
@@ -186,6 +188,74 @@ class CockpitServer:
                 "payment_amount": cfg.get("payment_amount", ""),
             }
         return index
+
+    def _load_routing_policy(self) -> Dict[str, Any]:
+        """Load routing.toml from the cockpit config dir with safe defaults."""
+        policy: Dict[str, Any] = {"defaults": {"local_weight": 1.0}}
+        routing_path = os.path.join(self._config_dir, "routing.toml")
+        if not os.path.exists(routing_path):
+            return policy
+        try:
+            with open(routing_path, "rb") as handle:
+                raw = tomllib.load(handle)
+        except tomllib.TOMLDecodeError as exc:
+            logger.warning("ROUTING_CONFIG_INVALID path=%s error=%s", routing_path, exc)
+            return policy
+        except Exception as exc:
+            logger.warning("ROUTING_CONFIG_LOAD_FAIL path=%s error=%s", routing_path, exc)
+            return policy
+
+        if isinstance(raw, dict):
+            policy.update(raw)
+        defaults = raw.get("defaults", {}) if isinstance(raw, dict) else {}
+        local_weight = defaults.get("local_weight", 1.0) if isinstance(defaults, dict) else 1.0
+        try:
+            local_weight = float(local_weight)
+        except (TypeError, ValueError):
+            logger.warning("ROUTING_LOCAL_WEIGHT_INVALID path=%s value=%r", routing_path, local_weight)
+            local_weight = 1.0
+        clamped_weight = max(0.0, min(2.0, local_weight))
+        if clamped_weight != local_weight:
+            logger.warning(
+                "ROUTING_LOCAL_WEIGHT_CLAMPED path=%s value=%s clamped=%s",
+                routing_path, local_weight, clamped_weight,
+            )
+        policy["defaults"] = {"local_weight": clamped_weight}
+        return policy
+
+    def get_local_weight(self, skill_name=None) -> float:
+        """Return the configured local routing weight for /api/execute scoring."""
+        return float(self._routing_policy.get("defaults", {}).get("local_weight", 1.0))
+
+    def _select_execute_provider(self, skill: str) -> Optional[Dict[str, Any]]:
+        candidates = []
+        all_skills = self._node.get_skills()
+        for skill_info in all_skills.get("network", []):
+            if skill_info["name"].lower() == skill.lower():
+                candidates.extend(skill_info.get("providers", []))
+                break
+
+        if skill.lower() in getattr(self._node, "_handlers", {}):
+            candidates.append({
+                "node_id": self._node.node_info.node_id,
+                "host": "127.0.0.1",
+                "port": self._node.node_info.port,
+                "_local": True,
+            })
+
+        if not candidates:
+            return None
+
+        local_weight = self.get_local_weight(skill)
+        scored = []
+        for index, candidate in enumerate(candidates):
+            normalized = dict(candidate)
+            score = 1.0
+            if normalized.get("_local"):
+                score *= local_weight
+            scored.append((score, 0 if normalized.get("_local") else 1, index, normalized))
+        scored.sort(key=lambda entry: (-entry[0], entry[1], entry[2]))
+        return scored[0][3]
 
     _MAX_RATE_LIMIT_IPS = 4096  # per path
 
@@ -627,13 +697,16 @@ class CockpitServer:
             self._respond_error(writer, 400, "Missing skill or invalid input")
             return
 
-        # Local execution: if skill exists locally and no explicit provider
         provider = data.get("provider")
-        local = data.get("local", False)
-        
+        # A5: normalize string provider to dict with node_id key
+        if isinstance(provider, str):
+            logger.debug(f"API_EXECUTE_PROVIDER_NORMALIZED: string -> dict node_id={provider[:16]!r}")
+            provider = {"node_id": provider}
+        local = data.get("local", False) is True
+
         timeout_ms = data.get("timeout_ms") or (int(data.get("timeout", 30)) * 1000)
 
-        if local or (not provider and skill.lower() in self._node._handlers):
+        if local:
             try:
                 # Async local execute via programmatic loopback
                 result = await self._node.submit_async_task(
@@ -659,16 +732,38 @@ class CockpitServer:
                 self._respond_error(writer, 500, "Task submission failed")
             return
 
-        # Remote execution
+        # B2: scored candidate selection when no explicit provider
         if not provider:
-            all_skills = self._node.get_skills()
-            for s in all_skills["network"]:
-                if s["name"].lower() == skill.lower() and s["providers"]:
-                    provider = s["providers"][0]
-                    break
+            provider = self._select_execute_provider(skill)
 
         if not provider:
             self._respond_error(writer, 404, "No provider found for skill")
+            return
+
+        # B2: if scored selection picked local, execute locally
+        if provider.get("_local"):
+            try:
+                result = await self._node.submit_async_task(
+                    self._node.node_info.node_id, "127.0.0.1", self._node.node_info.port,
+                    skill, task_input, timeout_ms=timeout_ms
+                )
+                if result.status in ("accepted", "queued"):
+                    self._respond(writer, "202 Accepted", "application/json", json.dumps({
+                        "status": result.status,
+                        "job_id": result.task_id,
+                        "position": getattr(result, "position", 0)
+                    }).encode("utf-8"))
+                elif result.status == "completed":
+                    self._respond(writer, "200 OK", "application/json", json.dumps({
+                        "status": "completed",
+                        "job_id": result.task_id,
+                    }).encode("utf-8"))
+                else:
+                    reason = getattr(result, "reason", "") or result.status
+                    self._respond_error(writer, 409, f"Task rejected: {reason}")
+            except Exception as e:
+                logger.error(f"API local async execute failed: {e}")
+                self._respond_error(writer, 500, "Task submission failed")
             return
 
         # Resolve host/port from peer table when only node_id provided (V011-005)

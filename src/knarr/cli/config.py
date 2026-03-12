@@ -156,7 +156,10 @@ def _warn_unknown_keys(raw: dict, path: Path):
     """Warn about unrecognized keys in known sections to catch typos."""
     for section, known in _KNOWN_KEYS.items():
         if section in raw and isinstance(raw[section], dict):
-            for key in raw[section]:
+            for key, v in raw[section].items():
+                # A4: skip dict sub-tables (e.g. [skills.my-skill]) — not unknown keys
+                if isinstance(v, dict):
+                    continue
                 if key not in known:
                     print(f"Warning: Unknown key '{key}' in [{section}] in {path}", file=sys.stderr)
 
