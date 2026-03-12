@@ -48,6 +48,8 @@ def node():
 def _make_mock_node(provider_pk, job_id, has_receipt=True, credits_charged=2.5):
     """Build a MagicMock node with storage that has an async_job entry.
     Uses Dev D pattern: provider_public_key stored in job record."""
+    from knarr.dht.mail_handlers import MailHandlers
+
     mock_node = MagicMock()
     mock_node.storage = MagicMock()
     mock_node.storage.get_async_job.return_value = {
@@ -56,6 +58,7 @@ def _make_mock_node(provider_pk, job_id, has_receipt=True, credits_charged=2.5):
         "provider_public_key": provider_pk,  # E1: key source
         "status": "pending",
     }
+    mock_node.storage.get_ledger_balance.return_value = 0.0
     mock_node.policy = Policy(initial_credit=3.0, min_balance=-10.0)
     mock_node._plugins = None
     mock_node._ledger_update_callback = None
@@ -69,6 +72,15 @@ def _make_mock_node(provider_pk, job_id, has_receipt=True, credits_charged=2.5):
             return MagicMock(balance=0.0)
     mock_node._enqueue_write = AsyncMock(side_effect=mock_enqueue)
     mock_node._enqueue_write_calls = calls
+
+    # Wire real MailHandlers so E1 logic actually runs
+    mh = MailHandlers(mock_node.storage, None, None, None)
+    mh.bind_runtime(
+        enqueue_write=mock_node._enqueue_write,
+        get_initial_trust=lambda nid: 0.3,
+        initial_credit=3.0,
+    )
+    mock_node._mail_handlers = mh
 
     return mock_node
 
@@ -260,41 +272,32 @@ def test_e2_sanctions_ok_returns_ok(storage):
 
 def test_e2_sanctions_hard_block(storage):
     """Peer below hard_limit returns 'hard_block'."""
-    # Apply v0.31.0 migration columns
+    storage.get_or_create_ledger_entry("peer_bad")
+    # A1.2: new entries start at 0.0 — set balance directly for test setup
     conn = storage._get_conn()
-    for col, default in [("prepaid", "0.0"), ("pub_tab", "0.0"),
-                         ("soft_limit", "-5.0"), ("hard_limit", "-10.0"),
-                         ("credit_limit", "3.0"), ("sanctions", "0")]:
-        try:
-            conn.execute(f"ALTER TABLE ledger ADD COLUMN {col} REAL NOT NULL DEFAULT {default}")
-        except Exception:
-            pass
+    conn.execute("UPDATE ledger SET balance = -15.0 WHERE peer_public_key = 'peer_bad'")
     conn.commit()
-
-    storage.get_or_create_ledger_entry("peer_bad", initial_balance=-15.0)
     assert storage.check_sanctions("peer_bad") == "hard_block"
 
 
 def test_e2_sanctions_soft_warning(storage):
     """Peer below soft_limit but above hard_limit returns 'soft_warning'."""
+    storage.get_or_create_ledger_entry("peer_warn")
+    # A1.2: new entries start at 0.0 — set balance directly for test setup
     conn = storage._get_conn()
-    for col, default in [("prepaid", "0.0"), ("pub_tab", "0.0"),
-                         ("soft_limit", "-5.0"), ("hard_limit", "-10.0"),
-                         ("credit_limit", "3.0"), ("sanctions", "0")]:
-        try:
-            conn.execute(f"ALTER TABLE ledger ADD COLUMN {col} REAL NOT NULL DEFAULT {default}")
-        except Exception:
-            pass
+    conn.execute("UPDATE ledger SET balance = -7.0 WHERE peer_public_key = 'peer_warn'")
     conn.commit()
-
-    storage.get_or_create_ledger_entry("peer_warn", initial_balance=-7.0)
     assert storage.check_sanctions("peer_warn") == "soft_warning"
 
 
 def test_e2_free_skill_bypasses_credit_check(storage):
     """A free skill (price=0) should be accessible even with negative balance."""
     peer_pk = "aa" * 32
-    storage.get_or_create_ledger_entry(peer_pk, initial_balance=-100.0)
+    storage.get_or_create_ledger_entry(peer_pk)
+    # A1.2: new entries start at 0.0 — set balance directly for test setup
+    conn = storage._get_conn()
+    conn.execute(f"UPDATE ledger SET balance = -100.0 WHERE peer_public_key = ?", (peer_pk,))
+    conn.commit()
     entry = storage.get_or_create_ledger_entry(peer_pk)
     assert entry.balance == -100.0
 
@@ -309,7 +312,11 @@ def test_e2_free_skill_bypasses_credit_check(storage):
 def test_e2_paid_skill_still_blocked_by_credit(storage):
     """A paid skill should still be blocked when balance is below minimum."""
     peer_pk = "bb" * 32
-    storage.get_or_create_ledger_entry(peer_pk, initial_balance=-100.0)
+    storage.get_or_create_ledger_entry(peer_pk)
+    # A1.2: new entries start at 0.0 — set balance directly for test setup
+    conn = storage._get_conn()
+    conn.execute(f"UPDATE ledger SET balance = -100.0 WHERE peer_public_key = ?", (peer_pk,))
+    conn.commit()
     entry = storage.get_or_create_ledger_entry(peer_pk)
 
     skill_price = 1.0
