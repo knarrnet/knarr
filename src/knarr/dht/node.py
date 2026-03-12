@@ -4933,11 +4933,17 @@ class DHTNode:
         accepted_receipt_id: str,
         settle_request_ref: str,
     ) -> Dict[str, Any]:
-        """Build a settlement_confirmation message body."""
+        """Build and sign a settlement_confirmation message body.
+
+        The WM applies gates [1,2,3,4,5] to settlement_confirmation, including
+        Gate 1 (Ed25519 signature verification).  The body must carry a proof
+        field or the receiver's WM will quarantine it.
+        """
+        from ..core.proof import sign_document
         seed = hashlib.sha256(
             f"{accepted_receipt_id}:{settle_request_ref}:{peer_key}".encode("utf-8")
         ).hexdigest()
-        return {
+        body = {
             "type": "knarr/commerce/settlement_confirmation",
             "tx_hash": (seed + ("x" * 88))[:88],
             "amount_settled": abs(float(amount)),
@@ -4946,6 +4952,8 @@ class DHTNode:
             "accepted_receipt_id": accepted_receipt_id,
             "settle_request_ref": settle_request_ref,
         }
+        verification_method = f"did:knarr:{self.node_info.node_id}#key-1"
+        return sign_document(body, self._signing_key, verification_method)
 
     def _get_settlement_config(self) -> dict:
         """Resolve settlement config by merging [economy.settlement] (base) and [settlement] (override)."""
