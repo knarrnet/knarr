@@ -884,6 +884,11 @@ class SyncEngine:
                         except ValueError:
                             self._log.warning("MAIL_REJECT: invalid _sender_pubkey on dispatch path, type=%s", msg_type)
                             return  # Fix #9: reject on corrupt sender identity
+                    # Strip transport metadata before WM ingest — fields injected
+                    # during decryption (e.g. _encrypted) were not present when
+                    # sign_document ran, so they break JCS canonical form at
+                    # verification time → Gate 1 signature mismatch.
+                    wm_document = {k: v for k, v in wm_document.items() if not k.startswith("_")}
                     result = await self._node._wm_ingest(wm_document, originator_pubkey)
                     if result is not None:
                         if result.status == "held":
