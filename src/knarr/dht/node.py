@@ -156,6 +156,7 @@ class DHTNode:
         self._handlers: Dict[str, tuple[Callable, bool]] = {} # skill_name -> (handler_fn, slow)
         self._handler_specs: Dict[str, str] = {}   # skill_name -> handler spec string
         self._handler_mtimes: Dict[str, float] = {} # skill_name -> handler file mtime
+        self._skill_active: Dict[str, int] = {}     # v0.37.0: per-skill active execution count
         self._task_events: Dict[str, asyncio.Event] = {}
         self._task_results: Dict[str, TaskResult] = {}
         self._task_expected_provider: Dict[str, str] = {}  # task_id -> expected provider public_key
@@ -989,6 +990,182 @@ class DHTNode:
                         await self._send_direct(msg.requester_host, msg.requester_port, result_msg)
             except Exception as e:
                 logger.warning(f"Failed to send slow task result to {msg.requester_host}:{msg.requester_port}: {e}")
+
+    async def _execute_local_fast_path(
+        self, msg: TaskRequest, handler_fn: Callable, slow: bool,
+        skill_name: str, skill_price: float,
+        caller_node_id: str, job_id: str, input_hash: str,
+    ) -> Message:
+        """v0.37.0 A1: Execute local task directly without queue.
+
+        MUST still write receipts, emit bus events, check admission gate.
+        This is the fast path for self-calls (caller == self.node_info.node_id).
+        """
+        from .mcp_bridge import MCPTimeoutError
+        import inspect
+        from ..static.handler import TaskContext
+
+        start_time = time.time()
+        input_size = len(json.dumps(msg.input_data)) if msg.input_data else 0
+
+        # v0.33.0 C-track: configurable default timeout
+        _default_timeout_s = float(self._config.get("skills", {}).get("default_timeout", 30))
+        max_timeout = self._config.get("node", {}).get("max_task_timeout", 3600)
+        _req_timeout_s = msg.timeout_ms / 1000.0 if msg.timeout_ms else _default_timeout_s
+        handler_timeout = min(_req_timeout_s, max_timeout) if max_timeout > 0 else _req_timeout_s
+
+        # Emit task.started and write order_executing receipt (parity with async path)
+        if self.bus:
+            self.bus.emit("task.started", skill_name=skill_name, caller_node=caller_node_id, task_id=job_id, fast_path=True, identity=caller_node_id)
+        self._write_receipt(
+            document_type="order_executing",
+            payload={
+                "provider": self.node_info.node_id,
+                "caller": caller_node_id,
+                "skill_uri": f"knarr:///{skill_name}",
+                "order_ref": job_id,
+                "fast_path": True,
+            },
+        )
+
+        try:
+            loop = asyncio.get_running_loop()
+
+            # Prepare input data (same as _execute_queued_task)
+            input_data = dict(msg.input_data)
+            input_data["_job_id"] = job_id
+            input_data["_caller_node_id"] = caller_node_id
+            input_data["_node_encrypt"] = self.encrypt_for_peer
+            input_data["_node_decrypt"] = self.decrypt_from_peer
+
+            # Check if handler accepts TaskContext
+            ctx = TaskContext(self._asset_dir) if self._asset_dir else None
+            handler_accepts_ctx = False
+            try:
+                sig = inspect.signature(handler_fn)
+                handler_accepts_ctx = len(sig.parameters) >= 2
+            except (ValueError, TypeError):
+                pass
+
+            # Execute handler (same logic as _execute_queued_task)
+            if asyncio.iscoroutinefunction(handler_fn):
+                def _run_async():
+                    tloop = asyncio.new_event_loop()
+                    try:
+                        if handler_accepts_ctx:
+                            return tloop.run_until_complete(handler_fn(input_data, ctx))
+                        else:
+                            return tloop.run_until_complete(handler_fn(input_data))
+                    finally:
+                        tloop.close()
+                result_data = await asyncio.wait_for(
+                    loop.run_in_executor(self._handler_pool, _run_async),
+                    timeout=handler_timeout
+                )
+            else:
+                if handler_accepts_ctx:
+                    result_data = await asyncio.wait_for(
+                        loop.run_in_executor(self._handler_pool, handler_fn, input_data, ctx),
+                        timeout=handler_timeout
+                    )
+                else:
+                    result_data = await asyncio.wait_for(
+                        loop.run_in_executor(self._handler_pool, handler_fn, input_data),
+                        timeout=handler_timeout
+                    )
+
+            wall_ms = int((time.time() - start_time) * 1000)
+            logger.info(f"FAST_PATH completed: skill={skill_name} task={job_id[:8]} wall={wall_ms}ms")
+
+            # Strip non-serializable hooks from result
+            if isinstance(result_data, dict):
+                result_data = {k: v for k, v in result_data.items() if not callable(v)}
+
+            # Egress check
+            if result_data and hasattr(self, '_egress'):
+                out_str = json.dumps(result_data) if isinstance(result_data, dict) else str(result_data)
+                if not self._egress.check(out_str):
+                    logger.critical(f"EGRESS_BLOCK_RESULT task={job_id[:16]} skill={skill_name}")
+                    if self.bus:
+                        self.bus.emit("security.egress_blocked", skill_name=skill_name, target=caller_node_id, identity=caller_node_id)
+                    result_data = {"error": "SECURITY_VIOLATION", "code": "EGRESS_FILTER_BLOCKED"}
+
+            # Write task status and execution log
+            await self._enqueue_write(
+                self.storage.update_task_status, job_id, "completed",
+                result_data, None, input_size, wall_ms
+            )
+            await self._enqueue_write(
+                self.storage.log_execution,
+                job_id, skill_name, caller_node_id, "completed", wall_ms, input_hash, None, None, skill_price, ""
+            )
+
+            # Emit bus event
+            if self.bus:
+                self.bus.emit("task.completed", skill_name=skill_name, caller_node=caller_node_id, task_id=job_id, wall_ms=wall_ms, price=skill_price, identity=caller_node_id)
+
+            # Write execution receipt (same as async path)
+            output_hash = hashlib.sha256(
+                json.dumps(result_data, sort_keys=True, separators=(',', ':')).encode()
+            ).hexdigest() if result_data else ""
+
+            from datetime import datetime, timezone as _tz_exec
+            _completed_at = datetime.now(_tz_exec.utc)
+            _completed_iso = _completed_at.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_completed_at.microsecond // 1000:03d}Z"
+            _started_at = _completed_at - __import__("datetime").timedelta(milliseconds=max(0, min(wall_ms, 86400000)))
+            _started_iso = _started_at.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_started_at.microsecond // 1000:03d}Z"
+
+            self._write_receipt(
+                document_type="execution_receipt",
+                payload={
+                    "provider": self.node_info.node_id,
+                    "caller": caller_node_id,
+                    "skill_uri": f"knarr:///{skill_name}",
+                    "order_ref": job_id,
+                    "execution": {
+                        "status": "completed",
+                        "started_at": _started_iso,
+                        "completed_at": _completed_iso,
+                        "duration_ms": wall_ms,
+                        "input_hash": f"sha256:{input_hash}" if input_hash else None,
+                        "output_hash": f"sha256:{output_hash}" if output_hash else None,
+                        "error": None,
+                    },
+                    "settlement": {
+                        "credit_note_ref": None,
+                        "amount": float(skill_price),
+                        "currency": "credits",
+                    },
+                },
+                counterparty=caller_node_id,
+                order_ref=job_id,
+                proof_purpose="assertion",
+                sign=True,
+            )
+
+            # Return success result
+            return self._sign(TaskResult(task_id=job_id, status="completed", result=result_data))
+
+        except asyncio.TimeoutError:
+            err = {"code": "TIMEOUT", "message": f"Handler exceeded {handler_timeout}s timeout"}
+            wall_ms = int((time.time() - start_time) * 1000)
+            await self._enqueue_write(
+                self.storage.update_task_status, job_id, "failed", None, err, input_size, wall_ms
+            )
+            if self.bus:
+                self.bus.emit("task.failed", skill_name=skill_name, caller_node=caller_node_id, task_id=job_id, error_type="TIMEOUT", identity=caller_node_id)
+            return self._sign(TaskResult(task_id=job_id, status="failed", error=err))
+
+        except Exception as e:
+            logger.exception(f"FAST_PATH_ERROR: skill={skill_name} task={job_id[:8]}: {e}")
+            err = {"code": "HANDLER_ERROR", "message": str(e)}
+            wall_ms = int((time.time() - start_time) * 1000)
+            await self._enqueue_write(
+                self.storage.update_task_status, job_id, "failed", None, err, input_size, wall_ms
+            )
+            if self.bus:
+                self.bus.emit("task.failed", skill_name=skill_name, caller_node=caller_node_id, task_id=job_id, error_type="EXCEPTION", identity=caller_node_id)
+            return self._sign(TaskResult(task_id=job_id, status="failed", error=err))
 
     async def _send_direct(self, host: str, port: int, msg: Message):
         """Sends a message directly to a host:port without expecting a Knarr response."""
@@ -2088,6 +2265,21 @@ class DHTNode:
                 asyncio.create_task(self._send_to_peer(peer, msg))
             
             logger.info(f"Deregistered skill '{skill_name}'")
+
+    def _get_skill_max_concurrent(self, skill_name: str) -> int:
+        """Return the max_concurrent setting for a skill (default 1)."""
+        skill_name_lower = skill_name.lower()
+        mc = getattr(self, "_skill_max_concurrent", {})
+        if skill_name_lower in mc:
+            return mc[skill_name_lower]
+        # Fallback: read from config
+        skill_cfg = self._config.get("skills", {}).get(skill_name, {})
+        if isinstance(skill_cfg, dict):
+            try:
+                return max(1, int(skill_cfg.get("max_concurrent", 1)))
+            except (ValueError, TypeError):
+                return 1
+        return 1
 
     def register_handler(self, skill_name: str, handler_fn: Callable, slow: bool = False):
         """Registers a handler for a skill."""
@@ -3218,6 +3410,24 @@ class DHTNode:
         is_async = getattr(msg, "mode", "sync") == "async"
         if is_async:
             job_id = str(uuid.uuid4())
+
+        # v0.37.0 A1: Local skill fast path — execute directly without queue
+        # MUST still write receipts, emit bus events, check admission gate, respect max_concurrent
+        if is_self_call and not is_async:
+            active = self._skill_active.get(skill_name, 0)
+            max_concurrent = self._get_skill_max_concurrent(skill_name)
+            if active < max_concurrent:
+                self._skill_active[skill_name] = active + 1
+                try:
+                    result_msg = await self._execute_local_fast_path(
+                        msg, handler_fn, slow, skill_name, skill_price,
+                        caller_node_id, job_id, input_hash
+                    )
+                    return result_msg
+                finally:
+                    self._skill_active[skill_name] = max(0, self._skill_active.get(skill_name, 0) - 1)
+            # else: fall through to queue (concurrency cap hit)
+
         self._admission_cache[job_id] = {
             "price": result.pricing.final_price,
             "breakdown": dataclasses.asdict(self._pricing_result_to_breakdown(result.pricing)),
