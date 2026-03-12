@@ -2475,3 +2475,82 @@ class Storage:
             (tx_digest, amount, asset, destination, time.time()),
         )
         conn.commit()
+
+
+class StorageStub:
+    """Minimal stub for unit tests. In-memory SQLite with receipt_log only.
+
+    Tests that need full Storage should use Storage(":memory:") instead.
+    This stub exists for receipt-focused tests that don't need the full schema.
+    """
+
+    _RECEIPT_LOG_DDL = """
+        CREATE TABLE IF NOT EXISTS receipt_log (
+            receipt_id      TEXT PRIMARY KEY,
+            document_type   TEXT NOT NULL,
+            timestamp       TEXT NOT NULL,
+            identity        TEXT NOT NULL,
+            counterparty    TEXT,
+            order_ref       TEXT,
+            proof_purpose   TEXT NOT NULL,
+            payload_json    TEXT NOT NULL,
+            signature       TEXT,
+            created_at      REAL NOT NULL
+        )
+    """
+
+    def __init__(self, db_path: str = ":memory:"):
+        self.db_path = db_path
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(self._RECEIPT_LOG_DDL)
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_log_type ON receipt_log(document_type)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_log_identity ON receipt_log(identity)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_log_ts ON receipt_log(timestamp)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_log_order ON receipt_log(order_ref)")
+        self._conn.commit()
+
+    def write_receipt(self, receipt_id, document_type, timestamp, identity,
+                      counterparty, order_ref, proof_purpose, payload_json, signature):
+        """INSERT OR IGNORE into receipt_log. Idempotent."""
+        self._conn.execute(
+            """INSERT OR IGNORE INTO receipt_log
+               (receipt_id, document_type, timestamp, identity, counterparty,
+                order_ref, proof_purpose, payload_json, signature, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (receipt_id, document_type, timestamp, identity, counterparty,
+             order_ref, proof_purpose, payload_json, signature, time.time()),
+        )
+        self._conn.commit()
+
+    def get_receipt(self, receipt_id):
+        cursor = self._conn.execute(
+            "SELECT receipt_id, document_type, timestamp, identity, counterparty, "
+            "order_ref, proof_purpose, payload_json, signature, created_at "
+            "FROM receipt_log WHERE receipt_id = ?", (receipt_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return dict(zip(["receipt_id", "document_type", "timestamp", "identity",
+                         "counterparty", "order_ref", "proof_purpose",
+                         "payload_json", "signature", "created_at"], row))
+
+    def get_receipts_by_type(self, document_type):
+        cursor = self._conn.execute(
+            "SELECT receipt_id, document_type, timestamp, identity, counterparty, "
+            "order_ref, proof_purpose, payload_json, signature, created_at "
+            "FROM receipt_log WHERE document_type = ? ORDER BY created_at ASC",
+            (document_type,))
+        cols = ["receipt_id", "document_type", "timestamp", "identity",
+                "counterparty", "order_ref", "proof_purpose",
+                "payload_json", "signature", "created_at"]
+        return [dict(zip(cols, r)) for r in cursor.fetchall()]
+
+    def count_receipts(self, document_type=None):
+        if document_type:
+            cursor = self._conn.execute(
+                "SELECT COUNT(*) FROM receipt_log WHERE document_type = ?",
+                (document_type,))
+        else:
+            cursor = self._conn.execute("SELECT COUNT(*) FROM receipt_log")
+        return cursor.fetchone()[0]
