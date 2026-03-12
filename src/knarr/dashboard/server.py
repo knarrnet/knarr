@@ -99,6 +99,16 @@ class CockpitServer:
         self._exposures = self._build_exposure_index(exposures or {})
         self._rate_limits: Dict[str, Dict[str, list]] = {}  # path -> {ip: [timestamps]}
         self._token_counters: Dict[str, Dict[str, dict]] = {}  # path -> {token: {count, day}}
+        # v0.38.0 A3.2: Wallet HMAC auth + spending caps
+        self._wallet_daily_spent: float = 0.0
+        self._wallet_daily_reset: float = time.time()
+        # FIX-002: HMAC replay guard — track seen signatures within timestamp window
+        self._seen_wallet_sigs: dict = {}  # {sig_hex: expiry_time}
+        self._sig_sweep_interval: float = 60.0
+        self._last_sig_sweep: float = time.time()
+        # FIX-003: Spend cap lock to prevent TOCTOU race
+        import asyncio as _asyncio
+        self._wallet_send_lock = _asyncio.Lock()
         self._routing_policy = self._load_routing_policy()
         self._log_handler = RingBufferHandler(maxlen=1000)
         logging.getLogger().addHandler(self._log_handler)
@@ -2192,6 +2202,113 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
             if _bus:
                 _bus.emit("security.auth_failed", source_ip=(source_ip or "")[:20], endpoint=(endpoint or "")[:40])
         return result
+
+    def _check_wallet_auth(
+        self, method: str, path: str, body: bytes | str, headers: dict
+    ) -> bool:
+        """v0.38.0 A3.2: HMAC authentication for wallet write operations.
+
+        Verifies X-Wallet-Signature header using:
+            HMAC-SHA256(send_secret, timestamp + "\\n" + method + "\\n" + path + "\\n" + body)
+
+        Also verifies X-Wallet-Timestamp is within ±30 seconds.
+        """
+        import hashlib as _hashlib
+        wallet_cfg = (getattr(self._node, '_config', None) or {}).get("cockpit", {}).get("wallet", {})
+        send_secret = wallet_cfg.get("send_secret", "")
+        if not send_secret:
+            # No secret configured — reject all wallet write requests
+            logger.warning("WALLET_AUTH_FAIL: send_secret not configured")
+            return False
+
+        timestamp_window = int(wallet_cfg.get("timestamp_window_seconds", 30))
+
+        # Get and validate timestamp
+        ts_header = headers.get("x-wallet-timestamp", "")
+        if not ts_header:
+            logger.warning("WALLET_AUTH_FAIL: missing X-Wallet-Timestamp")
+            return False
+        try:
+            ts = int(ts_header)
+        except (ValueError, TypeError):
+            logger.warning(f"WALLET_AUTH_FAIL: unparseable timestamp {ts_header!r}")
+            return False
+
+        if abs(time.time() - ts) > timestamp_window:
+            logger.warning(
+                f"WALLET_AUTH_FAIL: timestamp {ts} outside window "
+                f"(now={int(time.time())} window={timestamp_window}s)"
+            )
+            return False
+
+        # Get signature from header
+        sig_header = headers.get("x-wallet-signature", "")
+        if not sig_header:
+            logger.warning("WALLET_AUTH_FAIL: missing X-Wallet-Signature")
+            return False
+
+        # Build body string for signing
+        if isinstance(body, bytes):
+            body_str = body.decode("utf-8", errors="replace")
+        else:
+            body_str = body or ""
+
+        # Compute expected HMAC
+        msg = f"{ts}\n{method}\n{path}\n{body_str}"
+        expected_sig = hmac.new(
+            send_secret.encode("utf-8"),
+            msg.encode("utf-8"),
+            _hashlib.sha256,
+        ).hexdigest()
+
+        # Constant-time compare
+        if not hmac.compare_digest(sig_header.encode(), expected_sig.encode()):
+            logger.warning("WALLET_AUTH_FAIL: signature mismatch")
+            return False
+
+        # FIX-002: Replay guard — reject duplicate (timestamp, signature) tuples
+        sig_key = f"{ts}:{sig_header}"
+        now_replay = time.time()
+        if sig_key in self._seen_wallet_sigs:
+            logger.warning("WALLET_AUTH_FAIL: replayed signature")
+            return False
+        # Record signature with expiry (window + margin)
+        self._seen_wallet_sigs[sig_key] = now_replay + timestamp_window + 5
+        # Periodic sweep of expired entries
+        if now_replay - self._last_sig_sweep > self._sig_sweep_interval:
+            self._seen_wallet_sigs = {
+                k: v for k, v in self._seen_wallet_sigs.items() if v > now_replay
+            }
+            self._last_sig_sweep = now_replay
+
+        return True
+
+    def _check_wallet_spend_cap(self, amount: float) -> tuple[bool, str]:
+        """v0.38.0 A3.3: Check per-tx and daily spending caps.
+
+        Returns (allowed, reason).
+        """
+        wallet_cfg = (getattr(self._node, '_config', None) or {}).get("cockpit", {}).get("wallet", {})
+        max_per_tx = float(wallet_cfg.get("max_per_tx", 100.0))
+        max_daily = float(wallet_cfg.get("max_daily", 1000.0))
+
+        # Per-tx cap
+        if amount > max_per_tx:
+            return False, f"amount {amount} exceeds per-tx cap {max_per_tx}"
+
+        # Daily rolling cap: reset if > 24h since last reset
+        now = time.time()
+        if now - self._wallet_daily_reset > 86400:
+            self._wallet_daily_spent = 0.0
+            self._wallet_daily_reset = now
+
+        if self._wallet_daily_spent + amount > max_daily:
+            return False, (
+                f"daily cap exceeded: spent={self._wallet_daily_spent:.2f} "
+                f"+ requested={amount:.2f} > max={max_daily:.2f}"
+            )
+
+        return True, ""
 
     def _serve_static(self, path: str) -> tuple[bytes, str]:
         """Returns (content_bytes, content_type). Raises FileNotFoundError."""
