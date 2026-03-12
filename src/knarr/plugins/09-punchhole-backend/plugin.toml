@@ -1,0 +1,10 @@
+name = "punchhole-backend"
+version = "0.37.0"
+handler = "handler:PunchholeBackendPlugin"
+description = "Punchhole Cache Backend — LAN-side. Reads internal DB, applies granularity controls, signs cache objects, builds ACL, pushes to frontend via bus. Must start before frontend."
+
+[config]
+# Path to exposure_schema.toml — relative to plugin_dir
+schema_file = "exposure_schema.toml"
+# debug logging
+debug = false

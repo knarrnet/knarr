@@ -24,9 +24,92 @@ class SyncEngine:
         # M-018: Per-peer delivery state tracking
         self._peer_delivery_state: Dict[str, Dict[str, Any]] = {}  # node_id -> {last_attempt, consecutive_failures, next_retry_after, circuit_open}
 
+        # v0.39.0 C3: Mail circuit breaker — per-peer failure tracking
+        self._circuit_state: Dict[str, Dict[str, Any]] = {}
+        self._circuit_backoff_steps = [30, 60, 120, 300]  # seconds
+        self._circuit_threshold = 3  # failures before circuit opens
+
+    def _circuit_allows(self, peer: str) -> bool:
+        """Check if circuit breaker allows sending to this peer."""
+        state = self._circuit_state.get(peer)
+        if not state or not state.get("open", False):
+            return True
+        # Check if backoff period has elapsed (half-open)
+        if time.monotonic() >= state.get("retry_after", 0):
+            return True
+        return False
+
+    def _circuit_on_success(self, peer: str):
+        """Reset circuit breaker on successful delivery."""
+        if peer in self._circuit_state:
+            del self._circuit_state[peer]
+
+    def _circuit_on_failure(self, peer: str):
+        """Record failure, potentially open circuit."""
+        state = self._circuit_state.get(peer)
+        if not state:
+            state = {"failures": 0, "open": False, "retry_after": 0, "backoff_index": 0}
+            self._circuit_state[peer] = state
+        state["failures"] = state.get("failures", 0) + 1
+        if state["failures"] >= self._circuit_threshold:
+            state["open"] = True
+            idx = min(state.get("backoff_index", 0), len(self._circuit_backoff_steps) - 1)
+            backoff = self._circuit_backoff_steps[idx]
+            state["retry_after"] = time.monotonic() + backoff
+            state["backoff_index"] = min(idx + 1, len(self._circuit_backoff_steps) - 1)
+            self._log.warning(
+                f"CIRCUIT_OPEN peer={peer[:16]} failures={state['failures']} backoff={backoff}s"
+            )
+            bus = getattr(self._node, 'bus', None)
+            if bus:
+                bus.emit("mail.peer_circuit_open", peer=peer, failures=state["failures"],
+                         backoff_seconds=backoff, identity=peer)
+
     def register_handler(self, msg_type: str, handler: Callable):
         """Register a dispatch handler for a system mail msg_type."""
         self._mail_handlers[msg_type] = handler
+
+    async def _run_mail_admission(self, sender_node_id: str, sender_key: str):
+        import hashlib
+        from ..commerce.admission_pipeline import AdmissionContext, run_admission
+
+        skill_name = "knarr-mail"
+        initial_credit, min_balance = self._node._resolve_policy(sender_key, skill_name)
+        initial_trust = self._node._get_initial_trust(sender_node_id)
+        entry = await self._node._enqueue_write(
+            self._node.storage.get_or_create_ledger_entry,
+            sender_key, initial_credit, initial_trust
+        )
+
+        peer_nid = hashlib.sha256(bytes.fromhex(sender_key)).hexdigest()
+        group_engine = getattr(self._node, "_group_engine", None)
+        meter = await self._node._enqueue_write(
+            self._node.storage.meter_get, peer_nid, skill_name, ""
+        )
+        meter_count = meter["count"] if meter else 0
+        skill_sheet = getattr(self._node, "_own_skills", {}).get(skill_name)
+        skill_cfg = self._node._get_skill_runtime_config(skill_name)
+
+        result = run_admission(AdmissionContext(
+            caller_key=sender_key,
+            skill_name=skill_name,
+            base_price=skill_sheet.price if skill_sheet else float(self._node._config.get("mail", {}).get("price", 1.0)),
+            balance=entry.balance,
+            soft_limit=min_balance,
+            hard_limit=min_balance,
+            tit_for_tat=self._node.policy.tit_for_tat,
+            peer_node_id=peer_nid,
+            peer_groups=set(group_engine.get_groups(peer_nid)) if group_engine else set(),
+            discount_rules=self._node._load_discount_rules(peer_nid, skill_name),
+            cost_projection=self._node._get_cost_projection(skill_name),
+            pricing_config=self._node._build_pricing_config(skill_name),
+            prepaid_balance=getattr(entry, "prepaid", 0.0),
+            meter_count=meter_count,
+            meter_max_count=int(skill_cfg.get("meter_max_count", 0)),
+            identity=self._node.node_info.node_id,
+            counterparty=peer_nid,
+        ))
+        return result, entry, initial_credit, min_balance
 
     async def enqueue(self, to_node: str, msg_type: str, body: dict,
                       session_id: str = None, reply_to: str = None,
@@ -76,12 +159,21 @@ class SyncEngine:
         if peer_node_id == self._node.node_info.node_id:
             await self._self_deliver(peer_node_id)
             return
+        # v0.39.0 C3: Circuit breaker check — skip if circuit is open
+        if not self._circuit_allows(peer_node_id):
+            if self._debug:
+                self._log.debug(f"CIRCUIT_SKIP peer={peer_node_id[:16]} — circuit open")
+            return
         # V17-005: Per-peer singleflight — skip if already pushing to this peer
         if peer_node_id in self._push_in_flight:
             return
         self._push_in_flight.add(peer_node_id)
         try:
             await self._push_to_peer_inner(peer_node_id, peer_host, peer_port)
+            self._circuit_on_success(peer_node_id)
+        except Exception:
+            self._circuit_on_failure(peer_node_id)
+            raise
         finally:
             self._push_in_flight.discard(peer_node_id)
 
@@ -447,9 +539,33 @@ class SyncEngine:
                     self._log.warning(f"MailSync: group engine not available, rejecting")
                     break
 
-            # System flag: dispatch if msg_type has a registered handler
+            # System flag: only knarr/-prefixed msg_types are system mail
             msg_type = item.get("msg_type", "")
-            is_system = msg_type in self._mail_handlers
+            is_system = msg_type.startswith("knarr/")
+            if not is_system:
+                sender_key = getattr(msg, "public_key", "")
+                if not sender_key:
+                    self._log.warning("MAIL_REJECT: empty public_key on push path, item=%s", item_id[:8])
+                    confirmed_ids.append(item_id)
+                    continue
+                try:
+                    result, entry, initial_credit, min_balance = await self._run_mail_admission(
+                        msg.sender_node_id, sender_key
+                    )
+                except ValueError:
+                    self._log.warning("MAIL_REJECT: invalid hex public_key on push path, item=%s", item_id[:8])
+                    confirmed_ids.append(item_id)
+                    continue
+                if result.gate.outcome == "hard_block":
+                    if getattr(self._node, "bus", None):
+                        self._node.bus.emit(
+                            "credit.sanctioned",
+                            counterparty=sender_key,
+                            limit_type="hard",
+                            identity=sender_key,
+                        )
+                    confirmed_ids.append(item_id)
+                    continue
             
             # Store in inbox — force from_node to authenticated sender (anti-spoof)
             stored = await self._node._enqueue_write(
@@ -461,6 +577,17 @@ class SyncEngine:
             )
             
             if stored:
+                if not is_system:
+                    await self._node._enqueue_write(
+                        self._node.storage.update_ledger_provider,
+                        msg.public_key, max(0.0, result.pricing.final_price)
+                    )
+                    await self._node._maybe_send_tab_reminder(
+                        msg.public_key,
+                        result.gate.balance_after if result.gate.balance_after is not None else entry.balance,
+                        initial_credit,
+                        min_balance,
+                    )
                 confirmed_ids.append(item_id)
                 self._fire_mail_received(item, msg.sender_node_id, self._node.node_info.node_id)
                 # v0.33.0: mail.received (push path)
@@ -501,6 +628,7 @@ class SyncEngine:
                     self._log.info(f"MAIL_STORE id={item_id[:8]} type={item.get('msg_type','?')} from={msg.sender_node_id[:16]} system={is_system}")
                 if is_system:
                     # Run system dispatch in background task
+                    item["_sender_pubkey"] = getattr(msg, "public_key", "")
                     asyncio.create_task(self._dispatch_system_item(item))
             else:
                 # Duplicate item_id — still confirm to sender
@@ -731,7 +859,48 @@ class SyncEngine:
             try:
                 if self._debug:
                     self._log.info(f"MAIL_DISPATCH type={msg_type} from={item.get('from_node', '?')[:16]}")
-                await handler(item)
+                dispatch_item = item
+                # v0.42.0 A3: WM dispatch gate — documents with proof fields
+                body = item.get("body", {})
+                if isinstance(body, dict):
+                    # Unwrap nested document from settlement/commerce envelopes
+                    if msg_type.startswith("knarr/commerce/"):
+                        wm_document = body.get("document", body)
+                    else:
+                        wm_document = body
+                    # Commerce types are documents — always route through WM.
+                    # Non-commerce system messages (task results, asset fetch)
+                    # only go through WM if they carry a proof field; unsigned
+                    # system messages are authenticated at the transport layer.
+                    if not msg_type.startswith("knarr/commerce/"):
+                        if not isinstance(wm_document, dict) or "proof" not in wm_document:
+                            await handler(dispatch_item)
+                            return
+                    originator_pubkey = b""
+                    sender_pubkey = item.get("_sender_pubkey", "")
+                    if isinstance(sender_pubkey, str) and sender_pubkey:
+                        try:
+                            originator_pubkey = bytes.fromhex(sender_pubkey)
+                        except ValueError:
+                            self._log.warning("MAIL_REJECT: invalid _sender_pubkey on dispatch path, type=%s", msg_type)
+                            return  # Fix #9: reject on corrupt sender identity
+                    result = await self._node._wm_ingest(wm_document, originator_pubkey)
+                    if result is not None:
+                        if result.status == "held":
+                            self._log.info("WM_HELD type=%s reason=%s", result.document_type, result.reason or "review")
+                            return
+                        if result.status == "rejected":
+                            self._log.warning("WM_REJECTED type=%s reason=%s", result.document_type, result.reason or "rejected")
+                            return
+                        if result.document is not None:
+                            dispatch_item = dict(item)
+                            if msg_type.startswith("knarr/commerce/") and "document" in body:
+                                dispatch_body = dict(body)
+                                dispatch_body["document"] = result.document
+                                dispatch_item["body"] = dispatch_body
+                            else:
+                                dispatch_item["body"] = result.document
+                await handler(dispatch_item)
             except Exception:
                 self._log.error(f"System mail handler failed for {msg_type}", exc_info=True)
         else:
@@ -861,7 +1030,31 @@ class SyncEngine:
 
             # Store
             msg_type = item.get("msg_type", "")
-            is_system = msg_type in self._mail_handlers
+            is_system = msg_type.startswith("knarr/")
+            if not is_system:
+                sender_key = getattr(resp, "public_key", "")
+                if not sender_key:
+                    self._log.warning("MAIL_REJECT: empty public_key on pull path, item=%s", item_id[:8])
+                    confirmed_ids.append(item_id)
+                    continue
+                try:
+                    result, entry, initial_credit, min_balance = await self._run_mail_admission(
+                        peer_node_id, sender_key
+                    )
+                except ValueError:
+                    self._log.warning("MAIL_REJECT: invalid hex public_key on pull path, item=%s", item_id[:8])
+                    confirmed_ids.append(item_id)
+                    continue
+                if result.gate.outcome == "hard_block":
+                    if getattr(self._node, "bus", None):
+                        self._node.bus.emit(
+                            "credit.sanctioned",
+                            counterparty=sender_key,
+                            limit_type="hard",
+                            identity=sender_key,
+                        )
+                    confirmed_ids.append(item_id)
+                    continue
             stored = await self._node._enqueue_write(
                 self._node.storage.store_mail_from_sync,
                 item_id, peer_node_id, self._node.node_info.node_id,
@@ -871,6 +1064,17 @@ class SyncEngine:
             )
             confirmed_ids.append(item_id)
             if stored:
+                if not is_system:
+                    await self._node._enqueue_write(
+                        self._node.storage.update_ledger_provider,
+                        resp.public_key, max(0.0, result.pricing.final_price)
+                    )
+                    await self._node._maybe_send_tab_reminder(
+                        resp.public_key,
+                        result.gate.balance_after if result.gate.balance_after is not None else entry.balance,
+                        initial_credit,
+                        min_balance,
+                    )
                 self._fire_mail_received(item, peer_node_id, self._node.node_info.node_id)
                 # v0.33.0: mail.received (pull path)
                 _bus = getattr(self._node, 'bus', None)
@@ -908,6 +1112,7 @@ class SyncEngine:
                     self._log.warning("RECEIPT_SKIP: node missing _write_receipt — mail receipts disabled")
                     self._receipt_skip_warned = True
                 if is_system:
+                    item["_sender_pubkey"] = getattr(resp, "public_key", "")
                     asyncio.create_task(self._dispatch_system_item(item))
 
         # M-014: Replicate referenced assets from sender's sidecar

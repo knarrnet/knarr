@@ -48,6 +48,65 @@ def resolve_cockpit_token(config_dir: str, configured_token: str) -> str:
             logger.warning(f"Could not save cockpit token: {e}")
     return token
 
+
+def _resolve_data_dir(cli_data_dir: Optional[str], config: Dict[str, Any], config_dir: str) -> tuple[str, bool]:
+    env_data_dir = os.getenv("KNARR_DATA_DIR")
+    cfg_data_dir = config.get("node", {}).get("data_dir")
+
+    if cli_data_dir:
+        return os.path.abspath(cli_data_dir), True
+    if env_data_dir:
+        return os.path.abspath(env_data_dir), True
+    if cfg_data_dir:
+        if os.path.isabs(cfg_data_dir):
+            return cfg_data_dir, True
+        return os.path.abspath(os.path.join(config_dir, cfg_data_dir)), True
+    return config_dir, False
+
+
+def _resolve_storage_path(cli_storage: Optional[str], config: Dict[str, Any], data_dir: str) -> str:
+    if cli_storage is not None:
+        return cli_storage
+    configured = config.get("node", {}).get("storage")
+    if not configured:
+        return os.path.join(data_dir, "node.db")
+    if os.path.isabs(configured):
+        return configured
+    return os.path.join(data_dir, configured)
+
+
+def _warn_duplicate_identity_files(config_dir: str, data_dir: str) -> None:
+    if os.path.abspath(config_dir) == os.path.abspath(data_dir):
+        return
+    config_identity = all(os.path.exists(os.path.join(config_dir, name)) for name in ("key.pem", "cert.pem"))
+    data_identity = all(os.path.exists(os.path.join(data_dir, name)) for name in ("key.pem", "cert.pem"))
+    if config_identity and data_identity:
+        logger.warning(
+            "Identity files found in both config_dir and data_dir. Using data_dir. Remove duplicates to silence this warning."
+        )
+
+
+def _log_operator_backup_instruction(data_dir: str) -> None:
+    logger.warning(
+        "=== OPERATOR ACTION REQUIRED ===\n"
+        "Your node identity and wallet keys have been created at: %s\n"
+        "Back up the following files to a secure off-site location:\n\n"
+        "  IDENTITY (irreplaceable — your reputation, credit, and trust):\n"
+        "    %s\n"
+        "    %s\n\n"
+        "  WALLETS (on-chain asset custody):\n"
+        "    %s\n"
+        "    %s\n\n"
+        "Loss of identity files means loss of all credit relationships and network reputation.\n"
+        "Loss of wallet files means loss of on-chain assets.\n"
+        "=== END ===",
+        data_dir,
+        os.path.join(data_dir, "key.pem"),
+        os.path.join(data_dir, "cert.pem"),
+        os.path.join(data_dir, "secrets.toml"),
+        os.path.join(data_dir, "plugin_state", "06-thrall", "thrall_identity.key"),
+    )
+
 async def upload_asset(host: str, port: int, data: bytes, signing_key: SigningKey) -> str:
     """Uploads data to sidecar and returns content hash."""
     import time
@@ -321,11 +380,16 @@ async def cmd_serve(args):
     config = load_config(config_path, explicit=bool(args.config))
     config_dir = os.path.dirname(os.path.abspath(config_path)) if config_path.exists() else os.getcwd()
     config["_config_dir"] = config_dir
+    data_dir, data_dir_explicit = _resolve_data_dir(getattr(args, "data_dir", None), config, config_dir)
+    os.makedirs(data_dir, exist_ok=True)
+    config["_data_dir"] = data_dir
+    config["_data_dir_explicit"] = data_dir_explicit
+    _warn_duplicate_identity_files(config_dir, data_dir)
 
     # 2. Merge logic: Defaults -> Config -> CLI
     port = args.port if args.port is not None else config["node"].get("port", 9000)
     bind_host = args.host if args.host is not None else config["node"].get("host", "0.0.0.0")
-    storage_path = args.storage if args.storage is not None else config["node"].get("storage", "node.db")
+    storage_path = _resolve_storage_path(args.storage, config, data_dir)
     
     bootstrap_peers = []
     if args.bootstrap:
@@ -440,7 +504,9 @@ async def cmd_serve(args):
     await node.register_system_skills(config)
 
     # 7b. Load per-skill secrets
-    node.load_secrets(os.path.join(config_dir, "secrets.toml"))
+    node.load_secrets(os.path.join(data_dir, "secrets.toml"))
+    if getattr(node, "_generated_identity_certs", False):
+        _log_operator_backup_instruction(data_dir)
 
     # 7c. Refresh node/info meta cache now that skills are loaded
     node.refresh_node_meta()
@@ -473,7 +539,7 @@ async def cmd_serve(args):
         from ..dashboard.server import CockpitServer
         cockpit_bind = config.get("cockpit", {}).get("bind", "127.0.0.1")
         cockpit_token = resolve_cockpit_token(
-            config_dir, config.get("cockpit", {}).get("auth_token", "")
+            data_dir, config.get("cockpit", {}).get("auth_token", "")
         )
         cockpit_exposures = dict(config.get("expose", {}))
         # Merge expose.toml (cockpit-created exposures) if present
@@ -494,11 +560,11 @@ async def cmd_serve(args):
         if cockpit_tls_mode != "off":
             # Use ECDSA cert for cockpit (browser-compatible), not Ed25519
             from ..mail.tls import generate_cockpit_cert, resolve_cockpit_cert_paths
-            cockpit_cert, cockpit_key = resolve_cockpit_cert_paths(config, config_dir)
+            cockpit_cert, cockpit_key = resolve_cockpit_cert_paths(config, data_dir)
             if not os.path.exists(cockpit_cert) or not os.path.exists(cockpit_key):
                 cockpit_cfg = config.get("cockpit", {})
                 if "tls_cert" not in cockpit_cfg and "tls_key" not in cockpit_cfg:
-                    generate_cockpit_cert(node.node_info.node_id, config_dir)
+                    generate_cockpit_cert(node.node_info.node_id, data_dir)
         cockpit_server = CockpitServer(node, cockpit_bind, cockpit_port, cockpit_token,
                                        exposures=cockpit_exposures, config_dir=config_dir,
                                        cert_path=cockpit_cert, key_path=cockpit_key,
@@ -527,6 +593,7 @@ async def cmd_serve(args):
 
     # 9. Wait for shutdown
     shutdown = asyncio.Event()
+    node._shutdown_event = shutdown  # upgrade loop can trigger clean shutdown
     loop = asyncio.get_running_loop()
     
     def signal_handler():
@@ -539,7 +606,7 @@ async def cmd_serve(args):
             pass
 
     # Write PID file for skill install/remove to signal reload
-    pid_path = os.path.join(config_dir, "knarr.pid")
+    pid_path = os.path.join(data_dir, "knarr.pid")
     try:
         with open(pid_path, "w") as f:
             f.write(str(os.getpid()))
@@ -551,8 +618,13 @@ async def cmd_serve(args):
         try:
             fresh_config = load_config(config_path, explicit=bool(args.config))
             fresh_dir = os.path.dirname(os.path.abspath(config_path)) if config_path.exists() else os.getcwd()
+            fresh_data_dir, fresh_data_dir_explicit = _resolve_data_dir(getattr(args, "data_dir", None), fresh_config, fresh_dir)
+            os.makedirs(fresh_data_dir, exist_ok=True)
+            fresh_config["_config_dir"] = fresh_dir
+            fresh_config["_data_dir"] = fresh_data_dir
+            fresh_config["_data_dir_explicit"] = fresh_data_dir_explicit
             new_count = await load_skills_from_config(node, fresh_config, fresh_dir)
-            node.load_secrets(os.path.join(fresh_dir, "secrets.toml"))
+            node.load_secrets(os.path.join(fresh_data_dir, "secrets.toml"))
 
             # Reload group policies (NEW)
             fresh_policy_cfg = fresh_config.get("policy", {})
@@ -709,12 +781,14 @@ async def cmd_upgrade(args):
 
     # Newer version available
     config_path = Path(args.config) if args.config else Path("knarr.toml")
+    config = load_config(config_path, explicit=bool(args.config))
     config_dir = os.path.dirname(os.path.abspath(config_path)) if config_path.exists() else os.getcwd()
+    data_dir, _ = _resolve_data_dir(None, config, config_dir)
     
     print(f"\nUpgrading to v{latest}...")
     
     # 1. Backup
-    backup_dir = backup_config(config_dir, __version__)
+    backup_dir = backup_config(config_dir, __version__, data_dir=data_dir)
     if not backup_dir:
         print("Error: Backup failed. Aborting upgrade for safety.", file=sys.stderr)
         sys.exit(1)
@@ -727,11 +801,11 @@ async def cmd_upgrade(args):
             print("Restart your node to apply changes.")
         else:
             print("\nError: Installation verification failed. Rolling back...", file=sys.stderr)
-            rollback_installation(backup_dir, config_dir)
+            rollback_installation(backup_dir, config_dir, data_dir=data_dir)
             sys.exit(1)
     else:
         print("\nError: Upgrade failed. Rolling back...", file=sys.stderr)
-        rollback_installation(backup_dir, config_dir)
+        rollback_installation(backup_dir, config_dir, data_dir=data_dir)
         sys.exit(1)
 
 
@@ -1063,6 +1137,7 @@ def main():
     serve_parser.add_argument("--host", default=None)
     serve_parser.add_argument("--advertise-host", default=None)
     serve_parser.add_argument("--storage", default=None)
+    serve_parser.add_argument("--data-dir", default=None)
     serve_parser.add_argument("--bootstrap", default=None)
     serve_parser.add_argument("--config", default=None)
     serve_parser.add_argument("--bridge", action="append", default=[])

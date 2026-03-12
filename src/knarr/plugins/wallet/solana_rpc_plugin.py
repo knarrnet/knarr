@@ -4,6 +4,7 @@ Uses stdlib urllib — no async HTTP library. All calls run in executor
 to avoid blocking the event loop.
 """
 import asyncio
+import base64
 import json
 import logging
 import urllib.parse
@@ -18,10 +19,14 @@ _ALLOWED_SCHEMES = {"https", "http"}
 
 
 def _validate_rpc_url(url: str) -> str:
-    """Validate RPC URL scheme. Returns url or raises ValueError."""
+    """Validate RPC URL scheme. HTTPS required for remote; HTTP only for localhost."""
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in _ALLOWED_SCHEMES:
         raise ValueError(f"RPC URL scheme must be https or http, got: {parsed.scheme!r}")
+    if parsed.scheme == "http":
+        host = (parsed.hostname or "").lower()
+        if host not in ("localhost", "127.0.0.1", "::1"):
+            raise ValueError(f"HTTP RPC only allowed for localhost, got: {host!r}. Use HTTPS for remote endpoints.")
     return url
 
 
@@ -103,7 +108,22 @@ async def get_sol_balance(
 
 
 async def submit_transaction(tx_bytes: bytes, rpc_url: str = DEFAULT_RPC_URL) -> Optional[str]:
-    """Submit signed transaction to network (Phase C stub)."""
-    # For now, just log and return None
-    logger.info(f"submit_transaction stub called, bytes_len={len(tx_bytes)}")
-    return None
+    """Submit signed transaction to network via sendTransaction RPC."""
+    try:
+        loop = asyncio.get_running_loop()
+        encoded = base64.b64encode(tx_bytes).decode("ascii")
+        data = await loop.run_in_executor(
+            None,
+            _rpc_call,
+            rpc_url,
+            "sendTransaction",
+            [encoded, {"encoding": "base64", "preflightCommitment": "confirmed"}],
+        )
+        if "error" in data:
+            logger.debug(f"sendTransaction RPC error: {data['error']}")
+            return None
+        result = data.get("result")
+        return str(result) if result else None
+    except Exception as e:
+        logger.debug(f"submit_transaction failed: {e}")
+        return None

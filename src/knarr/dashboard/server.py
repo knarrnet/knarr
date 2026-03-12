@@ -1,10 +1,12 @@
 import asyncio
+from collections import deque
 import hmac
 import json
 import logging
 import os
 import sys
 import time
+import tomllib
 import urllib.parse
 from typing import Dict, Any, Optional
 import ipaddress
@@ -56,6 +58,26 @@ def _html_escape(s: str) -> str:
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#x27;")
 
 
+class RingBufferHandler(logging.Handler):
+    """In-memory log sink for the cockpit logs endpoint."""
+
+    def __init__(self, maxlen: int = 1000):
+        super().__init__()
+        self._records = deque(maxlen=maxlen)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._records.append({
+            "created": record.created,
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        })
+
+    def tail(self, limit: int = 100) -> list[dict]:
+        limit = max(1, min(int(limit), len(self._records) or 1))
+        return list(self._records)[-limit:]
+
+
 class CockpitServer:
     """Lightweight HTTP server for the Knarr Cockpit dashboard."""
 
@@ -77,6 +99,9 @@ class CockpitServer:
         self._exposures = self._build_exposure_index(exposures or {})
         self._rate_limits: Dict[str, Dict[str, list]] = {}  # path -> {ip: [timestamps]}
         self._token_counters: Dict[str, Dict[str, dict]] = {}  # path -> {token: {count, day}}
+        self._routing_policy = self._load_routing_policy()
+        self._log_handler = RingBufferHandler(maxlen=1000)
+        logging.getLogger().addHandler(self._log_handler)
 
     @property
     def port(self) -> int:
@@ -127,6 +152,7 @@ class CockpitServer:
             self._server.close()
             await self._server.wait_closed()
             logger.info("Cockpit dashboard stopped")
+        logging.getLogger().removeHandler(self._log_handler)
 
     @staticmethod
     def _build_exposure_index(exposures: Dict[str, Any]) -> Dict[str, dict]:
@@ -154,11 +180,82 @@ class CockpitServer:
                 "mode": cfg.get("mode", "auto"),
                 "timeout": int(cfg.get("timeout", 30)),
                 "timeout_ms": int(cfg.get("timeout_ms", 0)),
+                "payment": cfg.get("payment", "none"),
+                "payment_asset": cfg.get("payment_asset", ""),
+                "payment_assets": cfg.get("payment_assets", []),
                 "payment_address": cfg.get("payment_address", ""),
                 "payment_network": cfg.get("payment_network", ""),
                 "payment_amount": cfg.get("payment_amount", ""),
             }
         return index
+
+    def _load_routing_policy(self) -> Dict[str, Any]:
+        """Load routing.toml from the cockpit config dir with safe defaults."""
+        policy: Dict[str, Any] = {"defaults": {"local_weight": 1.0}}
+        routing_path = os.path.join(self._config_dir, "routing.toml")
+        if not os.path.exists(routing_path):
+            return policy
+        try:
+            with open(routing_path, "rb") as handle:
+                raw = tomllib.load(handle)
+        except tomllib.TOMLDecodeError as exc:
+            logger.warning("ROUTING_CONFIG_INVALID path=%s error=%s", routing_path, exc)
+            return policy
+        except Exception as exc:
+            logger.warning("ROUTING_CONFIG_LOAD_FAIL path=%s error=%s", routing_path, exc)
+            return policy
+
+        if isinstance(raw, dict):
+            policy.update(raw)
+        defaults = raw.get("defaults", {}) if isinstance(raw, dict) else {}
+        local_weight = defaults.get("local_weight", 1.0) if isinstance(defaults, dict) else 1.0
+        try:
+            local_weight = float(local_weight)
+        except (TypeError, ValueError):
+            logger.warning("ROUTING_LOCAL_WEIGHT_INVALID path=%s value=%r", routing_path, local_weight)
+            local_weight = 1.0
+        clamped_weight = max(0.0, min(2.0, local_weight))
+        if clamped_weight != local_weight:
+            logger.warning(
+                "ROUTING_LOCAL_WEIGHT_CLAMPED path=%s value=%s clamped=%s",
+                routing_path, local_weight, clamped_weight,
+            )
+        policy["defaults"] = {"local_weight": clamped_weight}
+        return policy
+
+    def get_local_weight(self, skill_name=None) -> float:
+        """Return the configured local routing weight for /api/execute scoring."""
+        return float(self._routing_policy.get("defaults", {}).get("local_weight", 1.0))
+
+    def _select_execute_provider(self, skill: str) -> Optional[Dict[str, Any]]:
+        candidates = []
+        all_skills = self._node.get_skills()
+        for skill_info in all_skills.get("network", []):
+            if skill_info["name"].lower() == skill.lower():
+                candidates.extend(skill_info.get("providers", []))
+                break
+
+        if skill.lower() in getattr(self._node, "_handlers", {}):
+            candidates.append({
+                "node_id": self._node.node_info.node_id,
+                "host": "127.0.0.1",
+                "port": self._node.node_info.port,
+                "_local": True,
+            })
+
+        if not candidates:
+            return None
+
+        local_weight = self.get_local_weight(skill)
+        scored = []
+        for index, candidate in enumerate(candidates):
+            normalized = dict(candidate)
+            score = 1.0
+            if normalized.get("_local"):
+                score *= local_weight
+            scored.append((score, 0 if normalized.get("_local") else 1, index, normalized))
+        scored.sort(key=lambda entry: (-entry[0], entry[1], entry[2]))
+        return scored[0][3]
 
     _MAX_RATE_LIMIT_IPS = 4096  # per path
 
@@ -310,8 +407,8 @@ class CockpitServer:
                 return
 
             # Auth check for API endpoints
-            # Exempt: GET /api/skills/*/schema (read-only), GET /api/assets/* without remote proxy (local read-only)
-            auth_exempt = path.endswith("/schema")
+            # Exempt: GET /api/assets/* without remote proxy (local read-only)
+            auth_exempt = False
             if auth_exempt is False and method == "GET" and path.startswith("/api/assets/") and not query.get("host"):
                 auth_exempt = True
             if path.startswith("/api/") and not auth_exempt:
@@ -427,15 +524,10 @@ class CockpitServer:
                         status_filter = query.get("status", ["unread"])[0]
                         results = self._node.storage.poll_task_results(limit, status_filter)
                         self._respond_json(writer, {"results": results, "count": len(results)})
+                    elif path == "/api/logs":
+                        self._handle_logs(writer, query)
                     elif path == "/api/reputation":
                         self._respond_json(writer, self._node.get_reputation_summary())
-                    elif path.startswith("/api/skills/") and path.endswith("/schema"):
-                        skill_name = path.split("/")[3]
-                        data = self._node.get_skill_schema(skill_name)
-                        if data:
-                            self._respond_json(writer, data)
-                        else:
-                            self._respond_404(writer)
                     elif path == "/api/secrets":
                         self._respond_json(writer, self._node.get_secrets_summary())
                     elif path.startswith("/api/secrets/"):
@@ -519,6 +611,8 @@ class CockpitServer:
                         self._handle_pricing_discount_upsert(writer, body)
                     elif path == "/api/groups/refresh":
                         self._handle_groups_refresh(writer, body)
+                    elif path == "/api/settlements/execute":
+                        await self._handle_settlement_execute(writer, body)
                     elif path.startswith("/api/groups/") and path.endswith("/members"):
                         group_name = path[len("/api/groups/"):-len("/members")]
                         self._handle_group_member_manage(writer, group_name, body)
@@ -603,13 +697,16 @@ class CockpitServer:
             self._respond_error(writer, 400, "Missing skill or invalid input")
             return
 
-        # Local execution: if skill exists locally and no explicit provider
         provider = data.get("provider")
-        local = data.get("local", False)
-        
+        # A5: normalize string provider to dict with node_id key
+        if isinstance(provider, str):
+            logger.debug(f"API_EXECUTE_PROVIDER_NORMALIZED: string -> dict node_id={provider[:16]!r}")
+            provider = {"node_id": provider}
+        local = data.get("local", False) is True
+
         timeout_ms = data.get("timeout_ms") or (int(data.get("timeout", 30)) * 1000)
 
-        if local or (not provider and skill.lower() in self._node._handlers):
+        if local:
             try:
                 # Async local execute via programmatic loopback
                 result = await self._node.submit_async_task(
@@ -635,16 +732,38 @@ class CockpitServer:
                 self._respond_error(writer, 500, "Task submission failed")
             return
 
-        # Remote execution
+        # B2: scored candidate selection when no explicit provider
         if not provider:
-            all_skills = self._node.get_skills()
-            for s in all_skills["network"]:
-                if s["name"].lower() == skill.lower() and s["providers"]:
-                    provider = s["providers"][0]
-                    break
+            provider = self._select_execute_provider(skill)
 
         if not provider:
             self._respond_error(writer, 404, "No provider found for skill")
+            return
+
+        # B2: if scored selection picked local, execute locally
+        if provider.get("_local"):
+            try:
+                result = await self._node.submit_async_task(
+                    self._node.node_info.node_id, "127.0.0.1", self._node.node_info.port,
+                    skill, task_input, timeout_ms=timeout_ms
+                )
+                if result.status in ("accepted", "queued"):
+                    self._respond(writer, "202 Accepted", "application/json", json.dumps({
+                        "status": result.status,
+                        "job_id": result.task_id,
+                        "position": getattr(result, "position", 0)
+                    }).encode("utf-8"))
+                elif result.status == "completed":
+                    self._respond(writer, "200 OK", "application/json", json.dumps({
+                        "status": "completed",
+                        "job_id": result.task_id,
+                    }).encode("utf-8"))
+                else:
+                    reason = getattr(result, "reason", "") or result.status
+                    self._respond_error(writer, 409, f"Task rejected: {reason}")
+            except Exception as e:
+                logger.error(f"API local async execute failed: {e}")
+                self._respond_error(writer, 500, "Task submission failed")
             return
 
         # Resolve host/port from peer table when only node_id provided (V011-005)
@@ -1308,6 +1427,59 @@ class CockpitServer:
     def _respond_cors_error(self, writer, code, message):
         self._respond_cors(writer, f"{code} {self._sanitize_status(message)}", "text/plain", message.encode("utf-8"))
 
+    def _issue_x402_refund(self, x402_payment: dict) -> None:
+        """v0.42.0 B4: Issue credit note refund after x402 execution failure."""
+        if not x402_payment or x402_payment.get("refunded"):
+            return
+        payer_node_id = str(x402_payment.get("payer_node_id", "") or "").strip()
+        if not payer_node_id:
+            logger.warning("x402 refund skipped: missing payer_node_id")
+            x402_payment["refunded"] = True
+            return
+        try:
+            from ..commerce.conversion import get_conversion_rate, token_to_credits
+            from ..commerce.documents import credit_note
+            from ..commerce.handlers import _resolve_public_key
+            from ..core.proof import sign_document
+
+            if self._node._signing_key is None:
+                raise RuntimeError("missing node signing key for refund")
+
+            # Fix #5: convert token amount to credits for refund
+            rate = get_conversion_rate(self._node._config)
+            refund_credits = token_to_credits(float(x402_payment["charged_amount"]), rate)
+
+            refund_doc = credit_note(
+                provider=self._node.node_info.node_id,
+                consumer=payer_node_id,
+                amount=refund_credits,
+                skill_name=x402_payment["skill_name"],
+                reason="execution_failed",
+                original_receipt_id=x402_payment["payment_receipt_id"],
+            )
+            signed_refund = sign_document(
+                refund_doc.payload,
+                self._node._signing_key,
+                verification_method=f"did:knarr:{self._node.node_info.node_id}#key-1",
+            )
+            self._node._write_receipt(
+                document_type="credit_note",
+                payload=signed_refund,
+                counterparty=payer_node_id,
+                order_ref=x402_payment["payment_receipt_id"],
+                proof_purpose="assertionMethod",
+            )
+            # Fix #3: resolve node_id → peer_public_key for ledger update
+            peer_pubkey = _resolve_public_key(self._node, payer_node_id)
+            if peer_pubkey:
+                self._node.storage.update_ledger_refund(peer_pubkey, refund_credits)
+            else:
+                logger.warning("x402 refund ledger update failed: cannot resolve pubkey for %s", payer_node_id[:16])
+            x402_payment["refunded"] = True
+            logger.info(f"X402_REFUND issued for skill={x402_payment['skill_name']} amount={x402_payment['charged_amount']}")
+        except Exception as exc:
+            logger.error(f"X402_REFUND_FAILED: {type(exc).__name__}: {exc}")
+
     async def _route_exposure(self, method, path, body, query, writer, client_ip, headers=None):
         """Route /s/ requests to the appropriate exposure handler."""
         headers = headers or {}
@@ -1413,7 +1585,7 @@ class CockpitServer:
             if not self._check_token_rate_limit(exposure_path, token, exposure):
                 self._respond_cors_error(writer, 429, "Too Many Requests")
                 return
-            await self._handle_exposure_execute(writer, body, exposure)
+            await self._handle_exposure_execute(writer, body, exposure, headers)
         elif action == "status" and method == "GET":
             token = self._check_exposure_auth(exposure, headers)
             if token is None:
@@ -1698,7 +1870,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
             "fields": exposed,
         })
 
-    async def _handle_exposure_execute(self, writer, body, exposure):
+    async def _handle_exposure_execute(self, writer, body, exposure, headers=None):
         """POST /s/{path}/execute — Validate, merge presets, execute."""
         if len(body) > 65536:
             self._respond_cors_error(writer, 413, "Request Too Large")
@@ -1714,6 +1886,93 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
             self._respond_cors_error(writer, 400, "Invalid input")
             return
 
+        headers = headers or {}
+        payment_mode = exposure.get("payment", "none")
+        x402_payment = None
+        if payment_mode != "none":
+            payment_sig = headers.get("payment-signature", "")
+            chain_cfg = self._node._chain
+            expected_amount = exposure.get("payment_amount") or exposure.get("price") or 0
+            expected_asset = exposure.get("payment_asset") or chain_cfg.get("token_mint", "")
+            expected_dest = exposure.get("payment_address", "")
+            node_address = self._node._wallet
+            # Fail closed: reject if asset or destination not configured
+            if not expected_asset or not expected_dest:
+                logger.error(f"x402 config incomplete: asset={expected_asset!r} dest={expected_dest!r}")
+                self._respond_cors_error(writer, 500, "Payment configuration incomplete: payment_asset and payment_address required")
+                return
+            if not payment_sig:
+                try:
+                    from ..commerce.x402 import build_payment_required
+
+                    pr = build_payment_required(chain_cfg, exposure, node_address)
+                except Exception as exc:
+                    logger.error(f"x402 build failed: {type(exc).__name__}: {exc}")
+                    self._respond_cors_error(writer, 500, "Payment configuration invalid")
+                    return
+                self._respond_cors(
+                    writer,
+                    "402 Payment Required",
+                    "application/json",
+                    json.dumps(pr).encode("utf-8"),
+                )
+                return
+            try:
+                import base64 as _b64, hashlib as _hl
+                from ..commerce.x402 import verify_x402_payload, settle_x402
+
+                # Persistent replay check — survives restarts, no TTL gap
+                try:
+                    _raw = _b64.b64decode(payment_sig, validate=True)
+                    _digest = _hl.sha256(_raw).hexdigest()
+                except Exception:
+                    self._respond_cors_error(writer, 403, "payment-signature must be base64 transaction bytes")
+                    return
+                if self._node.storage.check_payment_receipt(_digest):
+                    self._respond_cors_error(writer, 403, "replay detected")
+                    return
+
+                verify_result = verify_x402_payload(
+                    payment_sig,
+                    expected_amount,
+                    expected_asset,
+                    expected_dest,
+                    node_address,
+                )
+                if not verify_result.get("verified"):
+                    self._respond_cors_error(writer, 403, verify_result.get("error", "Invalid payment"))
+                    return
+
+                settle_result = await settle_x402(
+                    verify_result["tx_bytes"],
+                    getattr(self._node, "_signing_key", None),
+                    chain_cfg.get("rpc_url", ""),
+                )
+                if not settle_result.get("success"):
+                    self._respond_cors_error(writer, 502, settle_result.get("error", "Payment settlement failed"))
+                    return
+                self._node.storage.store_payment_receipt(
+                    _digest,
+                    verify_result["amount"],
+                    verify_result["asset"],
+                    verify_result["destination"],
+                )
+                x402_payment = {
+                    "charged_amount": verify_result["amount"],
+                    "payer_node_id": str(
+                        data.get("payer_node_id")
+                        or data.get("peer_key")
+                        or data.get("peer_public_key")
+                        or ""
+                    ).strip(),
+                    "payment_receipt_id": _digest,
+                    "skill_name": str(exposure.get("skill", "") or ""),
+                }
+            except Exception as exc:
+                logger.error(f"x402 verify/settle failed: {type(exc).__name__}: {exc}")
+                self._respond_cors_error(writer, 502, "Payment verification failed")
+                return
+
         fields = exposure.get("fields", {})
         presets = exposure.get("presets", {})
 
@@ -1721,6 +1980,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
         allowed_keys = set(fields.keys())
         extra = set(data.keys()) - allowed_keys
         if extra:
+            self._issue_x402_refund(x402_payment)
             self._respond_cors_error(writer, 400, f"Unknown fields: {', '.join(sorted(extra))}")
             return
 
@@ -1728,6 +1988,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
         for field_name, field_cfg in fields.items():
             if isinstance(field_cfg, dict) and field_cfg.get("required", False):
                 if field_name not in data or data[field_name] == "":
+                    self._issue_x402_refund(x402_payment)
                     self._respond_cors_error(writer, 400, f"Missing required field: {field_name}")
                     return
 
@@ -1763,12 +2024,14 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
                     }).encode("utf-8"))
                 else:
                     reason = getattr(result, "reason", "") or result.status
+                    self._issue_x402_refund(x402_payment)
                     self._respond_cors(writer, "409 Conflict", "application/json", json.dumps({
                         "status": "failed",
                         "error": {"code": "TASK_REJECTED", "message": f"Task rejected: {reason}"}
                     }).encode("utf-8"))
             except Exception as e:
                 logger.error(f"Exposure local async execute failed: {type(e).__name__}: {e}")
+                self._issue_x402_refund(x402_payment)
                 self._respond_cors_json(writer, {
                     "status": "failed",
                     "error": {"code": "HANDLER_ERROR", "message": "Task submission failed"}
@@ -1803,6 +2066,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
                     break
             if not provider:
                 if strict:
+                    self._issue_x402_refund(x402_payment)
                     self._respond_cors_error(writer, 404,
                         f"No provider found in jurisdiction '{target_j}'")
                     return
@@ -1814,6 +2078,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
                 provider = candidates[0]
 
         if not provider:
+            self._issue_x402_refund(x402_payment)
             self._respond_cors_error(writer, 404, "No provider found")
             return
 
@@ -1848,12 +2113,14 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
                 }).encode("utf-8"))
             else:
                 reason = getattr(result, "reason", "") or result.status
+                self._issue_x402_refund(x402_payment)
                 self._respond_cors(writer, "409 Conflict", "application/json", json.dumps({
                     "status": "failed",
                     "error": {"code": "TASK_REJECTED", "message": f"Task rejected: {reason}"}
                 }).encode("utf-8"))
         except Exception as e:
             logger.error(f"Exposure async execute failed: {type(e).__name__}: {e}")
+            self._issue_x402_refund(x402_payment)
             self._respond_cors_json(writer, {
                 "status": "failed",
                 "error": {"code": "EXECUTION_ERROR", "message": "Task submission failed"}
@@ -1883,7 +2150,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
             self._respond_cors_error(writer, 404, "Job not found")
             return
         
-        # 410 Gone for expired jobs
+        # Elder review: 410 Gone for expired jobs
         if job["status"] == "expired":
             self._respond_cors(writer, "410 Gone", "application/json", json.dumps({
                 "status": "expired",
@@ -2167,6 +2434,70 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
         if hasattr(engine, 'refresh'):
             engine.refresh(group_name)
         self._respond_json(writer, {"status": "ok"})
+
+    def _handle_logs(self, writer, query: dict):
+        """GET /api/logs?limit=100 — return recent in-memory logs."""
+        try:
+            limit = int(query.get("limit", ["100"])[0])
+        except Exception:
+            limit = 100
+        limit = max(1, min(limit, 1000))
+        logs = self._log_handler.tail(limit)
+        self._respond_json(writer, {"logs": logs, "count": len(logs)})
+
+    async def _handle_settlement_execute(self, writer, body: bytes):
+        """POST /api/settlements/execute — execute a countersigned settlement."""
+        try:
+            data = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            self._respond_error(writer, 400, "Invalid JSON")
+            return
+
+        peer_key = str(data.get("peer_key", "")).strip()
+        prepared_doc = data.get("prepared_doc")
+        countersigned_doc = data.get("countersigned_doc")
+        if len(peer_key) != 64 or any(c not in "0123456789abcdefABCDEF" for c in peer_key):
+            self._respond_error(writer, 400, "Invalid peer_key")
+            return
+        if not isinstance(prepared_doc, dict) or not isinstance(countersigned_doc, dict):
+            self._respond_error(writer, 400, "prepared_doc and countersigned_doc are required")
+            return
+
+        try:
+            from ..commerce.settlement_execution import execute_settlement
+
+            authority_vm = str(countersigned_doc.get("proof", {}).get("verificationMethod", ""))
+            authority_signing_key = getattr(self._node, "_cockpit_signing_key", None)
+            if authority_vm.endswith("#thrall-1"):
+                authority_signing_key = getattr(self._node, "_thrall_signing_key", authority_signing_key)
+            authority_verify_key = (
+                authority_signing_key.verify_key
+                if authority_signing_key is not None
+                else self._node._signing_key.verify_key
+            )
+
+            receipt_id = await execute_settlement(
+                prepared_doc=prepared_doc,
+                countersigned_doc=countersigned_doc,
+                node_verify_key=self._node._signing_key.verify_key,
+                authority_verify_key=authority_verify_key,
+                node_id=self._node.node_info.node_id,
+                signing_key=self._node._signing_key,
+                peer_key=peer_key,
+                storage=self._node.storage,
+                send_mail_fn=self._node._sync.enqueue,
+                bus=getattr(self._node, "bus", None),
+                config=self._node._config,
+            )
+        except ValueError as exc:
+            self._respond_error(writer, 400, str(exc))
+            return
+        except Exception as exc:
+            logger.error(f"Settlement execute failed: {type(exc).__name__}: {exc}")
+            self._respond_error(writer, 500, "Settlement execution failed")
+            return
+
+        self._respond_json(writer, {"status": "ok", "receipt_id": receipt_id})
 
     async def _handle_receipt_fetch(self, writer, reference: str):
         """GET /api/receipts/{reference} — fetch signed credit note by job_id.

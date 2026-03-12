@@ -115,6 +115,13 @@ class LedgerEntry:
     tasks_consumed: int = 0
     first_seen: float = 0.0
     last_updated: float = 0.0
+    prepaid: float = 0.0
+    pub_tab: float = 0.0
+    soft_limit: float = 0.0
+    hard_limit: float = 0.0
+    held_balance: float = 0.0
+    credit_limit: float = 0.0
+    trust: float = 0.0
 
 @dataclass(frozen=True)
 class Policy:

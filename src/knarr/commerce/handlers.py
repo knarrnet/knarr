@@ -53,10 +53,12 @@ def make_commerce_handlers(node) -> dict:
         if body["status"] == "rejected" and body.get("refund_requested"):
             original = node.storage.get_execution_log_entry(task_id)
             if original and original.get("price"):
+                token_symbol = getattr(node, "_token_symbol", "KNARR")
                 credit_note = {
                     "type": "knarr/commerce/credit_note",
                     "references": {"task_id": task_id, "original_amount": original["price"]},
                     "amount": original["price"],
+                    "token": token_symbol,
                     "reason": "quality_rejection",
                     "initiated_by": "provider",
                     "timestamp": time.time(),
@@ -81,6 +83,7 @@ def make_commerce_handlers(node) -> dict:
             return
 
         amount = body["amount"]
+        token = body.get("token", "KNARR")
 
         # Inflation guard: require references.task_id and validate against local records
         refs = body.get("references", {})
@@ -94,9 +97,9 @@ def make_commerce_handlers(node) -> dict:
         if not original or not original.get("price"):
             logger.warning(f"Credit note rejected: no local execution record for task_id={task_id[:16]}")
             return
-        max_refund = original["price"] * 2  # 2x cap as safety margin
+        max_refund = original["price"]  # 1x cap — refund cannot exceed original price
         if amount > max_refund:
-            logger.warning(f"Credit note rejected: amount {amount} > 2x original {original['price']}")
+            logger.warning(f"Credit note rejected: amount {amount} > original {original['price']}")
             return
 
         from_node_id = item.get("from_node")
@@ -105,7 +108,7 @@ def make_commerce_handlers(node) -> dict:
         if target_pubkey:
             await node._enqueue_write(node.storage.update_ledger_refund, target_pubkey, amount)
             logger.info(f"CREDIT_NOTE task={body.get('references', {}).get('task_id', 'N/A')[:8]} "
-                        f"amount={amount} reason={body.get('reason')}")
+                        f"amount={amount} token={token} reason={body.get('reason')}")
         else:
             logger.warning(f"Could not resolve public_key for node_id {from_node_id[:16]} — credit note dropped")
 
@@ -128,7 +131,8 @@ def make_commerce_handlers(node) -> dict:
             1,  # priority
         )
         logger.info(f"SETTLE_REQUEST from={item.get('from_node', '?')[:16]} "
-                    f"balance={body['current_balance']} limit={body['credit_limit']}")
+                    f"balance={body['current_balance']} limit={body['credit_limit']} "
+                    f"token={body.get('token', 'KNARR')}")
 
     async def handle_settlement_confirmation(item: dict) -> None:
         """Process knarr/commerce/settlement_confirmation mail."""
@@ -149,7 +153,8 @@ def make_commerce_handlers(node) -> dict:
             0,  # priority
         )
         logger.info(f"SETTLEMENT_CONFIRM from={item.get('from_node', '?')[:16]} "
-                    f"tx={body['tx_hash'][:16]} amount={body['amount_settled']}")
+                    f"tx={body['tx_hash'][:16]} amount={body['amount_settled']} "
+                    f"token={body.get('token', 'KNARR')}")
 
     return {
         "knarr/commerce/receipt": handle_receipt,

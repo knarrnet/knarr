@@ -41,6 +41,7 @@ class TestCreditWarning:
         node = MagicMock(spec=DHTNode)
         node.bus = bus
         node._config = {"settlement": {"tab_reminder_threshold": 80.0}}
+        node._get_settlement_config = MagicMock(return_value={"tab_reminder_threshold": 80.0})
         node.storage = MagicMock()
         node.storage.should_send_tab_reminder.return_value = True
         node._sync = MagicMock()
@@ -79,6 +80,7 @@ class TestCreditRestored:
         node = MagicMock(spec=DHTNode)
         node.bus = bus
         node._config = {"settlement": {"tab_reminder_threshold": 80.0}}
+        node._get_settlement_config = MagicMock(return_value={"tab_reminder_threshold": 80.0})
 
         # Mock _resolve_policy to return (3.0, -10.0) -- credit range = 13
         node._resolve_policy = MagicMock(return_value=(3.0, -10.0))
@@ -99,6 +101,7 @@ class TestCreditRestored:
         node = MagicMock(spec=DHTNode)
         node.bus = bus
         node._config = {"settlement": {"tab_reminder_threshold": 80.0}}
+        node._get_settlement_config = MagicMock(return_value={"tab_reminder_threshold": 80.0})
         node._resolve_policy = MagicMock(return_value=(3.0, -10.0))
 
         # Both over threshold: old=-9.0 (92.3%), new=-8.5 (88.5%)
@@ -114,6 +117,7 @@ class TestCreditRestored:
         node = MagicMock(spec=DHTNode)
         node.bus = bus
         node._config = {"settlement": {"tab_reminder_threshold": 80.0}}
+        node._get_settlement_config = MagicMock(return_value={"tab_reminder_threshold": 80.0})
         node._resolve_policy = MagicMock(return_value=(3.0, -10.0))
 
         # Both under: old=-5.0 (61.5%), new=-4.0 (53.8%)
@@ -347,6 +351,7 @@ class TestCheckCreditRestoredIntegration:
         node = MagicMock(spec=DHTNode)
         node.bus = bus
         node._config = {"settlement": {"tab_reminder_threshold": 80.0}}
+        node._get_settlement_config = MagicMock(return_value={"tab_reminder_threshold": 80.0})
         node._resolve_policy = MagicMock(return_value=(3.0, -10.0))
         return node, bus
 

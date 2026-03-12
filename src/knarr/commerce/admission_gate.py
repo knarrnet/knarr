@@ -43,6 +43,8 @@ class AdmissionRequest:
     soft_limit: float = -5.0
     hard_limit: float = -10.0
     tit_for_tat: bool = False
+    meter_count: int = 0  # F1 - Current meter count for rate limiting
+    meter_max_count: int = 0  # F1 - Max allowed meter count (0 = no limit)
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,23 @@ def check_admission(req: AdmissionRequest) -> AdmissionDecision:
     Pure function: no side effects, no I/O. The caller handles
     bus events, receipts, and response construction.
     """
+    # F1: Rate limit check - if meter_max_count > 0 and meter_count >= meter_max_count, hard block
+    if req.meter_max_count > 0 and req.meter_count >= req.meter_max_count:
+        logger.debug(
+            f"ADMISSION_RATE_LIMIT caller={req.caller_key[:16]} "
+            f"skill={req.skill_name} meter_count={req.meter_count} "
+            f"max_count={req.meter_max_count}"
+        )
+        return AdmissionDecision(
+            outcome="hard_block",
+            effective_price=req.base_price,
+            reason=(
+                f"Rate limit exceeded: {req.meter_count} >= {req.meter_max_count} "
+                f"executions in current window"
+            ),
+            balance_after=req.balance,
+        )
+
     # Reject non-finite prices (NaN/Inf bypass all comparisons)
     if not math.isfinite(req.base_price):
         logger.warning(

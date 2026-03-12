@@ -1,0 +1,111 @@
+# Punchhole Exposure Schema — default template
+# Controls what this node discloses to external requesters.
+#
+# ACL shorthands:
+#   all_signed   — any node presenting a valid signature
+#   known_hosts  — nodes in address_book WHERE tier = 'explicit'
+#   peer         — nodes with bilateral ledger entries
+#   trusted      — nodes listed in trusted_nodes below
+#   [node_id, ...]  — explicit list (inline TOML array)
+#
+# Granularity controls (applied at build time):
+#   exact        — actual value
+#   range:N      — round DOWN to nearest N (never overstate)
+#   boolean      — reduce to true/false
+#   age          — time-since string ("4h ago"), not raw timestamp
+#   recent:N     — last N entries only
+#   list         — names/IDs only, strip internal fields
+#   hidden       — omit field entirely from output
+
+# Operator-configured trusted node list (for "trusted" ACL shorthand)
+trusted_nodes = []
+
+[objects."economy.summary"]
+access = "known_hosts"
+description = "Credit balance, settlement count, utilization"
+source = "bilateral_ledger"
+fields = ["credit_balance", "settlement_count", "utilization", "skills_count"]
+
+[objects."economy.summary".granularity]
+credit_balance  = "range:50"
+settlement_count = "exact"
+utilization     = "range:0.1"
+skills_count    = "exact"
+
+[objects."economy.bilateral"]
+access = "peer"
+description = "Bilateral position with requesting node"
+source = "bilateral_ledger"
+live_query = true
+fields = ["balance", "utilization", "limit", "prepaid_balance"]
+
+[objects."economy.bilateral".granularity]
+balance         = "exact"
+utilization     = "exact"
+limit           = "exact"
+prepaid_balance = "exact"
+
+[objects.skills]
+access = "all_signed"
+description = "Published skill catalog with pricing"
+source = "skill_registry"
+fields = ["skill_name", "price", "visibility"]
+
+[objects.skills.granularity]
+skill_name  = "list"
+price       = "exact"
+visibility  = "exact"
+
+[objects."schemas.skills"]
+access = "all_signed"
+description = "Input/output schemas for published skills"
+source = "skill_registry"
+fields = ["skill_name", "input_schema", "output_schema", "input_spec"]
+
+[objects."schemas.documents"]
+access = "all_signed"
+description = "Protocol document type definitions"
+source = "document_registry"
+fields = ["document_type", "required_fields", "prefix"]
+
+[objects."storefront.catalog"]
+access = "all_signed"
+description = "Published storefront exposure catalog"
+source = "exposure_config"
+fields = ["name", "skill", "path", "price", "payment", "payment_asset", "payment_network"]
+
+[objects."economy.full"]
+access = "private"
+description = "Local full economy summary for cockpit"
+source = "economy_full"
+fields = ["economy"]
+
+[objects."economy.full".granularity]
+economy = "exact"
+
+[objects."positions.full"]
+access = "private"
+description = "Full bilateral ledger positions for cockpit"
+source = "positions"
+fields = ["positions"]
+
+[objects."positions.full".granularity]
+positions = "exact"
+
+[objects."peers.status"]
+access = "private"
+description = "Local peer status snapshot for cockpit"
+source = "peers"
+fields = ["peers"]
+
+[objects."peers.status".granularity]
+peers = "exact"
+
+[objects."skills.inventory"]
+access = "private"
+description = "Full local skill inventory for cockpit"
+source = "skill_inventory"
+fields = ["skills"]
+
+[objects."skills.inventory".granularity]
+skills = "exact"

@@ -1,6 +1,6 @@
 [project]
 name = "knarr"
-version = "0.35.0"
+version = "0.43.0"
 description = "Peer-to-peer exchange protocol for autonomous agents"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -25,6 +25,7 @@ upnp = [
 [tool.setuptools.package-data]
 "knarr.dashboard" = ["*.html", "*.js", "*.css"]
 "knarr.migrations" = ["*.sql"]
+"*" = ["plugin.toml", "exposure_schema.toml"]
 
 [build-system]
 requires = ["setuptools>=68.0"]

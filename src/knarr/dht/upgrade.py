@@ -40,7 +40,7 @@ def get_latest_version() -> Optional[str]:
         return None
 
 
-def backup_config(config_dir: str, current_version: str) -> Optional[str]:
+def backup_config(config_dir: str, current_version: str, data_dir: Optional[str] = None) -> Optional[str]:
     """Backup identity + config files before upgrade."""
     if not config_dir:
         return None
@@ -48,14 +48,25 @@ def backup_config(config_dir: str, current_version: str) -> Optional[str]:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     backup_name = f"backup-v{current_version}-{timestamp}"
     backup_path = os.path.join(config_dir, backup_name)
+    data_source = data_dir or config_dir
     
     try:
         os.makedirs(backup_path, exist_ok=True)
-        files_to_backup = ["knarr.toml", "node_key.seed", "cert.pem", "key.pem", "node.db"]
+        files_to_backup = [
+            "knarr.toml",
+            "node_key.seed",
+            "cert.pem",
+            "key.pem",
+            "cockpit-cert.pem",
+            "cockpit-key.pem",
+            ".cockpit_token",
+            "secrets.toml",
+            "node.db",
+        ]
         backed_up = []
 
         # Checkpoint WAL before backup so node.db is self-contained
-        db_path = os.path.join(config_dir, "node.db")
+        db_path = os.path.join(data_source, "node.db")
         if os.path.exists(db_path):
             try:
                 import sqlite3
@@ -66,7 +77,8 @@ def backup_config(config_dir: str, current_version: str) -> Optional[str]:
                 pass  # best-effort — backup proceeds regardless
 
         for filename in files_to_backup:
-            src = os.path.join(config_dir, filename)
+            src_root = config_dir if filename == "knarr.toml" else data_source
+            src = os.path.join(src_root, filename)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(backup_path, filename))
                 backed_up.append(filename)
@@ -103,7 +115,7 @@ def verify_installation(target_version: str) -> bool:
     return False
 
 
-def rollback_installation(backup_dir: str, config_dir: str) -> bool:
+def rollback_installation(backup_dir: str, config_dir: str, data_dir: Optional[str] = None) -> bool:
     """Restore config files from backup directory."""
     if not backup_dir or not os.path.exists(backup_dir):
         return False
@@ -113,7 +125,9 @@ def rollback_installation(backup_dir: str, config_dir: str) -> bool:
         for filename in os.listdir(backup_dir):
             src = os.path.join(backup_dir, filename)
             if os.path.isfile(src):
-                shutil.copy2(src, os.path.join(config_dir, filename))
+                dest_root = config_dir if filename == "knarr.toml" else (data_dir or config_dir)
+                os.makedirs(dest_root, exist_ok=True)
+                shutil.copy2(src, os.path.join(dest_root, filename))
                 restored.append(filename)
         
         if restored:

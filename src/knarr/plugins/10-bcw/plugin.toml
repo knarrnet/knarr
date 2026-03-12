@@ -1,0 +1,22 @@
+name = "blockchain-watcher"
+version = "0.37.0"
+handler = "handler:BCWPlugin"
+description = "On-chain payment detection and receipt generation (Solana poll-only)"
+
+[plugin]
+name = "blockchain-watcher"
+version = "0.37.0"
+description = "On-chain payment detection and receipt generation (Solana poll-only)"
+handler = "handler:BCWPlugin"
+
+[config]
+enabled = true
+poll_interval_seconds = 10
+
+[[config.chains]]
+chain_id = "solana-mainnet"
+rpc_url = "https://api.mainnet-beta.solana.com"
+tokens = ["KNARR"]
+token_mints = { KNARR = "KNRRmint111111111111111111111111111111111111" }
+commitment = "finalized"
+min_amount_lamports = 10000

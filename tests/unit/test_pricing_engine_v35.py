@@ -36,12 +36,12 @@ class TestNoDiscounts:
         result = resolve_price(req, PricingConfig(min_price=0.0))
         assert result.final_price == 0.0
 
-    def test_zero_price_hits_default_floor(self):
-        """Without explicit min_price=0, default floor (0.01) applies."""
+    def test_zero_price_stays_free(self):
+        """v0.39.0: base_price=0.0 is intentional free skill — bypasses floor."""
         req = PricingRequest(base_price=0.0, skill_name="ping", peer_node_id="a" * 64)
         result = resolve_price(req, PricingConfig())
-        assert result.final_price == 0.01
-        assert result.floor_applied is True
+        assert result.final_price == 0.0
+        assert result.floor_applied is False
 
 
 class TestMultiplicativeMode:

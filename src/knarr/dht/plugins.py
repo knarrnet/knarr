@@ -82,6 +82,33 @@ class PluginHooks:
         """
         pass
 
+    # v0.36.0: Settlement hooks
+    async def on_settlement_review(self, prepared_tx: dict) -> Optional[dict]:
+        """Called when node has prepared a settlement for authority review.
+
+        prepared_tx is a signed Document (settlement_prepared, signed by #key-1).
+
+        Return countersigned Document to approve (call ctx.sign_document on it).
+        Return None to reject (settlement skipped this cycle).
+
+        Default: auto-approve (hotwire) — returns prepared_tx unchanged.
+        This means unsigned settlements in the degenerate case.
+        """
+        return prepared_tx
+
+    async def on_inbound_settlement(self, settle_request: dict) -> bool:
+        """Called when counterparty's settle_request arrives and passes validation.
+
+        settle_request contains: dual-signed settlement proposal, positions, amount.
+        Node has already validated both signatures and run sanity check.
+
+        Return True to accept (zero ledger, send confirmation).
+        Return False to reject (send rejection with reason).
+
+        Default: accept.
+        """
+        return True
+
 
 @dataclasses.dataclass
 class PluginContext:
@@ -93,6 +120,7 @@ class PluginContext:
     send_fire_forget: Callable[[NodeInfo, Message], Any]
     delivery_cb: Optional[Callable[[Message, str], Any]]
     log: logging.Logger
+    state_dir: Optional[Path] = None
     group_engine: Optional[Any] = None      # GroupEngine instance, set after engine init
     storage_path: Optional[str] = None      # Path to node.db for read-only queries
     register_mail_handler: Optional[Callable] = None
@@ -106,14 +134,17 @@ class PluginContext:
     bus: Optional[Any] = None                     # v0.33.0: EventBus reference
     sign_document: Optional[Callable] = None      # v0.35.0: sign dict per eddsa-jcs-2022
     query_receipts: Optional[Callable] = None     # v0.35.0: query receipt_log with filters
+    query_prepaid_balance: Optional[Callable] = None  # v0.36.0: (peer_key) -> float
+    economy_config: Optional[dict] = None         # v0.42.0: global [economy] config section
 
 
 class PluginLoader:
     """
     Discovers, loads, and manages Knarr plugins from the specified plugin directories.
     """
-    def __init__(self, config_dir: Path, get_peers_cb: Callable, send_to_peer_cb: Callable, node_id: str, delivery_cb: Optional[Callable] = None, send_fire_forget_cb: Optional[Callable] = None, register_mail_handler_cb: Optional[Callable] = None, send_mail_cb: Optional[Callable] = None, register_egress_material_cb: Optional[Callable] = None, vault_get_cb: Optional[Callable] = None, vault_set_cb: Optional[Callable] = None, storage_path: Optional[str] = None, update_cache_cb: Optional[Callable] = None, subscribe_events_cb: Optional[Callable] = None, emit_event_cb: Optional[Callable] = None, bus: Optional[Any] = None):
+    def __init__(self, config_dir: Path, get_peers_cb: Callable, send_to_peer_cb: Callable, node_id: str, delivery_cb: Optional[Callable] = None, send_fire_forget_cb: Optional[Callable] = None, register_mail_handler_cb: Optional[Callable] = None, send_mail_cb: Optional[Callable] = None, register_egress_material_cb: Optional[Callable] = None, vault_get_cb: Optional[Callable] = None, vault_set_cb: Optional[Callable] = None, storage_path: Optional[str] = None, update_cache_cb: Optional[Callable] = None, subscribe_events_cb: Optional[Callable] = None, emit_event_cb: Optional[Callable] = None, bus: Optional[Any] = None, data_dir: Optional[Path] = None):
         self._plugin_root = config_dir / "plugins"
+        self._state_root = data_dir / "plugin_state" if data_dir else None
         self._get_peers_cb = get_peers_cb
         self._send_to_peer_cb = send_to_peer_cb
         self._send_fire_forget_cb = send_fire_forget_cb
@@ -167,6 +198,23 @@ class PluginLoader:
                 path_entry = str(plugin_path)
                 sys.path.insert(0, path_entry)
 
+                # V035-001: Pre-load sibling .py files with namespaced keys in
+                # sys.modules so that `from X import Y` inside handler code
+                # resolves to THIS plugin's copy, not a previously-loaded one.
+                _sibling_names = {f.stem for f in plugin_path.glob("*.py")}
+                _stashed_mods = {}
+                for _sn in _sibling_names:
+                    if _sn in sys.modules:
+                        _stashed_mods[_sn] = sys.modules.pop(_sn)
+                    # Pre-load this plugin's sibling module into sys.modules
+                    _sib_file = plugin_path / f"{_sn}.py"
+                    if _sib_file.is_file():
+                        _sib_spec = importlib.util.spec_from_file_location(_sn, str(_sib_file))
+                        if _sib_spec and _sib_spec.loader:
+                            _sib_mod = importlib.util.module_from_spec(_sib_spec)
+                            _sib_spec.loader.exec_module(_sib_mod)
+                            sys.modules[_sn] = _sib_mod
+
                 try:
                     spec = importlib.util.spec_from_file_location(module_name, handler_file)
                     if spec is None:
@@ -179,10 +227,15 @@ class PluginLoader:
                         raise TypeError(f"Plugin {class_name} in {module_name} must inherit from PluginHooks.")
 
                     plugin_logger = logging.getLogger(f"knarr.plugin.{plugin_config['name']}")
+                    state_dir = plugin_path
+                    if self._state_root is not None:
+                        state_dir = self._state_root / plugin_path.name
+                        state_dir.mkdir(parents=True, exist_ok=True)
 
                     plugin_context = PluginContext(
                         node_id=self._node_id,
                         plugin_dir=plugin_path,
+                        state_dir=state_dir,
                         get_peers=self._get_peers_cb,
                         send_to_peer=self._send_to_peer_cb,
                         send_fire_forget=self._send_fire_forget_cb or self._send_to_peer_cb,
@@ -207,6 +260,10 @@ class PluginLoader:
                 except (ImportError, AttributeError, TypeError) as e:
                     log.warning(f"Failed to load handler for {plugin_path.name}: {e}")
                 finally:
+                    # V035-001: Remove bare-named modules loaded during this plugin
+                    for _n in _sibling_names:
+                        sys.modules.pop(_n, None)
+                    sys.modules.update(_stashed_mods)
                     # V015-009: Remove by value, not position
                     try:
                         sys.path.remove(path_entry)
@@ -287,6 +344,30 @@ class PluginLoader:
             self._safe_run_plugin_hook(plugin.on_shutdown)
             for plugin in self.plugins
         ])
+
+    # v0.36.0: Settlement hook delegation
+    async def on_settlement_review(self, prepared_tx: dict) -> Optional[dict]:
+        """First plugin that returns non-None wins. If all return None, settlement rejected."""
+        for plugin in self.plugins:
+            try:
+                result = await plugin.on_settlement_review(prepared_tx)
+                if result is not None:
+                    return result
+            except Exception as e:
+                log.error(f"Plugin {plugin.__class__.__name__} failed in on_settlement_review: {e}")
+                return None  # fail-closed
+        return prepared_tx  # no plugin modified → auto-approve (hotwire)
+
+    async def on_inbound_settlement(self, settle_request: dict) -> bool:
+        """All plugins must agree. Any False → reject."""
+        for plugin in self.plugins:
+            try:
+                if not await plugin.on_inbound_settlement(settle_request):
+                    return False
+            except Exception as e:
+                log.error(f"Plugin {plugin.__class__.__name__} failed in on_inbound_settlement: {e}")
+                return False  # fail-closed
+        return True
 
     async def _safe_run_plugin_hook(self, hook_method: Callable, *args, **kwargs):
         """Helper to run plugin hooks, catching exceptions to prevent crashing the node."""
