@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Set, Callable
-from nacl.signing import SigningKey
+from nacl.signing import SigningKey, VerifyKey
 
 from .. import __version__
 from ..core.models import NodeInfo, SkillSheet, Task, Policy, GroupPolicy, SkillPolicy
@@ -100,6 +100,10 @@ class DHTNode:
         self._egress = EgressFilter()
 
         self._vault: Optional['KeyringVault'] = None  # Set in _load_or_generate_node_id
+        # C2: secrets managed by SecretsManager (must be created before _load_or_generate_node_id)
+        from .secrets import SecretsManager
+        self._secrets_mgr = SecretsManager()
+        self._secrets: Dict[str, Dict[str, str]] = {}  # skill_name -> {key: value}
         node_id = self._load_or_generate_node_id()
         self._init_encryption()
 
@@ -159,7 +163,7 @@ class DHTNode:
 
         self._mcp_bridges: List[Any] = []
         self._active_connections: int = 0  # SA-02: accept-level connection tracking
-        self._secrets: Dict[str, Dict[str, str]] = {}  # skill_name -> {key: value}
+        # C2: _secrets_mgr created earlier (before _load_or_generate_node_id)
         self._upgrading: bool = False
         self._restart_requested: bool = False
         self._shutdown_event: Optional[asyncio.Event] = None  # set by main.py for clean upgrade restart
@@ -181,7 +185,20 @@ class DHTNode:
 
         # v0.17.0: Mail v2 Sync Engine (before plugins so mail callbacks are available)
         from ..mail.sync import SyncEngine
+        from .mail_handlers import MailHandlers
         self._sync = SyncEngine(self, plugins=None)  # plugins wired after PluginLoader init
+        self._mail_handlers = MailHandlers(self.storage, None, self._asset_dir, self._sidecar)
+        self._mail_handlers.bind_runtime(
+            enqueue_write=self._enqueue_write,
+            get_initial_trust=self._get_initial_trust,
+            check_credit_restored=self._check_credit_restored,
+            store_asset_cb=self.store_asset,
+            signing_key=self._signing_key,
+            public_key_hex=self._public_key_hex,
+            initial_credit=self.policy.initial_credit,
+            debug=bool(self._config.get("mail", {}).get("debug", False)),
+            handler_pool=self._handler_pool,
+        )
 
         # Register core realms
         self.register_meta_realm("node", RealmConfig(
@@ -208,10 +225,10 @@ class DHTNode:
                 "tags": getattr(sheet, 'tags', []),
                 "version": getattr(sheet, 'version', ''),
             })
-        self._sync.register_handler("knarr/system/task_result", self._handle_task_result_mail)
-        self._sync.register_handler("knarr/system/task_failed", self._handle_task_failed_mail)
-        self._sync.register_handler("knarr/system/asset_fetch", self._handle_asset_fetch_mail)
-        self._sync.register_handler("knarr/system/asset_ready", self._handle_asset_ready_mail)
+        self._sync.register_handler("knarr/system/task_result", self._mail_handlers._handle_task_result_mail)
+        self._sync.register_handler("knarr/system/task_failed", self._mail_handlers._handle_task_failed_mail)
+        self._sync.register_handler("knarr/system/asset_fetch", self._mail_handlers._handle_asset_fetch_mail)
+        self._sync.register_handler("knarr/system/asset_ready", self._mail_handlers._handle_asset_ready_mail)
 
         # v0.25.0 Commerce handlers (async closures via factory)
         from ..commerce.handlers import make_commerce_handlers
@@ -224,6 +241,7 @@ class DHTNode:
         _bus_debug = bool(self._config.get("node", {}).get("event_bus_debug", False))
         _bus_size = int(self._config.get("node", {}).get("event_bus_size", 256))
         self.bus = EventBus(size=_bus_size, debug=_bus_debug)
+        self._mail_handlers.bind_runtime(bus=self.bus)
 
         # V015: Plugin system
         config_dir = Path(self._config.get("_config_dir", os.getcwd()))
@@ -541,6 +559,7 @@ class DHTNode:
             input_data["_caller_node_id"] = caller_node_id
             input_data["_node_encrypt"] = self.encrypt_for_peer
             input_data["_node_decrypt"] = self.decrypt_from_peer
+            input_data["_send_mail"] = self._sync.enqueue
 
             # Compute input hash for log
             canonical = json.dumps(msg.input_data, sort_keys=True, separators=(',', ':'))
@@ -1005,7 +1024,9 @@ class DHTNode:
         os.makedirs(data_dir, exist_ok=True)
         vault_path = os.path.join(data_dir, "vault.db")
         self._vault = KeyringVault(vault_path, key_bytes)
-        
+        # C2: wire vault into SecretsManager
+        self._secrets_mgr.set_vault(self._vault)
+
         verify_key = self._signing_key.verify_key
         self._public_key_hex = verify_key.encode().hex()
 
@@ -1420,6 +1441,11 @@ class DHTNode:
             )
             await self._sidecar.start()
             self._sidecar_port = self._sidecar.port
+        self._mail_handlers.bind_runtime(
+            asset_dir=self._asset_dir,
+            sidecar=self._sidecar,
+            signing_key=self._signing_key,
+        )
 
         self._running = True
         self._start_time = time.monotonic()
@@ -2140,6 +2166,7 @@ class DHTNode:
         input_data["_caller_node_id"] = self.node_info.node_id
         input_data["_node_encrypt"] = self.encrypt_for_peer
         input_data["_node_decrypt"] = self.decrypt_from_peer
+        input_data["_send_mail"] = self._sync.enqueue
 
         # H22: Task Recording (strip non-serializable hooks for storage)
         task = Task(
@@ -3526,285 +3553,51 @@ class DHTNode:
         await self._process_message(msg, peer_ip=peer_ip)
 
     # Per-skill secret store
+    # Per-skill secret store — C2: delegated to SecretsManager in dht/secrets.py
+
     def load_secrets(self, secrets_path: str = ""):
-        """Load per-skill secrets from vault. Auto-migrates from secrets.toml on first run."""
-        self._secrets = {}
-
-        if not self._vault:
-            return
-
-        # Auto-migrate from secrets.toml (idempotent — uses upsert, safe to re-run)
-        if secrets_path and os.path.exists(secrets_path):
-            try:
-                count = self._vault.migrate_from_toml(secrets_path)
-                if count > 0:
-                    logger.info(f"Migrated {count} secret(s) from secrets.toml to vault")
-            except Exception as e:
-                logger.error(f"Failed to migrate secrets.toml: {e}")
-            else:
-                # Only rename after successful migration (separate from try block)
-                try:
-                    migrated_path = secrets_path + ".migrated"
-                    os.rename(secrets_path, migrated_path)
-                except OSError as e:
-                    logger.warning(f"Could not rename secrets.toml after migration: {e} — plaintext file persists")
-
-        # Load all secrets from vault into memory
-        for scope in self._vault.list_scopes():
-            self._secrets[scope] = self._vault.get_all(scope)
-        if self._secrets:
-            logger.info(f"Loaded secrets for {len(self._secrets)} skill(s) from vault")
+        """Load per-skill secrets from vault. Delegates to SecretsManager."""
+        self._secrets_mgr.load(secrets_path)
+        # Keep _secrets dict in sync for any direct access
+        self._secrets = self._secrets_mgr._secrets
 
     def _inject_secrets(self, skill_name: str, input_data: dict) -> dict:
-        """Inject per-skill secrets into input_data. Caller values take precedence."""
-        secrets = self._secrets.get(skill_name.lower())
-        if not secrets:
-            return input_data
-        merged = dict(input_data)
-        for k, v in secrets.items():
-            if k not in merged:
-                merged[k] = v
-        return merged
+        """Inject per-skill secrets into input_data. Delegates to SecretsManager."""
+        return self._secrets_mgr.inject(skill_name, input_data)
 
     def get_secrets_summary(self) -> Dict[str, Any]:
         """Returns per-skill secret status for cockpit (values masked)."""
-        result = {}
-        for skill_name, secrets in self._secrets.items():
-            result[skill_name] = {
-                k: {"filled": bool(v), "masked": f"***({len(v)} chars)" if v else "***"}
-                for k, v in secrets.items()
-            }
-        return result
+        return self._secrets_mgr.get_summary()
 
     def set_secret(self, skill_name: str, key: str, value: str):
         """Set a secret value and persist to vault."""
-        skill_name = skill_name.lower()
-        if skill_name not in self._secrets:
-            self._secrets[skill_name] = {}
-        self._secrets[skill_name][key] = value
-        if self._vault:
-            self._vault.set(skill_name, key, value)
+        self._secrets_mgr.set_secret(skill_name, key, value)
+        # Keep _secrets dict in sync
+        self._secrets = self._secrets_mgr._secrets
 
     def delete_secret(self, skill_name: str, key: str):
         """Delete a secret value from vault."""
-        skill_name = skill_name.lower()
-        if skill_name in self._secrets and key in self._secrets[skill_name]:
-            del self._secrets[skill_name][key]
-            if not self._secrets[skill_name]:
-                del self._secrets[skill_name]
-        if self._vault:
-            self._vault.delete(skill_name, key)
+        self._secrets_mgr.delete_secret(skill_name, key)
+        # Keep _secrets dict in sync
+        self._secrets = self._secrets_mgr._secrets
 
-    # System Mail Handlers (v0.17.0)
+    # System Mail Handlers (v0.17.0) — moved to dht/mail_handlers.py (v0.43.0 C1)
+    # Handlers are registered via self._mail_handlers in __init__.
 
     async def _handle_task_result_mail(self, item: dict):
-        """Handle knarr/system/task_result — update async_jobs table."""
-        body = item.get("body", {})
-        job_id = body.get("job_id")
-        if not job_id:
-            return
-        # SA-ML4: Don't accept system mail results for jobs we manage as provider.
-        # Provider updates jobs locally via the worker path — system mail is for consumer side only.
-        job = self.storage.get_async_job(job_id)
-        if not job:
-            return
-        if not job.get("provider_node_id"):
-            logger.debug(f"Ignoring system task_result for local job {job_id[:8]} — provider manages directly")
-            return
-        # V21-004: Verify sender matches the tracked provider — prevent status spoofing
-        sender = item.get("from_node", "")
-        if sender != job["provider_node_id"]:
-            logger.warning(f"SYSTEM_MAIL_REJECT job={job_id[:8]} sender={sender[:16]} expected={job['provider_node_id'][:16]}")
-            return
-        # Receipt replay guard: only process results for pending/queued jobs
-        if job.get("status") in ("completed", "failed"):
-            logger.debug(f"Ignoring duplicate result for already-settled job {job_id[:8]}")
-            return
-        await self._enqueue_write(self.storage.update_async_job_status,
-                                   job_id, "completed", body.get("output_data"))
-        # v0.23.0: Store receipt on consumer side for settlement verification
-        receipt = body.get("receipt")
-        if receipt:
-            receipt_json = json.dumps(receipt) if isinstance(receipt, dict) else receipt
-            await self._enqueue_write(self.storage.store_receipt, job_id, receipt_json)
-
-        # v0.32.0: Credit note handling on consumer side.
-        # Prefer new credit_note field (v0.32.0+); fall back to parsing old receipt (v0.31.x peers).
-        credit_note_raw = body.get("credit_note")
-        provider_pubkey = job.get("provider_public_key", "")
-        credits_charged = 0.0
-        if credit_note_raw:
-            # New format: full signed credit note JSON
-            try:
-                cn = json.loads(credit_note_raw) if isinstance(credit_note_raw, str) else credit_note_raw
-                cn_json = json.dumps(cn) if isinstance(cn, dict) else credit_note_raw
-
-                # C-1/C-2: Verify signature + issuer identity before trusting amount
-                from knarr.commerce.receipts import verify_credit_note
-                if not verify_credit_note(cn_json):
-                    logger.warning(f"CREDIT_NOTE_SIG_FAIL job={job_id[:8]}: signature verification failed")
-                    # v0.33.0: security.receipt_forgery
-                    if self.bus:
-                        self.bus.emit("security.receipt_forgery", job_id=job_id, issuer=cn.get("issuer", "")[:16], reason="signature_invalid", identity=provider_pubkey or self._public_key_hex)
-                    credits_charged = 0.0
-                elif provider_pubkey and cn.get("issuer") != provider_pubkey:
-                    logger.warning(f"CREDIT_NOTE_ISSUER_MISMATCH job={job_id[:8]}: "
-                                   f"expected={provider_pubkey[:16]} got={cn.get('issuer', '?')[:16]}")
-                    # v0.33.0: security.receipt_forgery
-                    if self.bus:
-                        self.bus.emit("security.receipt_forgery", job_id=job_id, issuer=cn.get("issuer", "")[:16], reason="issuer_mismatch", identity=provider_pubkey or self._public_key_hex)
-                    credits_charged = 0.0
-                else:
-                    credits_charged = float(cn.get("amount", 0.0))
-                    if not provider_pubkey:
-                        provider_pubkey = cn.get("issuer", "")
-                    # Store consumer's copy (receipt before bus)
-                    await self._enqueue_write(
-                        self.storage.store_credit_note,
-                        provider_pubkey, job_id, cn_json
-                    )
-                    # E3: receipt.received fires AFTER storage
-                    if self.bus:
-                        self.bus.emit(
-                            "receipt.received",
-                            note_type=cn.get("note_type", "debit"),
-                            counterparty=provider_pubkey,
-                            amount=credits_charged,
-                            reference=job_id,
-                            identity=provider_pubkey,
-                        )
-            except Exception as _cn_err:
-                logger.warning(f"CREDIT_NOTE_RECV_FAIL job={job_id[:8]}: {_cn_err}")
-                credits_charged = 0.0  # M-2: don't fall back on parse error
-        elif receipt:
-            # Old format fallback (v0.31.x peer): parse credits from legacy receipt
-            try:
-                receipt_parsed = json.loads(receipt) if isinstance(receipt, str) else receipt
-                receipt_payload = receipt_parsed.get("data") or receipt_parsed.get("payload", {})
-                if isinstance(receipt_payload, str):
-                    receipt_payload = json.loads(receipt_payload)
-                if isinstance(receipt_payload, dict):
-                    credits_charged = float(receipt_payload.get("credits_charged", 0.0))
-            except Exception:
-                pass
-
-        # Consumer-side ledger update (applies regardless of credit_note format)
-        if credits_charged > 0 and math.isfinite(credits_charged) and credits_charged <= 1_000_000:
-            if provider_pubkey:
-                try:
-                    _nid = hashlib.sha256(bytes.fromhex(provider_pubkey)).hexdigest()
-                    _trust = self._get_initial_trust(_nid)
-                    await self._enqueue_write(
-                        self.storage.get_or_create_ledger_entry,
-                        provider_pubkey, self.policy.initial_credit, _trust
-                    )
-                    await self._enqueue_write(
-                        self.storage.update_ledger_consumer,
-                        provider_pubkey, credits_charged
-                    )
-                    # E3: credit.change fires AFTER ledger update
-                    if self.bus:
-                        self.bus.emit(
-                            "credit.change",
-                            direction="consumer",
-                            counterparty=provider_pubkey,
-                            amount=credits_charged,
-                            reference=job_id,
-                            identity=provider_pubkey,
-                        )
-                    # v0.33.0: credit.restored (consumer-side)
-                    _balance_after = self.storage.get_ledger_balance(provider_pubkey)
-                    if _balance_after is not None:
-                        # old = before update_ledger_consumer added credits_charged
-                        self._check_credit_restored(provider_pubkey, _balance_after - credits_charged, _balance_after)
-                except Exception as _le:
-                    logger.warning(f"CONSUMER_LEDGER_FAIL job={job_id[:8]}: {_le}")
-            else:
-                logger.warning(f"CONSUMER_LEDGER_SKIP job={job_id[:8]}: no provider_public_key")
-        elif credits_charged != 0:
-            logger.warning(f"CONSUMER_LEDGER_SKIP job={job_id[:8]}: invalid credits_charged={credits_charged}")
+        await self._mail_handlers._handle_task_result_mail(item)
 
     async def _handle_task_failed_mail(self, item: dict):
-        """Handle knarr/system/task_failed — update async_jobs table with error."""
-        body = item.get("body", {})
-        job_id = body.get("job_id")
-        if not job_id:
-            return
-        # SA-ML4: Same guard — provider manages its own jobs.
-        job = self.storage.get_async_job(job_id)
-        if not job:
-            return
-        if not job.get("provider_node_id"):
-            logger.debug(f"Ignoring system task_failed for local job {job_id[:8]} — provider manages directly")
-            return
-        # V21-004: Verify sender matches the tracked provider
-        sender = item.get("from_node", "")
-        if sender != job["provider_node_id"]:
-            logger.warning(f"SYSTEM_MAIL_REJECT job={job_id[:8]} sender={sender[:16]} expected={job['provider_node_id'][:16]}")
-            return
-        await self._enqueue_write(self.storage.update_async_job_status,
-                                   job_id, "failed", None, body.get("error"))
+        await self._mail_handlers._handle_task_failed_mail(item)
 
     async def _handle_asset_fetch_mail(self, item: dict):
-        """Handle knarr/system/asset_fetch — pull asset from sender's sidecar."""
-        body = item.get("body", {})
-        asset_hash = body.get("asset_hash")
-        from_node = item.get("from_node")
-        if not asset_hash or not from_node:
-            return
-        # SA-ML5: Validate asset_hash is a 64-char hex string (prevents path traversal)
-        import re
-        if not re.fullmatch(r'[0-9a-f]{64}', asset_hash):
-            logger.warning(f"asset_fetch: invalid asset_hash format from {from_node[:16]}")
-            return
-        # Resolve sender's sidecar address from address book / peer table
-        addr = self.storage.get_address(from_node)
-        if not addr or not addr.get("sidecar_port"):
-            return  # Can't reach sidecar
-        # SA-ML5: Validate sidecar_port range
-        sidecar_port = addr["sidecar_port"]
-        if not isinstance(sidecar_port, int) or sidecar_port < 1 or sidecar_port > 65535:
-            logger.warning(f"asset_fetch: invalid sidecar_port {sidecar_port} for {from_node[:16]}")
-            return
-        
-        # Fetch via HTTPS in executor (no new deps)
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self._handler_pool,
-            self._fetch_sidecar_asset, addr["last_ip"], addr["sidecar_port"], asset_hash)
+        await self._mail_handlers._handle_asset_fetch_mail(item)
 
     async def _handle_asset_ready_mail(self, item: dict):
-        """Handle knarr/system/asset_ready — log confirmation."""
-        pass  # Informational only
+        await self._mail_handlers._handle_asset_ready_mail(item)
 
     def _fetch_sidecar_asset(self, host: str, port: int, asset_hash: str):
-        """Synchronous fetch of an asset from a remote sidecar. Run in executor."""
-        import urllib.request
-        import ssl
-        url = f"https://{host}:{port}/assets/{asset_hash}"
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        # Build sidecar auth headers (same as cli/main.py download_asset)
-        timestamp = str(int(time.time()))
-        pub_key_hex = self._signing_key.verify_key.encode().hex()
-        payload = f"GET:/assets/{asset_hash}:{timestamp}:empty".encode("utf-8")
-        signature = self._signing_key.sign(payload).signature.hex()
-
-        req = urllib.request.Request(url, headers={
-            "x-knarr-publickey": pub_key_hex,
-            "x-knarr-signature": signature,
-            "x-knarr-timestamp": timestamp,
-        })
-
-        try:
-            logger.debug(f"Pulling asset {asset_hash[:16]} from {host}:{port}")
-            with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
-                data = resp.read()
-                self.store_asset(data)
-                logger.info(f"Pulled asset {asset_hash[:16]} from {host}:{port} ({len(data)} bytes)")
-        except Exception as e:
-            logger.warning(f"Failed to pull asset {asset_hash} from {host}:{port}: {e}")
+        self._mail_handlers._fetch_sidecar_asset(host, port, asset_hash)
 
     # Cockpit Data Accessors
     def get_node_info(self) -> Dict[str, Any]:
@@ -4704,15 +4497,52 @@ class DHTNode:
         if self._signing_key is None:
             raise RuntimeError("Settlement request processing requires a signing key")
 
+        # A2: countersign with #key-1 (not #cockpit-1)
         payload = {key: value for key, value in prepared_doc.items() if key != "proof"}
         countersigned_doc = sign_document(
             payload,
             self._signing_key,
-            f"did:knarr:{self.node_info.node_id}#cockpit-1",
+            f"did:knarr:{self.node_info.node_id}#key-1",
         )
         peer_key = self._resolve_settlement_peer_key(
             item, key_names=("peer_key", "proposer_key", "counterparty_key", "peer_public_key")
         )
+
+        # A1: extract proposer verify key from prepared_doc proof verificationMethod.
+        # Resolution strategy:
+        #   1. Try resolve_did_fragment (works when node_id = pubkey hex)
+        #   2. Fall back to peer_key from the mail body (= proposer's _public_key_hex)
+        #   3. If both fail, log error and return — do NOT fall back to local key
+        proposer_verify_key = None
+        proof_vm = (prepared_doc.get("proof") or {}).get("verificationMethod", "")
+        if proof_vm:
+            resolved = self.resolve_did_fragment(proof_vm)
+            if resolved is not None:
+                proposer_verify_key = resolved
+                logger.debug(f"SETTLEMENT_PROPOSER_KEY resolved via DID from {proof_vm!r}")
+            elif peer_key:
+                # peer_key = proposer's raw public key hex (sent alongside document)
+                try:
+                    proposer_verify_key = VerifyKey(bytes.fromhex(peer_key))
+                    logger.debug(f"SETTLEMENT_PROPOSER_KEY resolved via peer_key={peer_key[:16]!r}")
+                except Exception as exc:
+                    logger.error(
+                        "SETTLEMENT_PROPOSER_KEY_FAIL id=%s peer_key=%s error=%s — cannot verify, dropping",
+                        item.get("id"), peer_key[:16] if peer_key else "", exc,
+                    )
+                    return
+            else:
+                logger.error(
+                    "SETTLEMENT_PROPOSER_KEY_UNRESOLVED id=%s vm=%s — no peer_key available, dropping",
+                    item.get("id"), proof_vm,
+                )
+                return
+        else:
+            logger.error(
+                "SETTLEMENT_REQUEST_INVALID id=%s reason=missing_verification_method",
+                item.get("id"),
+            )
+            return
 
         async def _send_confirmation_mail(to_node: str, msg_type: str, body: dict, system: bool = True):
             await self._sync.enqueue(
@@ -4731,7 +4561,7 @@ class DHTNode:
         receipt_id = await execute_settlement(
             prepared_doc=prepared_doc,
             countersigned_doc=countersigned_doc,
-            node_verify_key=self._signing_key.verify_key,
+            node_verify_key=proposer_verify_key,
             authority_verify_key=self._signing_key.verify_key,
             node_id=self.node_info.node_id,
             signing_key=self._signing_key,
@@ -4816,6 +4646,32 @@ class DHTNode:
             return hashlib.sha256(bytes.fromhex(peer_key)).hexdigest()
         except Exception:
             return peer_key
+
+    def resolve_did_fragment(self, did_string: str) -> Optional[VerifyKey]:
+        """Resolve did:knarr:<node_id>#<fragment> to an Ed25519 verify key."""
+        if not isinstance(did_string, str) or not did_string.startswith("did:knarr:") or "#" not in did_string:
+            return None
+        node_part, fragment = did_string[len("did:knarr:"):].split("#", 1)
+        node_id = node_part.strip()
+        fragment = fragment.strip()
+        if not node_id or not fragment:
+            return None
+
+        own_ids = {self.node_info.node_id, getattr(self, "_public_key_hex", "")}
+        if node_id in own_ids:
+            if fragment == "key-1":
+                return self._signing_key.verify_key if self._signing_key else None
+            if fragment == "cockpit-1":
+                cockpit_key = getattr(self, "_cockpit_signing_key", None)
+                if cockpit_key is not None:
+                    return cockpit_key.verify_key
+                return self._signing_key.verify_key if self._signing_key else None
+            if fragment == "thrall-1":
+                thrall_key = getattr(self, "_thrall_signing_key", None)
+                return thrall_key.verify_key if thrall_key is not None else None
+            return None
+
+        return None
 
     def _resolve_settlement_peer_key(
         self,

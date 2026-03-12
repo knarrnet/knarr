@@ -73,3 +73,39 @@ access = "all_signed"
 description = "Published storefront exposure catalog"
 source = "exposure_config"
 fields = ["name", "skill", "path", "price", "payment", "payment_asset", "payment_network"]
+
+[objects."economy.full"]
+access = "private"
+description = "Local full economy summary for cockpit"
+source = "economy_full"
+fields = ["economy"]
+
+[objects."economy.full".granularity]
+economy = "exact"
+
+[objects."positions.full"]
+access = "private"
+description = "Full bilateral ledger positions for cockpit"
+source = "positions"
+fields = ["positions"]
+
+[objects."positions.full".granularity]
+positions = "exact"
+
+[objects."peers.status"]
+access = "private"
+description = "Local peer status snapshot for cockpit"
+source = "peers"
+fields = ["peers"]
+
+[objects."peers.status".granularity]
+peers = "exact"
+
+[objects."skills.inventory"]
+access = "private"
+description = "Full local skill inventory for cockpit"
+source = "skill_inventory"
+fields = ["skills"]
+
+[objects."skills.inventory".granularity]
+skills = "exact"

@@ -161,7 +161,7 @@ def _load_schema(schema_path: Path) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # ACL tier ordering (higher index = more privileged)
 # ---------------------------------------------------------------------------
-_TIER_ORDER = ["all_signed", "trusted", "known_hosts", "peer"]
+_TIER_ORDER = ["all_signed", "trusted", "known_hosts", "peer", "private"]
 
 
 def _tier_index(tier: str) -> int:
@@ -203,6 +203,7 @@ class PunchholeBackendPlugin(PluginHooks):
         schema_data = _load_schema(schema_path)
         self._objects: Dict[str, Any] = schema_data["objects"]
         self._trusted_nodes: List[str] = schema_data["trusted_nodes"]
+        self._cache: Dict[tuple[str, str], dict] = {}
         self._started = False
 
         # Subscribe to relevant bus events
@@ -567,6 +568,136 @@ class PunchholeBackendPlugin(PluginHooks):
         catalog.sort(key=lambda item: (str(item.get("path", "")), str(item.get("name", ""))))
         return {"catalog": catalog}
 
+    def _read_economy_full(self) -> Dict[str, Any]:
+        """B3: Read full economy data including per-peer ledger details."""
+        if not self._ctx.storage_path:
+            return {}
+        try:
+            conn = sqlite3.connect(self._ctx.storage_path, timeout=5)
+            cur = conn.execute("""
+                SELECT peer_public_key,
+                       balance,
+                       COALESCE(soft_limit, 0.0) AS soft_limit,
+                       COALESCE(prepaid, 0.0) AS prepaid,
+                       COALESCE(tasks_provided, 0) AS tasks_provided,
+                       COALESCE(tasks_consumed, 0) AS tasks_consumed
+                FROM ledger
+            """)
+            rows = cur.fetchall()
+            conn.close()
+            peers = []
+            for row in rows:
+                peers.append({
+                    "peer": row[0],
+                    "balance": float(row[1]),
+                    "soft_limit": float(row[2]),
+                    "prepaid": float(row[3]),
+                    "tasks_provided": int(row[4]),
+                    "tasks_consumed": int(row[5]),
+                })
+            return {"peers": peers, "count": len(peers)}
+        except Exception as exc:
+            log.warning(f"punchhole-backend: economy.full read failed: {exc}")
+            return {}
+
+    def _read_positions_full(self) -> Dict[str, Any]:
+        """B3: Read full position details from ledger."""
+        if not self._ctx.storage_path:
+            return {}
+        try:
+            conn = sqlite3.connect(self._ctx.storage_path, timeout=5)
+            cur = conn.execute("""
+                SELECT peer_public_key,
+                       balance,
+                       COALESCE(soft_limit, 0.0) AS soft_limit,
+                       COALESCE(tasks_provided, 0) AS tasks_provided,
+                       COALESCE(tasks_consumed, 0) AS tasks_consumed
+                FROM ledger ORDER BY ABS(balance) DESC
+            """)
+            rows = cur.fetchall()
+            conn.close()
+            positions = []
+            for row in rows:
+                balance = float(row[1])
+                soft_limit = float(row[2])
+                utilization = balance / max(soft_limit, 1.0) if soft_limit != 0 else 0.0
+                positions.append({
+                    "peer": row[0],
+                    "balance": balance,
+                    "soft_limit": soft_limit,
+                    "utilization": utilization,
+                    "tasks_provided": int(row[3]),
+                    "tasks_consumed": int(row[4]),
+                })
+            return {"positions": positions, "count": len(positions)}
+        except Exception as exc:
+            log.warning(f"punchhole-backend: positions.full read failed: {exc}")
+            return {}
+
+    def _read_peers_status(self) -> Dict[str, Any]:
+        """B3: Read peer connectivity status."""
+        if not self._ctx.storage_path:
+            return {}
+        try:
+            conn = sqlite3.connect(self._ctx.storage_path, timeout=5)
+            cur = conn.execute("""
+                SELECT node_id, host, port,
+                       COALESCE(last_seen, 0) AS last_seen,
+                       COALESCE(failed_count, 0) AS failed_count
+                FROM peers
+                ORDER BY last_seen DESC
+            """)
+            rows = cur.fetchall()
+            conn.close()
+            now = time.time()
+            peers = []
+            for row in rows:
+                last_seen = float(row[3])
+                age_s = int(now - last_seen) if last_seen > 0 else -1
+                peers.append({
+                    "node_id": row[0],
+                    "host": row[1],
+                    "port": int(row[2]),
+                    "last_seen_age_s": age_s,
+                    "failed_count": int(row[4]),
+                })
+            return {"peers": peers, "count": len(peers)}
+        except Exception as exc:
+            log.warning(f"punchhole-backend: peers.status read failed: {exc}")
+            return {}
+
+    def _read_skills_inventory(self) -> Dict[str, Any]:
+        """B3: Read full skill inventory including all skills."""
+        if not self._ctx.storage_path:
+            return {}
+        try:
+            conn = sqlite3.connect(self._ctx.storage_path, timeout=5)
+            cur = conn.execute("""
+                SELECT skill_key, skill_record_json, is_own
+                FROM skills
+                ORDER BY is_own DESC, skill_key ASC
+            """)
+            rows = cur.fetchall()
+            conn.close()
+            skills = []
+            for row in rows:
+                try:
+                    rec = json.loads(row[1])
+                    skills.append({
+                        "skill_name": row[0],
+                        "price": rec.get("price", 0.0),
+                        "visibility": rec.get("visibility", "public"),
+                        "is_own": bool(row[2]),
+                        "version": rec.get("version", ""),
+                        "description": rec.get("description", ""),
+                    })
+                except Exception:
+                    pass
+            return {"skills": skills, "count": len(skills)}
+        except Exception as exc:
+            log.warning(f"punchhole-backend: skills.inventory read failed: {exc}")
+            return {}
+
     # ------------------------------------------------------------------
     # Cache object builder
     # ------------------------------------------------------------------
@@ -587,6 +718,14 @@ class PunchholeBackendPlugin(PluginHooks):
             return self._read_schemas_documents()
         if object_key == "storefront.catalog":
             return self._read_storefront_catalog()
+        if object_key == "economy.full":
+            return self._read_economy_full()
+        if object_key == "positions.full":
+            return self._read_positions_full()
+        if object_key == "peers.status":
+            return self._read_peers_status()
+        if object_key == "skills.inventory":
+            return self._read_skills_inventory()
         # Fallback for unknown objects
         return {}
 
@@ -649,6 +788,7 @@ class PunchholeBackendPlugin(PluginHooks):
                                           requester_node_id)
         if signed is None:
             return
+        self._cache[(object_key, acl_group)] = signed
         if self._ctx.emit_event:
             self._ctx.emit_event(
                 f"cache.fill.{object_key}",
@@ -659,6 +799,13 @@ class PunchholeBackendPlugin(PluginHooks):
             )
             if self._debug:
                 log.debug(f"punchhole-backend: emitted cache.fill.{object_key} for {acl_group}")
+
+    def get_private_object(self, key: str) -> Optional[dict]:
+        """Read the local private cache directly without going through HTTP."""
+        signed = self._cache.get((key, "private"))
+        if self._debug:
+            log.debug("punchhole-backend: private_read key=%s hit=%s", key, signed is not None)
+        return signed
 
     # ------------------------------------------------------------------
     # Card builder
@@ -768,10 +915,10 @@ class PunchholeBackendPlugin(PluginHooks):
 
     # Dependency map: internal event -> affected object keys
     _STALE_MAP: Dict[str, List[str]] = {
-        "credit.change": ["economy.summary", "economy.bilateral"],
-        "receipt.issued": ["economy.summary"],
-        "skill.registered": ["skills", "schemas.skills"],
-        "skill.removed": ["skills", "schemas.skills"],
+        "credit.change": ["economy.summary", "economy.bilateral", "economy.full", "positions.full"],
+        "receipt.issued": ["economy.summary", "economy.full", "positions.full"],
+        "skill.registered": ["skills", "schemas.skills", "skills.inventory"],
+        "skill.removed": ["skills", "schemas.skills", "skills.inventory"],
         "exposure.changed": ["storefront.catalog"],
         "configuration.order": [],  # handled below — stales card + affected objects
     }
