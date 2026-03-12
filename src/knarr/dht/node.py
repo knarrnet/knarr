@@ -4823,7 +4823,7 @@ class DHTNode:
 
         body = item.get("body") or {}
         peer_key = self._resolve_settlement_peer_key(
-            item, key_names=("peer_key", "proposer_key", "counterparty_key", "peer_public_key")
+            item, key_names=("counterparty_key", "peer_public_key", "proposer_key", "peer_key")
         )
         if not peer_key:
             logger.warning(f"SETTLEMENT_CONFIRM_INVALID id={item.get('id')} missing peer")
@@ -4950,6 +4950,7 @@ class DHTNode:
             "timestamp": time.time(),
             "peer_key": peer_key,
             "recipient": peer_key,   # Gate 2 (_check_addressing) scans "recipient", not "peer_key"
+            "counterparty_key": getattr(self, "_public_key_hex", ""),  # confirmor's pubkey for ledger reset
             "accepted_receipt_id": accepted_receipt_id,
             "settle_request_ref": settle_request_ref,
         }
