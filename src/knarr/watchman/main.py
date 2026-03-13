@@ -188,6 +188,42 @@ def cmd_rollback(args: argparse.Namespace) -> None:
     print(f"Rolled back to v{target}. Restart knarr-watchman to apply.")
 
 
+def cmd_plugin(args: argparse.Namespace) -> None:
+    """Dispatch plugin subcommands."""
+    cfg = load_config(args.config)
+    data_dir = args.data_dir or cfg["node"].get("data_dir") or os.path.join(os.getcwd(), ".node")
+    cfg["node"]["data_dir"] = data_dir
+
+    from .plugin_manager import PluginManager
+    pm = PluginManager(cfg)
+
+    if args.plugin_cmd == "install":
+        pm.install(args.name)
+        print(f"Plugin '{args.name}' installed.")
+    elif args.plugin_cmd == "remove":
+        pm.remove(args.name)
+        print(f"Plugin '{args.name}' removed.")
+    elif args.plugin_cmd == "enable":
+        pm.enable(args.name)
+        print(f"Plugin '{args.name}' enabled.")
+    elif args.plugin_cmd == "disable":
+        pm.disable(args.name)
+        print(f"Plugin '{args.name}' disabled.")
+    elif args.plugin_cmd == "list":
+        plugins = pm.list_plugins()
+        if not plugins:
+            print("No plugins declared in manifest.")
+        else:
+            print(f"{'NAME':<20} {'SOURCE':<40} {'ENABLED':<8} {'VERSION'}")
+            print("-" * 78)
+            for p in plugins:
+                enabled = "yes" if p["enabled"] else "no"
+                print(f"{p['name']:<20} {p['source']:<40} {enabled:<8} {p['installed_version']}")
+    elif args.plugin_cmd == "sync":
+        pm.sync()
+        print("Plugin sync complete.")
+
+
 def _fmt_uptime(seconds: int) -> str:
     h, r = divmod(int(seconds), 3600)
     m, s = divmod(r, 60)
@@ -235,6 +271,26 @@ def _build_parser() -> argparse.ArgumentParser:
 
     rollback_p = sub.add_parser("rollback", help="Roll back to previous version")
     rollback_p.set_defaults(func=cmd_rollback)
+
+    plugin_p = sub.add_parser("plugin", help="Manage plugins from plugins.toml manifest")
+    plugin_p.set_defaults(func=cmd_plugin)
+    plugin_sub = plugin_p.add_subparsers(dest="plugin_cmd")
+    plugin_sub.required = True
+
+    pi = plugin_sub.add_parser("install", help="Install a plugin declared in manifest")
+    pi.add_argument("name", help="Plugin name")
+
+    pr = plugin_sub.add_parser("remove", help="Remove an installed plugin")
+    pr.add_argument("name", help="Plugin name")
+
+    pe = plugin_sub.add_parser("enable", help="Enable a plugin in the manifest")
+    pe.add_argument("name", help="Plugin name")
+
+    pd = plugin_sub.add_parser("disable", help="Disable a plugin in the manifest")
+    pd.add_argument("name", help="Plugin name")
+
+    plugin_sub.add_parser("list", help="List plugins and their status")
+    plugin_sub.add_parser("sync", help="Sync all enabled plugins from manifest")
 
     return parser
 

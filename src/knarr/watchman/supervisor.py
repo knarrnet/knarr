@@ -46,6 +46,16 @@ class Supervisor:
         self._running = True
         self._shutdown_requested = False
 
+        # Sync plugins before starting the node (if enabled)
+        plugins_cfg = self._cfg.get("plugins", {})
+        if plugins_cfg.get("sync_plugins", False):
+            try:
+                from .plugin_manager import PluginManager
+                pm = PluginManager(self._cfg)
+                pm.sync()
+            except Exception as e:
+                log.warning("WATCHMAN_PLUGIN_SYNC_FAIL error=%s — continuing", e)
+
         await self._spawn()
 
         health_task = asyncio.create_task(self._health_loop())

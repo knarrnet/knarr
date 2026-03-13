@@ -1,0 +1,16 @@
+# plugins.toml — example plugin manifest for knarr-watchman
+# Place this file in your data directory under watchman/plugins.toml
+# Run: knarr-watchman plugin sync  — to install all enabled plugins.
+
+# Example: install the knarr wallet plugin from GitHub
+[plugins.wallet]
+source = "github:knarrnet/knarr-plugin-wallet"
+version = ">=1.0.0"
+# SHA256 of the downloaded tarball (optional but recommended for reproducible installs)
+# sha256 = "abc123..."
+enabled = true
+
+# Example: install a plugin from a local path (useful for development)
+[plugins.my-local-plugin]
+source = "file:///home/user/dev/my-plugin"
+enabled = false
