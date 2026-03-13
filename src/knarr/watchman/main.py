@@ -130,6 +130,64 @@ def cmd_stop(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cmd_upgrade(args: argparse.Namespace) -> None:
+    """Trigger a staged upgrade (manual)."""
+    cfg = load_config(args.config)
+    data_dir = args.data_dir or cfg["node"].get("data_dir") or os.path.join(os.getcwd(), ".node")
+    cfg["node"]["data_dir"] = data_dir
+    _setup_logging(data_dir, args.verbose)
+
+    from .supervisor import Supervisor
+    from .upgrader import Upgrader
+
+    # Minimal supervisor stub for drain + spawn during manual upgrade
+    supervisor = Supervisor(cfg)
+
+    async def _run() -> None:
+        upgrader = Upgrader(cfg, supervisor)
+        tag = getattr(args, "tag", None) or None
+        success = await upgrader.run_upgrade(tag=tag)
+        if success:
+            print("Upgrade complete.")
+        else:
+            print("Upgrade failed — rolled back.")
+            sys.exit(1)
+
+    asyncio.run(_run())
+
+
+def cmd_rollback(args: argparse.Namespace) -> None:
+    """Roll back to the previous version recorded in backup/."""
+    cfg = load_config(args.config)
+    data_dir = args.data_dir or cfg["node"].get("data_dir") or os.path.join(os.getcwd(), ".node")
+    cfg["node"]["data_dir"] = data_dir
+    _setup_logging(data_dir, args.verbose)
+
+    from .upgrader import _parse_source, _install_from_tag
+
+    backup_root = os.path.join(data_dir, "watchman", "backup")
+    if not os.path.isdir(backup_root):
+        print("No backup found.")
+        sys.exit(1)
+
+    versions = sorted(os.listdir(backup_root))
+    if not versions:
+        print("No backup found.")
+        sys.exit(1)
+
+    target = versions[-1]
+    version_file = os.path.join(backup_root, target, "version.txt")
+    if os.path.exists(version_file):
+        with open(version_file) as f:
+            target = f.read().strip()
+
+    source = cfg["upgrade"]["source"]
+    org, repo = _parse_source(source)
+    print(f"Rolling back to v{target}...")
+    _install_from_tag(org, repo, f"v{target}")
+    print(f"Rolled back to v{target}. Restart knarr-watchman to apply.")
+
+
 def _fmt_uptime(seconds: int) -> str:
     h, r = divmod(int(seconds), 3600)
     m, s = divmod(r, 60)
@@ -170,6 +228,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     stop_p = sub.add_parser("stop", help="Stop running watchman")
     stop_p.set_defaults(func=cmd_stop)
+
+    upgrade_p = sub.add_parser("upgrade", help="Trigger staged upgrade (manual)")
+    upgrade_p.add_argument("--tag", default=None, help="Specific version tag (e.g. v0.45.0)")
+    upgrade_p.set_defaults(func=cmd_upgrade)
+
+    rollback_p = sub.add_parser("rollback", help="Roll back to previous version")
+    rollback_p.set_defaults(func=cmd_rollback)
 
     return parser
 

@@ -50,9 +50,10 @@ class Supervisor:
 
         health_task = asyncio.create_task(self._health_loop())
         monitor_task = asyncio.create_task(self._monitor_loop())
+        upgrade_task = asyncio.create_task(self._upgrade_loop())
 
         try:
-            await asyncio.gather(health_task, monitor_task)
+            await asyncio.gather(health_task, monitor_task, upgrade_task)
         except asyncio.CancelledError:
             pass
         finally:
@@ -178,6 +179,26 @@ class Supervisor:
     # ------------------------------------------------------------------
     # Health loop
     # ------------------------------------------------------------------
+
+    async def _upgrade_loop(self) -> None:
+        """Periodic auto-upgrade check. Only runs if auto_upgrade=true."""
+        upgrade_cfg = self._cfg.get("upgrade", {})
+        if not upgrade_cfg.get("auto_upgrade", False):
+            return
+
+        check_interval = upgrade_cfg.get("check_interval", 3600)
+        await asyncio.sleep(60)  # initial delay — let node stabilise first
+
+        from .upgrader import Upgrader
+        upgrader = Upgrader(self._cfg, self)
+
+        while self._running:
+            try:
+                log.info("WATCHMAN_UPGRADE_CHECK")
+                await upgrader.run_upgrade()
+            except Exception as e:
+                log.warning("WATCHMAN_UPGRADE_ERROR error=%s", e)
+            await asyncio.sleep(check_interval)
 
     async def _health_loop(self) -> None:
         interval = self._health_cfg["health_interval"]
