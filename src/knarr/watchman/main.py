@@ -93,6 +93,14 @@ def cmd_status(args: argparse.Namespace) -> None:
     pid = _read_pid(data_dir)
     cockpit_url = cfg["health"]["cockpit_url"]
 
+    # Validate PID is actually alive (stale PID files on Windows after SIGTERM)
+    if pid is not None:
+        try:
+            os.kill(pid, 0)
+        except (OSError, ProcessLookupError):
+            _remove_pid(data_dir)
+            pid = None
+
     print(f"watchman pid: {pid or 'not running'}")
 
     # Try to fetch /health from the node
@@ -124,6 +132,10 @@ def cmd_stop(args: argparse.Namespace) -> None:
     try:
         os.kill(pid, signal.SIGTERM)
         print(f"Sent SIGTERM to watchman (PID {pid})")
+        # On Windows, SIGTERM = TerminateProcess (abrupt). Clean up PID file here
+        # since the finally: block in cmd_run may not execute.
+        if sys.platform == "win32":
+            _remove_pid(data_dir)
     except ProcessLookupError:
         print(f"watchman (PID {pid}) not found — stale pid file?")
         _remove_pid(data_dir)
