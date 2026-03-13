@@ -434,6 +434,17 @@ class CockpitServer:
             async def _dispatch_request():
                 if path.startswith("/s/"):
                     await self._route_exposure(method, path, body, query, writer, client_ip, headers)
+                elif path == "/health" and method == "GET":
+                    # Auth-exempt — probed by Watchman and external health checks
+                    status = self._node.get_status()
+                    peer_count = len(status.get("peers", []))
+                    uptime = status.get("uptime_seconds", 0)
+                    self._respond_json(writer, {
+                        "status": "ok",
+                        "version": status.get("version", ""),
+                        "peer_count": peer_count,
+                        "uptime": uptime,
+                    })
                 elif method == "GET":
                     if path == "/meta":
                         # Self-description: list available realms

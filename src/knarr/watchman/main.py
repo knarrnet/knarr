@@ -1,0 +1,184 @@
+"""knarr-watchman CLI entry point."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import sys
+import time
+
+from .config import load_config
+from .supervisor import Supervisor
+
+
+def _setup_logging(data_dir: str, verbose: bool) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+
+    log_path = os.path.join(data_dir, "watchman", "watchman.log")
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    handlers.append(logging.FileHandler(log_path))
+
+    logging.basicConfig(level=level, format=fmt, handlers=handlers)
+
+
+def _write_pid(data_dir: str) -> None:
+    pid_path = os.path.join(data_dir, "watchman", "watchman.pid")
+    os.makedirs(os.path.dirname(pid_path), exist_ok=True)
+    with open(pid_path, "w") as f:
+        f.write(str(os.getpid()))
+
+
+def _remove_pid(data_dir: str) -> None:
+    pid_path = os.path.join(data_dir, "watchman", "watchman.pid")
+    try:
+        os.remove(pid_path)
+    except FileNotFoundError:
+        pass
+
+
+def _read_pid(data_dir: str) -> int | None:
+    pid_path = os.path.join(data_dir, "watchman", "watchman.pid")
+    try:
+        with open(pid_path) as f:
+            return int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+# ------------------------------------------------------------------
+# Commands
+# ------------------------------------------------------------------
+
+def cmd_run(args: argparse.Namespace) -> None:
+    """Run the supervisor (foreground)."""
+    cfg = load_config(args.config)
+    data_dir = args.data_dir or cfg["node"].get("data_dir") or os.path.join(os.getcwd(), ".node")
+    cfg["node"]["data_dir"] = data_dir
+
+    _setup_logging(data_dir, args.verbose)
+    _write_pid(data_dir)
+
+    log = logging.getLogger("knarr.watchman")
+    log.info("WATCHMAN_INIT data_dir=%s config=%s", data_dir, args.config)
+
+    supervisor = Supervisor(cfg)
+
+    async def _run() -> None:
+        loop = asyncio.get_running_loop()
+        if sys.platform != "win32":
+            import signal as _signal
+            loop.add_signal_handler(_signal.SIGTERM, lambda: asyncio.create_task(supervisor.stop()))
+            loop.add_signal_handler(_signal.SIGHUP, lambda: asyncio.create_task(supervisor.stop()))
+        try:
+            await supervisor.run()
+        finally:
+            _remove_pid(data_dir)
+            log.info("WATCHMAN_EXIT")
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    """Print watchman + node status."""
+    cfg = load_config(args.config)
+    data_dir = args.data_dir or cfg["node"].get("data_dir") or os.path.join(os.getcwd(), ".node")
+
+    pid = _read_pid(data_dir)
+    cockpit_url = cfg["health"]["cockpit_url"]
+
+    print(f"watchman pid: {pid or 'not running'}")
+
+    # Try to fetch /health from the node
+    import urllib.request
+    health_url = f"{cockpit_url}/health"
+    try:
+        with urllib.request.urlopen(health_url, timeout=3) as resp:
+            data = json.loads(resp.read())
+            print(f"node: running")
+            print(f"  version:    {data.get('version', '?')}")
+            print(f"  peers:      {data.get('peer_count', '?')}")
+            print(f"  uptime:     {_fmt_uptime(data.get('uptime', 0))}")
+            print(f"  health:     ok")
+    except Exception as e:
+        print(f"node: unreachable ({e})")
+
+
+def cmd_stop(args: argparse.Namespace) -> None:
+    """Send SIGTERM to running watchman."""
+    cfg = load_config(args.config)
+    data_dir = args.data_dir or cfg["node"].get("data_dir") or os.path.join(os.getcwd(), ".node")
+
+    pid = _read_pid(data_dir)
+    if not pid:
+        print("watchman: not running (no pid file)")
+        sys.exit(1)
+
+    import signal
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"Sent SIGTERM to watchman (PID {pid})")
+    except ProcessLookupError:
+        print(f"watchman (PID {pid}) not found — stale pid file?")
+        _remove_pid(data_dir)
+        sys.exit(1)
+
+
+def _fmt_uptime(seconds: int) -> str:
+    h, r = divmod(int(seconds), 3600)
+    m, s = divmod(r, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+# ------------------------------------------------------------------
+# Argument parser
+# ------------------------------------------------------------------
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="knarr-watchman",
+        description="Knarr node process supervisor",
+    )
+    parser.add_argument(
+        "--config", default="watchman.toml",
+        help="Path to watchman.toml (default: watchman.toml in cwd)",
+    )
+    parser.add_argument(
+        "--data-dir", default=None,
+        help="Node data directory (overrides watchman.toml [node] data_dir)",
+    )
+    parser.add_argument("--verbose", "-v", action="store_true")
+
+    sub = parser.add_subparsers(dest="command")
+    sub.required = True
+
+    run_p = sub.add_parser("run", help="Start watchman supervisor (foreground)")
+    run_p.set_defaults(func=cmd_run)
+
+    status_p = sub.add_parser("status", help="Show node and watchman status")
+    status_p.set_defaults(func=cmd_status)
+
+    stop_p = sub.add_parser("stop", help="Stop running watchman")
+    stop_p.set_defaults(func=cmd_stop)
+
+    return parser
+
+
+def main() -> None:
+    parser = _build_parser()
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

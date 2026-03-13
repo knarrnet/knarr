@@ -12,6 +12,7 @@ dependencies = [
 
 [project.scripts]
 knarr = "knarr.cli.main:main"
+knarr-watchman = "knarr.watchman.main:main"
 
 [project.optional-dependencies]
 dev = [

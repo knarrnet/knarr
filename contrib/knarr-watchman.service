@@ -1,0 +1,22 @@
+[Unit]
+Description=Knarr Node Watchman
+After=network.target
+Documentation=https://github.com/knarrnet/knarr
+
+[Service]
+Type=simple
+# Adjust User and data-dir to match your installation
+User=knarr
+ExecStart=/usr/local/bin/knarr-watchman --data-dir /var/lib/knarr run
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=knarr-watchman
+
+# Ensure watchman has time to drain the node on stop
+TimeoutStopSec=90
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
