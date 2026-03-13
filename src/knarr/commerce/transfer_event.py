@@ -21,3 +21,4 @@ class TransferEvent:
     confirmation: ConfirmationStatus
     slot: int = 0
     block_time: int = 0
+    mint_address: str = ""

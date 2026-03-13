@@ -253,6 +253,14 @@ class CockpitServer:
                 "_local": True,
             })
 
+        # M-022: knarr-mail must always route local — remote workers cannot deliver mail
+        if skill.lower() == "knarr-mail":
+            local = next((c for c in candidates if c.get("_local")), None)
+            if local:
+                return local
+            # No local handler for knarr-mail — do not fall through to remote
+            return None
+
         if not candidates:
             return None
 

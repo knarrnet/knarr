@@ -181,6 +181,7 @@ def _make_wm(config_override=None, storage=None):
     wm = WarehouseManager(
         node_id=NODE_ID,
         identity_fragments=IDENTITY_FRAGMENTS,
+        internal_signer_keys={},
         bus=bus,
         storage=st,
         config=config,

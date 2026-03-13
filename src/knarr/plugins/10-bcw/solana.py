@@ -154,6 +154,7 @@ class SolanaWatcher:
                         confirmation=ConfirmationStatus.FINALIZED,
                         slot=slot,
                         block_time=block_time,
+                        mint_address=mint,
                     )
                 )
 

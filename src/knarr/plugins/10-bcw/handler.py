@@ -195,6 +195,9 @@ class WatchStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_all_watches(self) -> list[dict]:
+        return self.list_watches()
+
     def all_addresses(self) -> set[str]:
         with self._connect() as conn:
             rows = conn.execute("SELECT address FROM bcw_watchlist").fetchall()
@@ -291,6 +294,17 @@ class BCWPlugin(PluginHooks):
             normalized_cfg.setdefault("rpc_url", _DEFAULT_RPC_BY_CHAIN.get(chain_id, ""))
             self._solana_modules[chain_id] = SolanaWatcher(chain_id, normalized_cfg)
 
+        if self._enabled and not self._solana_modules:
+            configured_chain_ids = ",".join(
+                str((chain_cfg or {}).get("chain_id", "")).strip()
+                for chain_cfg in self._config.get("chains", [])
+            ).strip(",") or "<none>"
+            self._enabled = False
+            self._log_warning(
+                "BCW disabled: no valid chains configured chain_id=%s",
+                configured_chain_ids,
+            )
+
         self._master_seed = self._load_master_seed()
         if self._enabled and not self._master_seed:
             self._enabled = False
@@ -346,6 +360,9 @@ class BCWPlugin(PluginHooks):
 
     def _bootstrap_watchlist(self) -> None:
         if not self._master_seed:
+            return
+        if not hasattr(self._store, "_db_path"):
+            self._log_warning("BCW bootstrap skipped: watch store not initialized")
             return
 
         for chain_id, watcher in self._solana_modules.items():
@@ -551,6 +568,7 @@ class BCWPlugin(PluginHooks):
             "amount": transfer.amount,
             "denom": transfer.denom,
             "decimals": transfer.decimals,
+            "mint": transfer.mint_address,
             "dedup_key": dedup_key,
         }
 
@@ -634,8 +652,19 @@ class BCWPlugin(PluginHooks):
             )
             return
 
+        expected_mint = self._knarr_mint()
+        if expected_mint:
+            mint = str(event.get("mint") or event.get("token_mint") or "")
+            if not mint or mint != expected_mint:
+                self._log_warning("BCW deposit credit skipped: wrong mint %s", mint or "<missing>")
+                return
+
+        from knarr.core.constants import KNARR_DECIMALS
+
+        raw_amount = float(event.get("amount", 0.0))
+        amount = raw_amount / (10 ** KNARR_DECIMALS)
         rate = get_conversion_rate({"economy": self._economy_config()})
-        credits = token_to_credits(float(event.get("amount", 0.0)), rate)
+        credits = token_to_credits(amount, rate)
         self._credit_ledger(peer_public_key, credits)
 
     def _economy_config(self) -> dict[str, Any]:
@@ -810,6 +839,14 @@ class BCWPlugin(PluginHooks):
             logger.warning(msg, *args)
         else:
             log.warning(msg, *args)
+
+    def _knarr_mint(self) -> str:
+        from knarr.core.constants import KNARR_MINT
+
+        return str(self._config.get("knarr_mint") or KNARR_MINT or "")
+
+
+BCWHandler = BCWPlugin
 
 
 def _chain_topic(chain_id: str) -> str:

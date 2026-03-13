@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import math
+import numbers
 import os
 import random
 import secrets
@@ -49,6 +50,7 @@ HEARTBEAT_SILENCE_THRESHOLD = 90  # seconds of silence before dedicated heartbea
 PEER_DEAD_TIMEOUT = 300          # seconds before removing silent peer
 PEER_HEARTBEAT_SWEEP_TIMEOUT = 10.0
 MIN_PEER_FLOOR = 8  # never prune below this many peers
+SWEEP_BATCH_SIZE = 50  # B3: max peers processed per sweep cycle (P-025)
 
 def _parse_version(v: str) -> tuple:
     """Parse 'major.minor.patch' to tuple for comparison."""
@@ -60,9 +62,10 @@ def _parse_version(v: str) -> tuple:
 class DHTNode:
     """A node in the Knarr DHT network with identity, propagation, task, and economy capabilities."""
 
-    def __init__(self, host: str, port: int, storage_path: str = ":memory:",
+    def __init__(self, host: str = "127.0.0.1", port: int = 9000, storage_path: str = ":memory:",
                  advertise_host: Optional[str] = None, policy: Optional[Policy] = None,
-                 config: Optional[Dict[str, Any]] = None, ephemeral: bool = False):
+                 config: Optional[Dict[str, Any]] = None, ephemeral: bool = False,
+                 signing_key: Optional[SigningKey] = None):
         self._main_loop = asyncio.get_event_loop()
         self.storage = Storage(storage_path)
         network_cfg = (config or {}).get("network", {})
@@ -89,7 +92,8 @@ class DHTNode:
         self._asset_dir: str = ""
         self._generated_identity_certs = False
 
-        self._signing_key: Optional[SigningKey] = None
+        # If an explicit signing_key was provided (e.g. for testing), set it before id generation
+        self._signing_key: Optional[SigningKey] = signing_key if signing_key is not None else None
         self._public_key_hex: str = ""
         self._x25519_private = None
         self._x25519_public = None
@@ -137,6 +141,8 @@ class DHTNode:
         self._group_engine = None  # GroupEngine, set in _init_group_engine()
         self._skill_policies: Dict[str, SkillPolicy] = {}  # skill_name -> SkillPolicy
         self._peer_last_activity: Dict[str, float] = {}
+        self._isolation_since: Optional[float] = None  # B2: monotonic timestamp when isolation began
+        self._sweep_offset: int = 0  # B3: rotating offset for peer sweep batching
         self._peer_last_hb_work: Dict[str, float] = {}  # SA-FW2: throttle HB downstream work
         self._bootstrap_peers: List[str] = []  # stored on join() for re-bootstrap
         self._heartbeat_silence_threshold = float(network_cfg.get("heartbeat_silence_threshold", HEARTBEAT_SILENCE_THRESHOLD))
@@ -291,6 +297,11 @@ class DHTNode:
                 internal_signer_keys["cockpit-1"] = cockpit_signing_key.verify_key.encode()
             except Exception as exc:
                 logger.warning(f"Failed to register cockpit signing key: {exc}")
+
+        if self._signing_key is not None:
+            internal_signer_keys["key-1"] = self._signing_key.verify_key.encode()
+            if self._debug if hasattr(self, '_debug') else False:
+                logger.info("WM_SIGNER_KEY1 registered node primary signing key")
 
         wm_cfg = dict(self._config.get("warehouse_manager", {}) or {})
         if wm_cfg.get("enabled", False):
@@ -1190,15 +1201,23 @@ class DHTNode:
         except Exception as e:
             logger.debug(f"Direct send to {host}:{port} failed: {e}")
 
+    def _load_config(self) -> dict:
+        """Return node config dict. Exists as a patchable seam for tests."""
+        return self._config
+
     def _load_or_generate_node_id(self) -> str:
         """Loads node identity and derives Ed25519 keypair."""
-        key_bytes = self.storage.get_node_key()
-        if not key_bytes:
-            key_bytes = secrets.token_bytes(32)
-            self.storage.set_node_key(key_bytes)
-            logger.info("Generated new persistent node identity")
+        # If signing_key was pre-injected (e.g. in tests), derive key_bytes from it directly
+        if self._signing_key is not None:
+            key_bytes = bytes(self._signing_key)
         else:
-            logger.info("Loaded persistent node identity")
+            key_bytes = self.storage.get_node_key()
+            if not key_bytes:
+                key_bytes = secrets.token_bytes(32)
+                self.storage.set_node_key(key_bytes)
+                logger.info("Generated new persistent node identity")
+            else:
+                logger.info("Loaded persistent node identity")
 
         self._signing_key = SigningKey(key_bytes)
         
@@ -1835,9 +1854,17 @@ class DHTNode:
         logger.info("PEER_CACHE no cached peer responded, falling back to bootstrap")
         return False
 
-    async def join(self, bootstrap_peers: List[str]):
+    async def join(self, bootstrap_peers: List[str], skip_jitter: bool = False):
         """Joins the network and re-announces own skills."""
         self._bootstrap_peers = list(bootstrap_peers)
+        # B1: startup jitter to prevent bootstrap stampede (P-024)
+        # skip_jitter=True for isolation recovery — node already waited 5min, no stampede risk
+        startup_jitter = self._config.get("node", {}).get("startup_jitter", True)
+        if startup_jitter and not skip_jitter:
+            jitter = random.uniform(0, 30)
+            if self._debug if hasattr(self, '_debug') else False:
+                logger.info("JOIN_JITTER sleep=%.2fs", jitter)
+            await asyncio.sleep(jitter)
         joined = False
         for peer_addr in bootstrap_peers:
             try:
@@ -4656,6 +4683,22 @@ class DHTNode:
             logger.warning(f"SETTLEMENT_SOFT_THRESHOLD_MISSING_PEER id={item.get('id')}")
             return
 
+        # A4: cadence guard — prevent settlement spam on same bilateral pair (E-025)
+        settlement_cfg = self._get_settlement_config()
+        economy_cfg = self._config.get("economy", {})
+        _default_interval = float(economy_cfg.get("settlement_min_interval_seconds", 86400))
+        min_interval = float(settlement_cfg.get("min_interval_seconds", _default_interval))
+        last_settlement = self.storage.get_settlement_cadence(peer_key)
+        if last_settlement is not None:
+            elapsed = max(0.0, time.time() - last_settlement)
+            if elapsed < min_interval:
+                if self._debug:
+                    logger.info(
+                        "SETTLEMENT_CADENCE_GUARD peer=%s elapsed=%.0fs min_interval=%.0fs",
+                        peer_key[:16], elapsed, min_interval,
+                    )
+                return
+
         entry = self.storage.get_or_create_ledger_entry(peer_key)
         soft_limit, hard_limit = self._resolve_policy(peer_key, "")
         current_balance = float(body.get("current_balance", getattr(entry, "balance", 0.0) or 0.0))
@@ -4684,18 +4727,25 @@ class DHTNode:
         if decision.action != "settle":
             return
 
+        decision_amount = getattr(decision, "amount", 0.0)
+        if not isinstance(decision_amount, numbers.Real):
+            decision_amount = 0.0
+        target_utilization = getattr(decision, "target_utilization", self._get_settlement_config().get("soft_target", 0.5))
+        if not isinstance(target_utilization, numbers.Real):
+            target_utilization = float(self._get_settlement_config().get("soft_target", 0.5))
+
         prepared_doc = await prepare_settlement(
             node_id=self.node_info.node_id,
             peer_key=peer_key,
-            amount=decision.amount,
+            amount=float(decision_amount),
             formula=(
                 f"balance={current_balance:.6f} hard_limit={float(hard_limit):.6f} "
-                f"target_utilization={decision.target_utilization:.6f}"
+                f"target_utilization={float(target_utilization):.6f}"
             ),
             proposer_balance=current_balance,
             counterparty_balance_claimed=float(body.get("counterparty_balance_claimed", -current_balance)),
             utilization=float(utilization),
-            target_utilization=decision.target_utilization,
+            target_utilization=float(target_utilization),
             signing_key=self._signing_key,
             storage=self.storage,
             bus=self.bus,
@@ -4709,17 +4759,22 @@ class DHTNode:
                 "document": prepared_doc,
                 "peer_key": getattr(self, "_public_key_hex", "") or self.node_info.node_id,
                 "counterparty_key": peer_key,
-                "amount": abs(float(decision.amount)),
+                "amount": abs(float(decision_amount)),
                 "current_balance": current_balance,
                 "credit_limit": float(credit_limit),
                 "provider_wallet": self._get_settlement_wallet(),
                 "requested_action": "settle_to_zero",
-                "target_utilization": decision.target_utilization,
+                "target_utilization": float(target_utilization),
                 "timestamp": time.time(),
             },
             system=True,
             ttl_hours=24,
         )
+        # A4: cadence written after successful enqueue — prevents burning the window on prepare failures
+        now = time.time()
+        self.storage.set_settlement_cadence(peer_key, now)
+        if self._debug:
+            logger.info("SETTLEMENT_CADENCE_SET peer=%s", peer_key[:16])
 
     async def _handle_settlement_request(self, item: dict):
         """Countersign and execute an inbound settlement request."""
@@ -5054,22 +5109,47 @@ class DHTNode:
     async def _peer_heartbeat_sweep_loop(self):
         """Independent background loop for peer heartbeat sweep."""
         interval = max(1.0, float(self._config.get("node", {}).get("sweep_interval", 10)))
+        _isolation_timeout = 300.0  # 5 minutes before re-bootstrap on peer_count <= 1 (B2)
         while self._running:
             await asyncio.sleep(interval)
             try:
                 peers = self.storage.get_peers()
                 if not peers:
+                    # Clear isolation tracking — no peers triggers immediate re-bootstrap
+                    self._isolation_since = None
                     if self._bootstrap_peers:
                         logger.warning("No peers — attempting re-bootstrap")
                         if self.bus:
                             self.bus.emit("node.rebootstrap", reason="no_peers", identity=self.node_info.node_id)
                         try:
-                            await self.join(self._bootstrap_peers)
+                            await self.join(self._bootstrap_peers, skip_jitter=True)
                         except Exception as e:
                             logger.warning(f"Re-bootstrap failed: {e}")
                             if self.bus:
                                 self.bus.emit("node.rebootstrap_failed", error=str(e), identity=self.node_info.node_id)
                     continue
+
+                # B2: isolation detection — peer_count <= 1 for >5min triggers re-bootstrap (P-023)
+                if len(peers) <= 1:
+                    if not self._isolation_since:
+                        self._isolation_since = time.monotonic()
+                    elif time.monotonic() - self._isolation_since > _isolation_timeout:
+                        logger.warning(
+                            "ISOLATION_DETECTED peer_count=%d isolated_for=%.0fs — re-bootstrapping",
+                            len(peers), time.monotonic() - self._isolation_since,
+                        )
+                        self._isolation_since = None
+                        if self._bootstrap_peers:
+                            if self.bus:
+                                self.bus.emit("node.rebootstrap", reason="isolation", identity=self.node_info.node_id)
+                            try:
+                                await self.join(self._bootstrap_peers, skip_jitter=True)
+                            except Exception as e:
+                                logger.warning(f"Re-bootstrap (isolation) failed: {e}")
+                        continue
+                else:
+                    # Healthy peer count — clear isolation tracking
+                    self._isolation_since = None
 
                 now = time.monotonic()
                 await asyncio.wait_for(
@@ -5144,7 +5224,13 @@ class DHTNode:
             return 0
 
     async def _peer_heartbeat_sweep(self, peers, now):
-        for peer in peers:
+        # B3: batch cap — process at most SWEEP_BATCH_SIZE peers per cycle (P-025)
+        if len(peers) > SWEEP_BATCH_SIZE:
+            batch = peers[self._sweep_offset:self._sweep_offset + SWEEP_BATCH_SIZE]
+            self._sweep_offset = (self._sweep_offset + SWEEP_BATCH_SIZE) % len(peers)
+        else:
+            batch = peers
+        for peer in batch:
             last_seen = self._peer_last_activity.get(peer.node_id)
             if last_seen is None:
                 # New peer — initialize activity to now, evaluate next cycle
@@ -5400,7 +5486,7 @@ class DHTNode:
     async def _auto_upgrade_loop(self):
         """Check for and install new versions. Opt-in only.
 
-        DEPRECATED as of v0.45.0. In-process upgrade is replaced by
+        Auto-upgrade via this loop has been superseded by
         knarr-watchman, which runs as a separate supervisor process and
         performs staged upgrades with drain, SHA256 verify, and rollback.
 
