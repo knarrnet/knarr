@@ -67,6 +67,7 @@ class KademliaPlugin(PluginHooks):
             self.kbuckets.add_peer(peer.node_id, peer.host, peer.port)
 
         self._last_evict = time.monotonic()
+        self._kad_put_failed: Dict[str, bool] = {}  # B4: per-skill PUT failure flag for gossip fallback
         if self._debug:
             self._log.info(f"KAD_INIT mode={self.mode} k={self.k} max_records={self.max_provider_records}")
 
@@ -363,7 +364,22 @@ class KademliaPlugin(PluginHooks):
                     skill_sheet = getattr(msg, "skill_sheet", {}) or {}
                     visibility = skill_sheet.get("visibility", "public")
                     if self._lookup and self.mode == "full" and visibility == "public":
-                        asyncio.create_task(self._put_provider_to_closest(skill_key))
+                        task = asyncio.create_task(self._put_provider_to_closest(skill_key))
+                        # B4: D-007 Phase C — suppress gossip, KAD handles distribution
+                        # If last PUT for this skill failed, allow gossip fallback this cycle
+                        put_failures = getattr(self, '_kad_put_failed', {})
+                        last_failed = put_failures.pop(skill_key, False)
+                        def _on_put_done(t, sk=skill_key):
+                            if not t.cancelled() and t.exception():
+                                getattr(self, '_kad_put_failed', {})[sk] = True
+                        task.add_done_callback(_on_put_done)
+                        if last_failed:
+                            if self._debug:
+                                self._log.info(f"KAD_GOSSIP_FALLBACK skill={skill_key} (prev PUT failed)")
+                            return True  # allow gossip this cycle as fallback
+                        if self._debug:
+                            self._log.info(f"KAD_GOSSIP_SUPPRESS skill={skill_key}")
+                        return False
 
         except Exception as e:
             self._log.warning(f"KAD_OUTBOUND_ERR {type(e).__name__}: {e}")
@@ -394,6 +410,7 @@ class KademliaPlugin(PluginHooks):
                 self._log.info(f"KAD_PUT_BROADCAST skill={skill_key} targets={len(closest[:self.k])}")
         except Exception as e:
             self._log.warning(f"KAD_PUT_ERR skill={skill_key} err={e}")
+            self._kad_put_failed[skill_key] = True
 
     async def _maybe_refresh_buckets(self):
         """Refresh stale k-buckets by looking up a random ID in that bucket's range."""

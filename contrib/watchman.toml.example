@@ -1,0 +1,44 @@
+# watchman.toml — example configuration for knarr-watchman
+# Copy to your data directory and adjust to your environment.
+
+[node]
+# Command to start the knarr node. Use "knarr" for installed package.
+command = "knarr"
+args = ["serve", "--data-dir", "/var/lib/knarr"]
+data_dir = "/var/lib/knarr"
+
+[health]
+# URL where the node's cockpit HTTP server is listening.
+cockpit_url = "http://127.0.0.1:8080"
+# How often to probe the node (seconds).
+health_interval = 10
+# Number of consecutive failures before killing the node.
+health_fail_threshold = 3
+
+[recovery]
+max_restarts = 10
+# Seconds before first restart attempt.
+initial_backoff = 5
+# Maximum backoff between restart attempts.
+max_backoff = 300
+# If the node ran for this many seconds, reset the backoff counter.
+backoff_reset_uptime = 300
+
+[upgrade]
+# Source repository for automatic upgrades.
+# Format: "github:org/repo"
+source = "github:knarrnet/knarr"
+# Set to true to enable automatic upgrade checks.
+auto_upgrade = false
+# How often to check for upgrades (seconds). Only used when auto_upgrade = true.
+check_interval = 3600
+# How long to wait for in-flight tasks to finish before upgrading.
+drain_timeout = 60
+# How long to wait for the new version to become healthy before rolling back.
+health_timeout = 60
+
+[plugins]
+# Set to true to sync plugins from plugins.toml on startup.
+sync_plugins = false
+# Directory where plugins are installed (relative to data_dir or absolute).
+plugin_dir = "plugins"

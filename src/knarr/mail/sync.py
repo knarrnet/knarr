@@ -557,6 +557,11 @@ class SyncEngine:
                     confirmed_ids.append(item_id)
                     continue
                 if result.gate.outcome == "hard_block":
+                    self._log.warning(
+                        "MAIL_HARD_BLOCK from=%s item=%s balance=%.2f limit=%.2f",
+                        msg.sender_node_id[:16], item_id[:8],
+                        entry.balance, min_balance,
+                    )
                     if getattr(self._node, "bus", None):
                         self._node.bus.emit(
                             "credit.sanctioned",
@@ -1051,6 +1056,11 @@ class SyncEngine:
                     confirmed_ids.append(item_id)
                     continue
                 if result.gate.outcome == "hard_block":
+                    self._log.warning(
+                        "MAIL_HARD_BLOCK from=%s item=%s balance=%.2f limit=%.2f",
+                        peer_node_id[:16], item_id[:8],
+                        entry.balance, min_balance,
+                    )
                     if getattr(self._node, "bus", None):
                         self._node.bus.emit(
                             "credit.sanctioned",
@@ -1142,3 +1152,6 @@ class SyncEngine:
         if self._debug:
             self._log.info(f"MAIL_PULL_RECV peer={peer_node_id[:16]} items={len(confirmed_ids)}")
         return len(confirmed_ids)
+
+
+MailSyncEngine = SyncEngine

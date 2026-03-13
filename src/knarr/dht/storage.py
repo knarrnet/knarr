@@ -310,16 +310,19 @@ class Storage:
         
         self._get_conn().commit()
 
-        # v0.23.0+: Run versioned SQL migrations (replaces inline ALTER TABLEs)
-        import os
-        from ..core.migrations import run_migrations
-        migrations_dir = os.path.join(os.path.dirname(__file__), '..', 'migrations')
-        applied = run_migrations(self._get_conn(), migrations_dir)
+        applied = self.run_migrations()
         if applied:
             logger.info(f"Applied {applied} schema migration(s)")
 
     def _get_conn(self):
         return self._keepalive_conn
+
+    def run_migrations(self) -> int:
+        import os
+        from ..core.migrations import run_migrations
+
+        migrations_dir = os.path.join(os.path.dirname(__file__), '..', 'migrations')
+        return run_migrations(self._get_conn(), migrations_dir)
 
     @staticmethod
     def _mail_bucket(msg_type: str, system: bool) -> str:
@@ -789,6 +792,7 @@ class Storage:
         """Inserts a new async job record."""
         conn = self._get_conn()
         now = time.time()
+        self.purge_stale_failed_jobs()
         conn.execute("""
             INSERT INTO async_jobs (
                 job_id, skill_name, consumer_node_id, input_hash,
@@ -882,7 +886,10 @@ class Storage:
         """Removes expired jobs from the database."""
         conn = self._get_conn()
         now = time.time()
-        conn.execute("UPDATE async_jobs SET status = 'expired' WHERE expires_at < ? AND status != 'expired'", (now,))
+        conn.execute(
+            "UPDATE async_jobs SET status = 'expired', updated_at = ? WHERE expires_at < ? AND status != 'expired'",
+            (now, now),
+        )
         conn.commit()
 
     def delete_old_expired_jobs(self, days: int = 7):
@@ -891,6 +898,16 @@ class Storage:
         cutoff = time.time() - (days * 86400)
         conn.execute("DELETE FROM async_jobs WHERE status = 'expired' AND updated_at < ?", (cutoff,))
         conn.commit()
+
+    def purge_stale_failed_jobs(self, grace_seconds: int = 300) -> int:
+        cutoff = time.time() - grace_seconds
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "DELETE FROM async_jobs WHERE status IN ('failed', 'expired') AND updated_at < ?",
+            (cutoff,),
+        )
+        conn.commit()
+        return cursor.rowcount
 
     def update_task_status(self, task_id: str, status: str,
                            output_data: Optional[Dict[str, Any]] = None,
@@ -2057,6 +2074,27 @@ class Storage:
             (f'%{escaped_key}%',)
         ).fetchone()
         return row is not None
+
+    def get_settlement_cadence(self, peer_key: str) -> Optional[float]:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT last_settlement_ts FROM settlement_cadence WHERE peer_key = ?",
+            (peer_key,),
+        ).fetchone()
+        return float(row[0]) if row else None
+
+    def set_settlement_cadence(self, peer_key: str, ts: float) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """
+            INSERT INTO settlement_cadence (peer_key, last_settlement_ts)
+            VALUES (?, ?)
+            ON CONFLICT(peer_key)
+            DO UPDATE SET last_settlement_ts = excluded.last_settlement_ts
+            """,
+            (peer_key, float(ts)),
+        )
+        conn.commit()
 
     def _escape_like(self, s: str) -> str:
         """Escape LIKE metacharacters to prevent SQL LIKE injection."""

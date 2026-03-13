@@ -755,29 +755,37 @@ async def cmd_serve(args):
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 async def cmd_upgrade(args):
-    """Check for and install updates."""
-    from ..dht.upgrade import get_latest_version, check_and_upgrade, backup_config, verify_installation, rollback_installation
+    """Check for and install updates.
+
+    DEPRECATED — use knarr-watchman upgrade instead.
+    """
+    from ..dht.upgrade import get_latest_version
     from knarr import __version__
-    
-    print(f"Current version:   v{__version__}")
-    
-    latest = get_latest_version()
-    if not latest:
-        print("Error: Could not fetch latest version info from GitHub.", file=sys.stderr)
-        sys.exit(1)
-        
-    print(f"Latest available: v{latest}")
-    
+
+    print("WARNING: 'knarr upgrade' is deprecated as of v0.45.0.", file=sys.stderr)
+    print("Use 'knarr-watchman upgrade' for staged upgrades with drain and rollback.", file=sys.stderr)
+    print("See: contrib/watchman.toml.example", file=sys.stderr)
+    print(file=sys.stderr)
+
     if args.check:
-        if latest == __version__:
-            print("Status: Already up to date.")
+        # --check is still useful for version display; keep it working
+        print(f"Current version:   v{__version__}")
+        latest = get_latest_version()
+        if latest:
+            print(f"Latest available: v{latest}")
+            if latest == __version__:
+                print("Status: Already up to date.")
+            else:
+                print(f"Status: Update available — run 'knarr-watchman upgrade' to install.")
         else:
-            print(f"Status: Update available! Run 'knarr upgrade' to install.")
+            print("Could not fetch latest version from GitHub.", file=sys.stderr)
         return
 
-    if latest == __version__:
-        print("Already up to date.")
-        return
+    print(f"Current version:   v{__version__}")
+    latest = get_latest_version()
+    if latest:
+        print(f"Latest available: v{latest}")
+    sys.exit(1)  # upgrade execution disabled — use knarr-watchman upgrade
 
     # Newer version available
     config_path = Path(args.config) if args.config else Path("knarr.toml")

@@ -18,47 +18,25 @@ def test_get_latest_version_parses_github_response():
         assert get_latest_version() == "0.14.0"
 
 def test_backup_creates_directory_and_copies_files():  # SENTINEL
-    """backup_config creates backup dir and copies identity files."""
+    """backup_config is a no-op stub — returns None and emits DeprecationWarning (v0.45.0)."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Create dummy files
-        config_file = os.path.join(tmpdir, "knarr.toml")
-        with open(config_file, "w") as f: f.write("config")
-        seed_file = os.path.join(tmpdir, "node_key.seed")
-        with open(seed_file, "w") as f: f.write("seed")
-        
-        backup_path = backup_config(tmpdir, "0.13.0")
-        assert backup_path is not None
-        assert os.path.exists(backup_path)
-        assert "backup-v0.13.0" in backup_path
-        assert os.path.exists(os.path.join(backup_path, "knarr.toml"))
-        assert os.path.exists(os.path.join(backup_path, "node_key.seed"))
+        with pytest.warns(DeprecationWarning, match="knarr-watchman"):
+            result = backup_config(tmpdir, "0.13.0")
+        assert result is None, "backup_config must return None (deprecated no-op)"
 
 def test_rollback_restores_from_backup():
-    """rollback_installation copies files back from backup."""
+    """rollback_installation is a no-op stub — returns False and emits DeprecationWarning (v0.45.0)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         config_dir = os.path.join(tmpdir, "config")
         backup_dir = os.path.join(tmpdir, "backup")
         os.makedirs(config_dir)
         os.makedirs(backup_dir)
-        
-        # Original file
-        config_file = os.path.join(config_dir, "knarr.toml")
-        with open(config_file, "w") as f: f.write("original")
-        
-        # Backup file
-        with open(os.path.join(backup_dir, "knarr.toml"), "w") as f: f.write("backed_up")
-        
-        # Rollback
-        assert rollback_installation(backup_dir, config_dir) is True
-        
-        with open(config_file, "r") as f:
-            assert f.read() == "backed_up"
+        with pytest.warns(DeprecationWarning, match="knarr-watchman"):
+            result = rollback_installation(backup_dir, config_dir)
+        assert result is False, "rollback_installation must return False (deprecated no-op)"
 
 def test_verify_installation_checks_version():
-    """verify_installation returns True when version matches."""
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="0.14.0\n")
-        assert verify_installation("0.14.0") is True
-        
-        mock_run.return_value = MagicMock(returncode=0, stdout="0.13.0\n")
-        assert verify_installation("0.14.0") is False
+    """verify_installation is a no-op stub — returns False and emits DeprecationWarning (v0.45.0)."""
+    with pytest.warns(DeprecationWarning, match="knarr-watchman"):
+        result = verify_installation("0.14.0")
+    assert result is False, "verify_installation must return False (deprecated no-op)"

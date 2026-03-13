@@ -253,6 +253,14 @@ class CockpitServer:
                 "_local": True,
             })
 
+        # M-022: knarr-mail must always route local — remote workers cannot deliver mail
+        if skill.lower() == "knarr-mail":
+            local = next((c for c in candidates if c.get("_local")), None)
+            if local:
+                return local
+            # No local handler for knarr-mail — do not fall through to remote
+            return None
+
         if not candidates:
             return None
 
@@ -434,6 +442,17 @@ class CockpitServer:
             async def _dispatch_request():
                 if path.startswith("/s/"):
                     await self._route_exposure(method, path, body, query, writer, client_ip, headers)
+                elif path == "/health" and method == "GET":
+                    # Auth-exempt — probed by Watchman and external health checks
+                    status = self._node.get_status()
+                    peer_count = len(status.get("peers", []))
+                    uptime = status.get("uptime_seconds", 0)
+                    self._respond_json(writer, {
+                        "status": "ok",
+                        "version": status.get("version", ""),
+                        "peer_count": peer_count,
+                        "uptime": uptime,
+                    })
                 elif method == "GET":
                     if path == "/meta":
                         # Self-description: list available realms
