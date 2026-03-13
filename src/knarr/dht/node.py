@@ -5398,10 +5398,24 @@ class DHTNode:
             await self._enqueue_write(self.storage.prune_completed_tasks)
 
     async def _auto_upgrade_loop(self):
-        """Check for and install new versions. Opt-in only."""
+        """Check for and install new versions. Opt-in only.
+
+        DEPRECATED as of v0.45.0. In-process upgrade is replaced by
+        knarr-watchman, which runs as a separate supervisor process and
+        performs staged upgrades with drain, SHA256 verify, and rollback.
+
+        If [node] auto_upgrade = true is set in knarr.toml, this loop
+        now logs UPGRADE_DEPRECATED and exits. Use knarr-watchman instead.
+        """
         if not self._config.get("node", {}).get("auto_upgrade", False):
             logger.debug("UPGRADE disabled (auto_upgrade not set)")
             return  # Opt-in only
+        logger.warning(
+            "UPGRADE_DEPRECATED [node] auto_upgrade is no longer supported. "
+            "Use knarr-watchman for staged upgrades with drain and rollback. "
+            "See: contrib/watchman.toml.example"
+        )
+        return  # no-op — remainder of loop is unreachable
         logger.info("UPGRADE loop started (check interval=300s)")
         while self._running:
             await asyncio.sleep(300)  # Check every 5 min

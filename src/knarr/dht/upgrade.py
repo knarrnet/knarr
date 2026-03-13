@@ -1,12 +1,23 @@
 """Auto-upgrade: download, verify, and install new Knarr releases.
 
-Opt-in only. SHA256 verification non-negotiable.
-Downloads sdist from GitHub releases, verifies against SHA256SUMS,
-then pip-installs and signals restart.
+DEPRECATED as of v0.45.0. Use knarr-watchman instead:
+  knarr-watchman upgrade          # staged upgrade with drain + rollback
+  knarr-watchman upgrade --tag v0.46.0  # specific version
+
+This module is retained for read-only helpers (get_latest_version,
+cleanup_old_backups) used by the dashboard and mail handler. The
+upgrade execution functions (check_and_upgrade, backup_config,
+verify_installation, rollback_installation) will warn and no-op.
 
 N-3: GitHub dependency acknowledged as tech debt.
 Future: upgrade-via-DHT (download sdist from any peer, verify SHA256).
 """
+import warnings as _warnings
+_DEPRECATION_MSG = (
+    "knarr.dht.upgrade is deprecated. "
+    "Use 'knarr-watchman upgrade' for node upgrades. "
+    "See: https://github.com/knarrnet/knarr/blob/main/contrib/watchman.toml.example"
+)
 import hashlib
 import json
 import logging
@@ -41,8 +52,14 @@ def get_latest_version() -> Optional[str]:
 
 
 def backup_config(config_dir: str, current_version: str, data_dir: Optional[str] = None) -> Optional[str]:
-    """Backup identity + config files before upgrade."""
-    if not config_dir:
+    """Backup identity + config files before upgrade.
+
+    DEPRECATED — use knarr-watchman upgrade instead.
+    """
+    _warnings.warn(_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
+    logger.warning("UPGRADE_DEPRECATED backup_config() is a no-op — use 'knarr-watchman upgrade'")
+    return None
+    if not config_dir:  # noqa: unreachable
         return None
     
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -96,8 +113,15 @@ def backup_config(config_dir: str, current_version: str, data_dir: Optional[str]
 
 
 def verify_installation(target_version: str) -> bool:
-    """Verify installed version matches target after pip install."""
-    try:
+    """Verify installed version matches target after pip install.
+
+    DEPRECATED — used internally by check_and_upgrade (also deprecated).
+    Returns False (no-op).
+    """
+    _warnings.warn(_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
+    logger.warning("UPGRADE_DEPRECATED verify_installation() is a no-op — use knarr-watchman upgrade")
+    return False
+    try:  # noqa: unreachable
         # Import knarr in a separate process to avoid module caching issues
         cmd = [sys.executable, "-c", "import knarr; print(knarr.__version__)"]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
@@ -116,8 +140,15 @@ def verify_installation(target_version: str) -> bool:
 
 
 def rollback_installation(backup_dir: str, config_dir: str, data_dir: Optional[str] = None) -> bool:
-    """Restore config files from backup directory."""
-    if not backup_dir or not os.path.exists(backup_dir):
+    """Restore config files from backup directory.
+
+    DEPRECATED — use knarr-watchman rollback instead.
+    Returns False (no-op).
+    """
+    _warnings.warn(_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
+    logger.warning("UPGRADE_DEPRECATED rollback_installation() is a no-op — use 'knarr-watchman rollback'")
+    return False
+    if not backup_dir or not os.path.exists(backup_dir):  # noqa: unreachable
         return False
     
     try:
@@ -160,11 +191,15 @@ def cleanup_old_backups(config_dir: str, retention_days: int = 7):
 def check_and_upgrade(target_version: str) -> bool:
     """Download, verify, and install a specific version.
 
-    Returns True on success, False on failure.
-    NEVER proceeds if checksum verification fails.
+    DEPRECATED — use knarr-watchman upgrade instead.
+    Returns False immediately (no-op) to prevent in-process upgrade.
     """
-    tag = f"v{target_version}"
-    logger.info(f"Auto-upgrade: starting upgrade to {tag}")
+    _warnings.warn(_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
+    logger.warning(
+        "UPGRADE_DEPRECATED check_and_upgrade() is disabled — "
+        "use 'knarr-watchman upgrade' for safe staged upgrades with drain + rollback"
+    )
+    return False
 
     try:
         # 1. Fetch SHA256SUMS from release
