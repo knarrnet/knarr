@@ -482,6 +482,127 @@ Show node identity, reputation data, and ledger summary.
 | `--storage` | `node.db` | SQLite database path |
 | `--reputation` | `false` | Include per-provider reputation scores |
 
+## Running in Production (Watchman)
+
+For production deployments, use `knarr-watchman` — a process supervisor that runs
+alongside your node and handles crash recovery, health monitoring, and staged upgrades.
+
+### Install
+
+Watchman is included in the knarr package. After `pip install`, `knarr-watchman` is
+available as a CLI command.
+
+### Configure
+
+Copy `contrib/watchman.toml.example` to your data directory and adjust:
+
+```toml
+[node]
+command = "knarr"
+args = ["serve", "--data-dir", "/var/lib/knarr"]
+data_dir = "/var/lib/knarr"
+
+[health]
+cockpit_url = "http://127.0.0.1:8080"   # must match --cockpit in knarr serve
+health_interval = 10                     # seconds between health probes
+health_fail_threshold = 3               # failures before killing the node
+
+[recovery]
+max_restarts = 10
+initial_backoff = 5       # seconds before first restart
+max_backoff = 300         # maximum backoff between restarts
+backoff_reset_uptime = 300
+
+[upgrade]
+source = "github:knarrnet/knarr"
+auto_upgrade = false      # set to true to enable automatic upgrades
+check_interval = 3600
+drain_timeout = 60        # wait for in-flight tasks before upgrading
+health_timeout = 60       # time for new version to become healthy before rollback
+```
+
+### Run
+
+```bash
+# Start supervisor (foreground — use systemd or screen for background)
+knarr-watchman --config /var/lib/knarr/watchman.toml run
+
+# Check status
+knarr-watchman --config /var/lib/knarr/watchman.toml status
+
+# Stop (sends SIGTERM to watchman, which drains and stops the node)
+knarr-watchman --config /var/lib/knarr/watchman.toml stop
+```
+
+### Systemd
+
+A ready-to-use systemd unit is at `contrib/knarr-watchman.service`. Copy and adjust
+the `User` and `data-dir` values:
+
+```bash
+sudo cp contrib/knarr-watchman.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now knarr-watchman
+```
+
+### Upgrades
+
+Watchman supports staged upgrades with automatic rollback. When a new release is
+available on GitHub, watchman will:
+1. Download and SHA256-verify the release artifact
+2. Wait for in-flight tasks to drain
+3. Stop the node, install the new version, restart
+4. Monitor health for `health_timeout` seconds
+5. Roll back to the previous version if health checks fail
+
+Trigger a manual upgrade:
+```bash
+knarr-watchman --config watchman.toml upgrade
+knarr-watchman --config watchman.toml upgrade --tag v0.46.0   # specific version
+
+# Roll back to the previous version:
+knarr-watchman --config watchman.toml rollback
+```
+
+### Plugin management
+
+Watchman can install and manage knarr plugins from a `plugins.toml` manifest:
+
+```toml
+# data_dir/watchman/plugins.toml
+[plugins.bcw]
+source = "github:knarrnet/knarr-bcw"
+version = ">=1.0.0"
+enabled = true
+```
+
+```bash
+knarr-watchman --config watchman.toml plugin list
+knarr-watchman --config watchman.toml plugin install bcw
+knarr-watchman --config watchman.toml plugin enable bcw
+knarr-watchman --config watchman.toml plugin disable bcw
+knarr-watchman --config watchman.toml plugin sync    # install all enabled plugins
+```
+
+### Structured log events
+
+Watchman emits structured log lines prefixed with `WATCHMAN_*` for easy parsing:
+
+| Event | Meaning |
+|-------|---------|
+| `WATCHMAN_START` | Node subprocess started |
+| `WATCHMAN_CRASH exit_code=N` | Node exited unexpectedly |
+| `WATCHMAN_RESTART attempt=N backoff=Ns` | Restarting after crash |
+| `WATCHMAN_GIVE_UP restarts=N` | Max restarts reached, supervisor exits |
+| `WATCHMAN_HEALTH_FAIL consecutive=N` | Health probe failed |
+| `WATCHMAN_HEALTH_RECOVER` | Health restored after failures |
+| `WATCHMAN_UPGRADE_START from=X to=Y` | Upgrade initiated |
+| `WATCHMAN_UPGRADE_SUCCESS` | Upgrade complete |
+| `UPGRADE_ROLLBACK` | Health check failed, rolled back |
+| `WATCHMAN_STOP` | Clean shutdown |
+
+---
+
 ## Upgrading
 
 ```bash
