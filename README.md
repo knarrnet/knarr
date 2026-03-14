@@ -545,25 +545,6 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now knarr-watchman
 ```
 
-### Upgrades
-
-Watchman supports staged upgrades with automatic rollback. When a new release is
-available on GitHub, watchman will:
-1. Download and SHA256-verify the release artifact
-2. Wait for in-flight tasks to drain
-3. Stop the node, install the new version, restart
-4. Monitor health for `health_timeout` seconds
-5. Roll back to the previous version if health checks fail
-
-Trigger a manual upgrade:
-```bash
-knarr-watchman --config watchman.toml upgrade
-knarr-watchman --config watchman.toml upgrade --tag v0.46.0   # specific version
-
-# Roll back to the previous version:
-knarr-watchman --config watchman.toml rollback
-```
-
 ### Plugin management
 
 Watchman can install and manage knarr plugins from a `plugins.toml` manifest:
@@ -604,6 +585,23 @@ Watchman emits structured log lines prefixed with `WATCHMAN_*` for easy parsing:
 ---
 
 ## Upgrading
+
+### With Watchman (recommended for production)
+
+Watchman handles upgrades with automatic rollback. When a new release is available on
+GitHub, watchman will download and verify it, drain in-flight tasks, swap the install,
+then roll back automatically if health checks fail.
+
+```bash
+knarr-watchman --config watchman.toml upgrade                  # latest release
+knarr-watchman --config watchman.toml upgrade --tag v0.46.0   # specific version
+knarr-watchman --config watchman.toml rollback                 # revert to previous
+```
+
+Set `auto_upgrade = true` in `watchman.toml` to have watchman check for upgrades
+automatically on a schedule (`check_interval` seconds, default 3600).
+
+### Without Watchman (manual)
 
 ```bash
 pip install --upgrade --force-reinstall git+https://github.com/knarrnet/knarr.git
