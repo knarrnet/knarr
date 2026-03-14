@@ -35,6 +35,14 @@ def test_deep_merge_does_not_mutate_base():
     assert base["a"]["x"] == 1  # base unchanged
 
 
+def test_deep_merge_new_nested_key_in_override():
+    """Override can add a new nested key that doesn't exist in base."""
+    from knarr.watchman.config import _deep_merge
+    base = {"a": {"x": 1}}
+    result = _deep_merge(base, {"a": {"y": 2}})
+    assert result == {"a": {"x": 1, "y": 2}}
+
+
 def test_deep_merge_override_wins_on_scalar():
     from knarr.watchman.config import _deep_merge
     result = _deep_merge({"k": "old"}, {"k": "new"})
@@ -127,6 +135,15 @@ def test_version_tuple_bad_input():
     assert _version_tuple("") == (0,)
 
 
+def test_version_tuple_non_standard_lengths():
+    """Two-part and four-part versions must compare consistently."""
+    from knarr.watchman.upgrader import _version_tuple
+    assert _version_tuple("1.0") == (1, 0)
+    assert _version_tuple("1.0.0.1") == (1, 0, 0, 1)
+    # Two-part is less than three-part equivalent
+    assert _version_tuple("1.0") < _version_tuple("1.0.0")
+
+
 def test_check_available_returns_none_when_current(monkeypatch):
     """check_available must return None when running version matches latest."""
     from knarr.watchman import upgrader as upg
@@ -171,6 +188,25 @@ def test_check_available_returns_tag_when_newer(monkeypatch):
     upgrader = upg.Upgrader(cfg, MagicMock())
     result = upgrader.check_available()
     assert result == "v0.46.0"
+
+
+def test_check_available_missing_tag_name(monkeypatch):
+    """check_available must return None when release payload has no tag_name."""
+    from knarr.watchman import upgrader as upg
+
+    monkeypatch.setattr(upg, "_fetch_latest_release", lambda org, repo: {})  # no tag_name
+    monkeypatch.setattr(upg, "_get_running_version", lambda: "0.45.0")
+
+    cfg = {
+        "node": {"command": "knarr", "args": ["serve"], "data_dir": "."},
+        "health": {"health_interval": 10, "health_fail_threshold": 3, "cockpit_url": "http://127.0.0.1:8080"},
+        "recovery": {"max_restarts": 10, "initial_backoff": 5, "max_backoff": 300, "backoff_reset_uptime": 1800},
+        "upgrade": {"auto_upgrade": False, "check_interval": 3600, "drain_timeout": 60, "health_timeout": 30, "source": "github:knarrnet/knarr"},
+        "plugins": {"sync_plugins": False, "plugin_dir": "plugins"},
+    }
+    upgrader = upg.Upgrader(cfg, MagicMock())
+    result = upgrader.check_available()
+    assert result is None
 
 
 def test_check_available_returns_none_on_api_failure(monkeypatch):
@@ -245,26 +281,68 @@ def test_supervisor_get_status_no_proc():
     assert isinstance(status["uptime_seconds"], int)
 
 
-def test_supervisor_backoff_formula():
+@pytest.mark.asyncio
+async def test_supervisor_backoff_increases_exponentially():
     """
-    Exponential backoff: min(initial * 2^(attempt-1), max).
-    At restart_count=10 with initial=5, max=300:
-      attempt 1: 5, 2: 10, 3: 20, 4: 40, 5: 80, 6: 160, 7: 300, ..., 10: 300
+    _restart backoff must double each attempt and cap at max_backoff.
+    Verified by capturing actual sleep durations from Supervisor._restart().
     """
-    initial_backoff = 5
-    max_backoff = 300
+    import time
+    from knarr.watchman.supervisor import Supervisor
 
-    def _backoff(attempt):
-        return min(initial_backoff * (2 ** (attempt - 1)), max_backoff)
+    cfg = _make_supervisor_cfg()
+    cfg["recovery"]["initial_backoff"] = 5
+    cfg["recovery"]["max_backoff"] = 300
+    cfg["recovery"]["max_restarts"] = 20
 
-    assert _backoff(1) == 5
-    assert _backoff(2) == 10
-    assert _backoff(3) == 20
-    assert _backoff(4) == 40
-    assert _backoff(5) == 80
-    assert _backoff(6) == 160
-    assert _backoff(7) == 300   # capped
-    assert _backoff(10) == 300  # still capped
+    s = Supervisor(cfg)
+    s._running = True
+    s._start_time = time.monotonic()  # uptime ≈ 0 → no backoff reset
+
+    sleep_durations = []
+
+    async def mock_sleep(secs):
+        sleep_durations.append(secs)
+
+    async def mock_spawn():
+        pass
+
+    s._spawn = mock_spawn
+
+    with patch("knarr.watchman.supervisor.asyncio.sleep", side_effect=mock_sleep):
+        for _ in range(7):
+            await s._restart()
+
+    assert sleep_durations == [5, 10, 20, 40, 80, 160, 300], (
+        f"Backoff sequence wrong: {sleep_durations}. "
+        "Expected [5, 10, 20, 40, 80, 160, 300] (doubles each attempt, capped at 300)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_supervisor_restart_gives_up_when_max_restarts_zero():
+    """max_restarts=0 must give up on the very first crash (no restarts allowed)."""
+    import time
+    from knarr.watchman.supervisor import Supervisor
+
+    cfg = _make_supervisor_cfg()
+    cfg["recovery"]["max_restarts"] = 0
+
+    s = Supervisor(cfg)
+    s._running = True
+    s._restart_count = 0
+    s._start_time = time.monotonic()
+
+    spawn_calls = []
+    async def mock_spawn():
+        spawn_calls.append(1)
+    s._spawn = mock_spawn
+
+    with patch("knarr.watchman.supervisor.asyncio.sleep", return_value=None):
+        await s._restart()
+
+    assert s._running is False, "max_restarts=0 must give up immediately"
+    assert len(spawn_calls) == 0
 
 
 @pytest.mark.asyncio
@@ -383,6 +461,25 @@ def test_load_manifest_empty_when_no_file(tmp_path):
     from knarr.watchman.plugin_manager import load_manifest
     result = load_manifest(str(tmp_path / "nonexistent.toml"))
     assert result == {"plugins": {}}
+
+
+def test_write_manifest_simple_special_chars_in_source(tmp_path):
+    """Sources with special chars (slashes, colons, dots) must survive the roundtrip."""
+    from knarr.watchman.plugin_manager import _write_manifest_simple, load_manifest
+
+    manifest = {
+        "plugins": {
+            "my-plugin": {
+                "source": "github:org/repo-with.dots",
+                "version": ">=1.0.0",
+                "enabled": True,
+            }
+        }
+    }
+    path = str(tmp_path / "plugins.toml")
+    _write_manifest_simple(path, manifest)
+    result = load_manifest(path)
+    assert result["plugins"]["my-plugin"]["source"] == "github:org/repo-with.dots"
 
 
 def test_write_manifest_simple_roundtrip(tmp_path):

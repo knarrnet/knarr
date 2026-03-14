@@ -503,7 +503,7 @@ args = ["serve", "--data-dir", "/var/lib/knarr"]
 data_dir = "/var/lib/knarr"
 
 [health]
-cockpit_url = "http://127.0.0.1:8080"   # must match --cockpit in knarr serve
+cockpit_url = "http://127.0.0.1:8080"   # scheme + host + port matching knarr serve --cockpit PORT
 health_interval = 10                     # seconds between health probes
 health_fail_threshold = 3               # failures before killing the node
 
@@ -511,14 +511,14 @@ health_fail_threshold = 3               # failures before killing the node
 max_restarts = 10
 initial_backoff = 5       # seconds before first restart
 max_backoff = 300         # maximum backoff between restarts
-backoff_reset_uptime = 300
+backoff_reset_uptime = 1800
 
 [upgrade]
 source = "github:knarrnet/knarr"
 auto_upgrade = false      # set to true to enable automatic upgrades
 check_interval = 3600
 drain_timeout = 60        # wait for in-flight tasks before upgrading
-health_timeout = 60       # time for new version to become healthy before rollback
+health_timeout = 30       # time for new version to become healthy before rollback
 ```
 
 ### Run
@@ -530,17 +530,19 @@ knarr-watchman --config /var/lib/knarr/watchman.toml run
 # Check status
 knarr-watchman --config /var/lib/knarr/watchman.toml status
 
-# Stop (sends SIGTERM to watchman, which drains and stops the node)
+# Stop (sends SIGTERM to watchman, which then terminates the node)
 knarr-watchman --config /var/lib/knarr/watchman.toml stop
 ```
 
 ### Systemd
 
-A ready-to-use systemd unit is at `contrib/knarr-watchman.service`. Copy and adjust
-the `User` and `data-dir` values:
+A ready-to-use systemd unit is at `contrib/knarr-watchman.service`. Copy it, then edit
+`ExecStart` to point to your config file and adjust `User`:
 
 ```bash
 sudo cp contrib/knarr-watchman.service /etc/systemd/system/
+# Edit ExecStart to add --config, e.g.:
+#   ExecStart=/usr/local/bin/knarr-watchman --config /var/lib/knarr/watchman.toml run
 sudo systemctl daemon-reload
 sudo systemctl enable --now knarr-watchman
 ```
@@ -577,8 +579,8 @@ Watchman emits structured log lines prefixed with `WATCHMAN_*` for easy parsing:
 | `WATCHMAN_GIVE_UP restarts=N` | Max restarts reached, supervisor exits |
 | `WATCHMAN_HEALTH_FAIL consecutive=N` | Health probe failed |
 | `WATCHMAN_HEALTH_RECOVER` | Health restored after failures |
-| `WATCHMAN_UPGRADE_START from=X to=Y` | Upgrade initiated |
-| `WATCHMAN_UPGRADE_SUCCESS` | Upgrade complete |
+| `UPGRADE_START from=X to=Y` | Upgrade initiated |
+| `UPGRADE_SUCCESS` | Upgrade complete |
 | `UPGRADE_ROLLBACK` | Health check failed, rolled back |
 | `WATCHMAN_STOP` | Clean shutdown |
 
@@ -589,8 +591,9 @@ Watchman emits structured log lines prefixed with `WATCHMAN_*` for easy parsing:
 ### With Watchman (recommended for production)
 
 Watchman handles upgrades with automatic rollback. When a new release is available on
-GitHub, watchman will download and verify it, drain in-flight tasks, swap the install,
-then roll back automatically if health checks fail.
+GitHub, watchman will download it (SHA256-verified when a `checksums.txt` asset is
+present), drain in-flight tasks, swap the install, then roll back automatically if
+health checks fail.
 
 ```bash
 knarr-watchman --config watchman.toml upgrade                  # latest release

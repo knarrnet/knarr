@@ -22,7 +22,7 @@ initial_backoff = 5
 # Maximum backoff between restart attempts.
 max_backoff = 300
 # If the node ran for this many seconds, reset the backoff counter.
-backoff_reset_uptime = 300
+backoff_reset_uptime = 1800
 
 [upgrade]
 # Source repository for automatic upgrades.
@@ -35,7 +35,7 @@ check_interval = 3600
 # How long to wait for in-flight tasks to finish before upgrading.
 drain_timeout = 60
 # How long to wait for the new version to become healthy before rolling back.
-health_timeout = 60
+health_timeout = 30
 
 [plugins]
 # Set to true to sync plugins from plugins.toml on startup.
