@@ -32,3 +32,6 @@ nul
 node_modules/
 cache/
 vault.db
+
+# Git worktrees
+.worktrees/
