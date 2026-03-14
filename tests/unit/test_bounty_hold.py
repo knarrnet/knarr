@@ -24,12 +24,14 @@ def test_release_held_moves_amount_into_balance():
 
 def test_return_held_only_reduces_hold():
     storage = Storage(":memory:")
-    storage.get_or_create_ledger_entry("a" * 64, 1.0, 0.3)
+    # A1.2 security rule: get_or_create_ledger_entry always stores balance=0.0 in the DB
+    # regardless of the initial_balance argument. Use 0.0 to match the actual stored value.
+    storage.get_or_create_ledger_entry("a" * 64, 0.0, 0.3)
     storage.hold_balance("a" * 64, 4.0)
     storage.return_held("a" * 64, 2.5)
     entry = storage.get_or_create_ledger_entry("a" * 64, 0.0, 0.3)
     assert entry.held_balance == 1.5
-    assert entry.balance == 1.0
+    assert entry.balance == 0.0  # return_held does not credit balance (unlike release_held)
     storage.close()
 
 

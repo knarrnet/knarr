@@ -7,11 +7,11 @@ from knarr.dht.storage import Storage
 def test_decay_stale_balances_decays_old_entries():
     """Stale entries get their balance multiplied by (1 - rate)."""
     s = Storage(":memory:")
-    # Create an entry with known balance
-    s.get_or_create_ledger_entry("peer_a", 10.0)
-    # Backdate last_updated so it appears stale
+    # Create an entry — A1.2 always stores balance=0.0 in the DB regardless of initial_balance.
+    # Set the real test balance and backdate last_updated via direct SQL (same approach).
+    s.get_or_create_ledger_entry("peer_a", 0.0)
     conn = s._get_conn()
-    conn.execute("UPDATE ledger SET last_updated = ? WHERE peer_public_key = ?",
+    conn.execute("UPDATE ledger SET last_updated = ?, balance = 10.0 WHERE peer_public_key = ?",
                  (time.time() - 7200, "peer_a"))
     conn.commit()
 
@@ -25,7 +25,11 @@ def test_decay_stale_balances_decays_old_entries():
 def test_decay_skips_recent_entries():
     """Recently active entries are not decayed."""
     s = Storage(":memory:")
-    s.get_or_create_ledger_entry("peer_b", 5.0)
+    # A1.2 always stores balance=0.0; set actual test balance via direct SQL.
+    s.get_or_create_ledger_entry("peer_b", 0.0)
+    conn = s._get_conn()
+    conn.execute("UPDATE ledger SET balance = 5.0 WHERE peer_public_key = ?", ("peer_b",))
+    conn.commit()
     # last_updated is now() — should NOT be decayed
 
     decayed = s.decay_stale_balances(decay_rate=0.5, stale_seconds=3600)
@@ -51,9 +55,10 @@ def test_decay_skips_near_zero_balances():
 def test_decay_handles_negative_balances():
     """Negative balances (debt) also decay toward zero."""
     s = Storage(":memory:")
-    s.get_or_create_ledger_entry("peer_d", -8.0)
+    # A1.2 always stores balance=0.0; set the negative test balance via direct SQL.
+    s.get_or_create_ledger_entry("peer_d", 0.0)
     conn = s._get_conn()
-    conn.execute("UPDATE ledger SET last_updated = ? WHERE peer_public_key = ?",
+    conn.execute("UPDATE ledger SET last_updated = ?, balance = -8.0 WHERE peer_public_key = ?",
                  (time.time() - 7200, "peer_d"))
     conn.commit()
 

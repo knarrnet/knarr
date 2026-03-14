@@ -408,15 +408,16 @@ class TestE2EEconomySummary:
         p1 = next((e for e in entries if e["peer_public_key"] == peer1), None)
         assert p1 is not None
         assert p1["tasks_consumed"] == 2
-        # Balance should reflect: initial_credit(3.0) + 2.0 + 3.0 = 8.0
-        assert p1["balance"] == 8.0
+        # A1.2 security rule: entries start at 0.0, not initial_credit.
+        # Balance: 0.0 + 2.0 + 3.0 = 5.0
+        assert p1["balance"] == 5.0
 
         # Find peer2 entry
         p2 = next((e for e in entries if e["peer_public_key"] == peer2), None)
         assert p2 is not None
         assert p2["tasks_provided"] == 1
-        # Balance: initial_credit(3.0) - 1.5 = 1.5
-        assert p2["balance"] == 1.5
+        # Balance: 0.0 - 1.5 = -1.5
+        assert p2["balance"] == -1.5
 
         # Verify economy fields present
         for entry in entries:

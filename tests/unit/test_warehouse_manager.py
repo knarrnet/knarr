@@ -45,6 +45,10 @@ class _QuarantineStorage:
 
     def quarantine_store(self, id, document_type, document_json, originator_pubkey, status, gate_results, reason):
         now = time.time()
+        if not isinstance(document_json, str):
+            document_json = json.dumps(document_json, sort_keys=True)
+        if not isinstance(gate_results, str):
+            gate_results = json.dumps(gate_results, sort_keys=True)
         self._conn.execute(
             """INSERT OR REPLACE INTO dmz_quarantine
                (id, document_type, document_json, originator_pubkey, status, gate_results, reason, received_at)
@@ -163,6 +167,16 @@ def _make_signed_doc(doc_type="credit_note", identity=None, counterparty=None, v
         "cache_object": {
             "object_key": "economy.summary",
             "data": {"balance": 100}, "granularity": {"balance": "exact"},
+        },
+        "settlement_prepared": {
+            "proposer": NODE_ID, "amount": 5.0, "formula": "bilateral",
+            "proposer_balance": -8.0, "counterparty_balance_claimed": 8.0,
+            "utilization": 0.8, "target_utilization": 0.5,
+        },
+        "settlement_accepted": {
+            "proposer": NODE_ID, "amount": 5.0,
+            "authority": NODE_ID, "authority_method": "auto",
+            "prepared_receipt_id": "sp_test",
         },
     }
     if doc_type in _BODY_FIELDS:

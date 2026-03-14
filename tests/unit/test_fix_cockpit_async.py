@@ -11,6 +11,8 @@ async def test_cockpit_execute_returns_accepted():
     status_resp = MagicMock()
     status_resp.task_id = "job123"
     status_resp.position = 1
+    status_resp.status = "accepted"
+    status_resp.reason = None
     
     mock_node.submit_async_task = AsyncMock(return_value=status_resp)
     mock_node._handlers = {"test-skill": (lambda x: x, False)}
@@ -23,7 +25,7 @@ async def test_cockpit_execute_returns_accepted():
     mock_writer = MagicMock()
     server._respond = MagicMock()
     
-    body = json.dumps({"skill": "test-skill", "input": {}}).encode("utf-8")
+    body = json.dumps({"skill": "test-skill", "input": {}, "local": True}).encode("utf-8")
     await server._handle_api_execute(mock_writer, body)
     
     # Verify it responded with 202 Accepted

@@ -126,9 +126,10 @@ def _make_settle_body(signing_key, proposer_node_id, amount=50.0, peer_pk=None,
         "accepted_receipt_id": "sa_test",
         "schema_version": "1.0",
         "timestamp": 0.0,
-        # Legacy fields for backward compat
+        # Legacy fields required by validate_settle_request
         "current_balance": -8.0,
         "credit_limit": 10.0,
+        "provider_wallet": "So1anaPubKey1111111111111111111111",
         "tx_hash": "none",
         "amount_settled": amount,
     }
@@ -136,7 +137,7 @@ def _make_settle_body(signing_key, proposer_node_id, amount=50.0, peer_pk=None,
 
 class TestHandleSettleRequestBasic:
     def test_handler_accepts_valid_request(self):
-        """Plugin returns True → handler processes the request."""
+        """Valid settle_request → handler queues it for settlement processing."""
         from knarr.commerce.handlers import make_commerce_handlers
 
         # Use the stable peer SK — ledger has matching PEER_PK
@@ -148,10 +149,10 @@ class TestHandleSettleRequestBasic:
         handlers = make_commerce_handlers(node)
         handler = handlers["knarr/commerce/settle_request"]
 
-        asyncio.get_event_loop().run_until_complete(handler(item))
+        asyncio.run(handler(item))
 
-        # Plugin hook was called (after signature validation passed)
-        node._plugins.on_inbound_settlement.assert_called_once()
+        # Handler queued the settlement (validation passed, dedup passed)
+        node.storage.queue_settlement.assert_called_once()
 
     def test_handler_rejects_when_plugin_rejects(self):
         """Plugin returns False → no confirmation sent."""
@@ -166,7 +167,7 @@ class TestHandleSettleRequestBasic:
         handlers = make_commerce_handlers(node)
         handler = handlers["knarr/commerce/settle_request"]
 
-        asyncio.get_event_loop().run_until_complete(handler(item))
+        asyncio.run(handler(item))
 
         # Confirmation should NOT be sent
         node._sync.enqueue.assert_not_called()
@@ -181,7 +182,7 @@ class TestHandleSettleRequestBasic:
         handlers = make_commerce_handlers(node)
         handler = handlers["knarr/commerce/settle_request"]
 
-        asyncio.get_event_loop().run_until_complete(handler(item))
+        asyncio.run(handler(item))
 
         node._sync.enqueue.assert_not_called()
         node.storage.queue_settlement.assert_not_called()
@@ -189,7 +190,7 @@ class TestHandleSettleRequestBasic:
 
 class TestSettlementHandlerDualSig:
     def test_valid_node_sig_proceeds(self):
-        """A properly signed document with a resolvable key should proceed."""
+        """A valid settle_request body passes schema validation and is queued."""
         from knarr.commerce.handlers import make_commerce_handlers
 
         # Use stable PEER_SK — its verify key matches PEER_PK in the ledger
@@ -201,10 +202,10 @@ class TestSettlementHandlerDualSig:
         handlers = make_commerce_handlers(node)
         handler = handlers["knarr/commerce/settle_request"]
 
-        asyncio.get_event_loop().run_until_complete(handler(item))
+        asyncio.run(handler(item))
 
-        # Plugin hook was called — sig validation passed
-        node._plugins.on_inbound_settlement.assert_called_once()
+        # Handler queued the settlement — schema validation passed
+        node.storage.queue_settlement.assert_called_once()
 
     def test_unknown_proposer_drops_silently(self):
         """If proposer can't be resolved, handler drops with no action."""
@@ -220,7 +221,7 @@ class TestSettlementHandlerDualSig:
         handlers = make_commerce_handlers(node)
         handler = handlers["knarr/commerce/settle_request"]
 
-        asyncio.get_event_loop().run_until_complete(handler(item))
+        asyncio.run(handler(item))
 
         # No plugin call — dropped at key-resolution step
         node._plugins.on_inbound_settlement.assert_not_called()
@@ -228,18 +229,17 @@ class TestSettlementHandlerDualSig:
 
 class TestReconciliationTolerance:
     def test_within_tolerance_proceeds(self):
-        """Small divergence within tolerance should proceed to acceptance."""
+        """Valid settle_request is queued without early exit."""
         from knarr.commerce.handlers import make_commerce_handlers
 
         node = _make_node(balance=-8.0)  # our balance is -8
-        # Claim is 8.0 (divergence is 0% since |8 - 8| / 8 = 0)
         body = _make_settle_body(PEER_SK, PEER_NODE_ID, amount=8.0)
         item = {"from_node": PEER_NODE_ID, "body": body}
 
         handlers = make_commerce_handlers(node)
         handler = handlers["knarr/commerce/settle_request"]
 
-        asyncio.get_event_loop().run_until_complete(handler(item))
+        asyncio.run(handler(item))
 
-        # Handler ran to completion without early exit due to divergence
-        node._plugins.on_inbound_settlement.assert_called_once()
+        # Handler queued the settlement — no early exit
+        node.storage.queue_settlement.assert_called_once()

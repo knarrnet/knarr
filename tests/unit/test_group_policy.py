@@ -166,7 +166,10 @@ async def test_handle_task_request_uses_resolve_policy():
 
         await node._handle_task_request(req)
         balance = node.storage.get_ledger_balance(pk)
-        assert balance == 1000.0
+        # A1.2 security rule: new ledger entries always start at balance=0.0.
+        # The group policy initial_credit=1000.0 sets the soft limit (credit range),
+        # not the starting balance. Price=0.0 so balance remains at 0.0.
+        assert balance == 0.0
     finally:
         await node.stop()
 

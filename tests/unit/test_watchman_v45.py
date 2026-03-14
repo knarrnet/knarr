@@ -11,9 +11,28 @@ Network I/O (GitHub API, pip) and subprocess spawning are NOT exercised here.
 Those paths require integration tests (planned for v0.46.0).
 """
 import os
+import sys
 import tempfile
+from pathlib import Path
 import pytest
 from unittest.mock import patch, MagicMock
+
+# -- O-030 import shim -------------------------------------------------------
+# tests/conftest.py imports knarr.dht.node at collection time, which pins
+# knarr.__path__ to the installed package.  sys.path manipulation alone cannot
+# override this because Python resolves subpackages through knarr.__path__, not
+# sys.path, once the top-level package is loaded.
+#
+# Fix: prepend the worktree's knarr/ directory to knarr.__path__ (a mutable
+# list) and evict the cached knarr.watchman.* modules so they are re-resolved
+# from the worktree's implementation on next import.
+import knarr as _knarr_pkg
+_WORKTREE_KNARR = str(Path(__file__).parents[2] / "src" / "knarr")
+if _WORKTREE_KNARR not in _knarr_pkg.__path__:
+    _knarr_pkg.__path__.insert(0, _WORKTREE_KNARR)
+    for _k in [k for k in sys.modules if k.startswith("knarr.watchman")]:
+        del sys.modules[_k]
+# ----------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -535,3 +554,60 @@ def test_get_installed_version_returns_none_when_not_present(tmp_path):
     from knarr.watchman.plugin_manager import get_installed_version
     result = get_installed_version("echo", str(tmp_path / "plugins"))
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# supervisor.py — reload_config (O-030)
+# ---------------------------------------------------------------------------
+
+def test_watchman_reload_on_config_change(tmp_path):
+    """reload_config() must live-update health and recovery settings from disk."""
+    from knarr.watchman.config import load_config
+    from knarr.watchman.supervisor import Supervisor
+
+    config_path = str(tmp_path / "watchman.toml")
+
+    # Write initial config
+    with open(config_path, "wb") as f:
+        f.write(
+            b'[health]\nhealth_interval = 10\nhealth_fail_threshold = 3\n'
+            b'cockpit_url = "http://127.0.0.1:8080"\n'
+        )
+
+    cfg = load_config(config_path)
+    s = Supervisor(cfg, config_path=config_path)
+
+    assert s._health_cfg["health_interval"] == 10
+    assert s._health_cfg["health_fail_threshold"] == 3
+
+    # Update the config file on disk
+    with open(config_path, "wb") as f:
+        f.write(
+            b'[health]\nhealth_interval = 30\nhealth_fail_threshold = 5\n'
+            b'cockpit_url = "http://127.0.0.1:8080"\n'
+        )
+
+    # Reload and verify live update
+    s.reload_config(config_path)
+
+    assert s._health_cfg["health_interval"] == 30, (
+        f"Expected health_interval=30 after reload, got {s._health_cfg['health_interval']}"
+    )
+    assert s._health_cfg["health_fail_threshold"] == 5, (
+        f"Expected health_fail_threshold=5 after reload, got {s._health_cfg['health_fail_threshold']}"
+    )
+
+
+def test_watchman_reload_no_path_logs_warning(caplog):
+    """reload_config() must log WATCHMAN_RELOAD_SKIP and not raise when no path is set."""
+    import logging
+    from knarr.watchman.supervisor import Supervisor
+
+    s = Supervisor(_make_supervisor_cfg())  # no config_path argument
+
+    with caplog.at_level(logging.WARNING, logger="knarr.watchman"):
+        s.reload_config()  # no path argument either
+
+    assert "WATCHMAN_RELOAD_SKIP" in caplog.text, (
+        "Expected WATCHMAN_RELOAD_SKIP warning when reload_config() called with no path"
+    )

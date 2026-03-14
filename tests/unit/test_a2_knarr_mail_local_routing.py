@@ -98,18 +98,26 @@ def test_knarr_mail_returns_none_when_no_local_handler():
 
 def test_non_knarr_mail_skill_still_load_balances():
     """Other skills must still use normal scored selection (no regression)."""
+    remote_providers = [{"node_id": "remote01", "host": "10.0.0.1", "port": 9010}]
     server = _make_cockpit_server(
         has_local_handler=True,
-        remote_providers=[{"node_id": "remote01", "host": "10.0.0.1", "port": 9010}],
+        remote_providers=remote_providers,
         local_weight=0.5,  # remote should be preferred
     )
-    # Run 20 times — with local_weight=0.5 and equal score remote at 1.0,
-    # a non-knarr-mail skill should sometimes pick remote.
-    # We just verify it doesn't crash and returns a provider.
+    # The fixture only registers knarr-mail providers; expose embed-batch-lite too
+    # so _select_execute_provider has candidates to score.
+    server._node.get_skills.return_value = {
+        "network": [
+            {"name": "knarr-mail", "providers": remote_providers},
+            {"name": "embed-batch-lite", "providers": remote_providers},
+        ]
+    }
+    # Run 20 times — with local_weight=0.5 and a remote at score 1.0,
+    # the remote should win regularly. We just verify a provider is returned.
     results = set()
     for _ in range(20):
         r = server._select_execute_provider("embed-batch-lite")
         if r:
             results.add(r.get("node_id") or ("local" if r.get("_local") else "?"))
-    # At least one remote should appear (local_weight=0.5 means remote wins often)
+    # At least one provider must appear (remote wins with local_weight=0.5)
     assert len(results) >= 1

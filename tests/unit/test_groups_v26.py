@@ -72,46 +72,53 @@ def test_announce_jurisdiction_field():
 
 # ── Pricing Discount Tests ────────────────────────────────────
 
-def test_group_price_discount_single():
-    """Single group discount applies correctly."""
+def _make_node_mock(config, groups):
+    """Helper: build a MagicMock node with SQL returning empty (uses TOML fallback)."""
     from unittest.mock import MagicMock
     node = MagicMock()
-    node._config = {"pricing": {"discounts": {"partners": 25}, "min_price": 0.0}}
+    node._config = config
     engine = MagicMock()
-    engine.get_groups.return_value = ["partners"]
+    engine.get_groups.return_value = groups
     node._group_engine = engine
+    # Return empty from SQL (pricing_discounts table) so TOML fallback is used
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    cursor.fetchone.return_value = None
+    node.storage._get_conn.return_value.execute.return_value = cursor
+    return node
 
-    # Borrow the method
+
+def test_group_price_discount_single():
+    """Single group discount applies correctly."""
+    # _calculate_group_price was refactored to _resolve_price_builtin (v0.39.0+)
     from knarr.dht.node import DHTNode
-    price = DHTNode._calculate_group_price(node, "test_node", 10.0, "test_skill")
+    node = _make_node_mock(
+        {"pricing": {"discounts": {"partners": 25}, "min_price": 0.0}},
+        ["partners"],
+    )
+    price, _ = DHTNode._resolve_price_builtin(node, "test_node", 10.0, "test_skill")
     assert price == pytest.approx(7.5)
 
 
 def test_group_price_discount_stacking():
     """Multiplicative stacking: 25% + 10% = 0.75 * 0.90 = 0.675."""
-    from unittest.mock import MagicMock
-    node = MagicMock()
-    node._config = {"pricing": {"discounts": {"partners": 25, "high_volume": 10}, "min_price": 0.0}}
-    engine = MagicMock()
-    engine.get_groups.return_value = ["partners", "high_volume"]
-    node._group_engine = engine
-
     from knarr.dht.node import DHTNode
-    price = DHTNode._calculate_group_price(node, "test_node", 10.0, "test_skill")
+    node = _make_node_mock(
+        {"pricing": {"discounts": {"partners": 25, "high_volume": 10}, "min_price": 0.0}},
+        ["partners", "high_volume"],
+    )
+    price, _ = DHTNode._resolve_price_builtin(node, "test_node", 10.0, "test_skill")
     assert price == pytest.approx(6.75)
 
 
 def test_group_price_floor():
     """Discount can't go below min_price."""
-    from unittest.mock import MagicMock
-    node = MagicMock()
-    node._config = {"pricing": {"discounts": {"partners": 99}, "min_price": 1.0}}
-    engine = MagicMock()
-    engine.get_groups.return_value = ["partners"]
-    node._group_engine = engine
-
     from knarr.dht.node import DHTNode
-    price = DHTNode._calculate_group_price(node, "test_node", 10.0, "test_skill")
+    node = _make_node_mock(
+        {"pricing": {"discounts": {"partners": 99}, "min_price": 1.0}},
+        ["partners"],
+    )
+    price, _ = DHTNode._resolve_price_builtin(node, "test_node", 10.0, "test_skill")
     assert price == 1.0
 
 

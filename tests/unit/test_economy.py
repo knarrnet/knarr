@@ -10,8 +10,10 @@ def storage():
 
 def test_ledger_entry_creation_with_initial_credit(storage):
     key = "peer1"
-    entry = storage.get_or_create_ledger_entry(key, initial_balance=3.0)
-    assert entry.balance == 3.0
+    # A1.2 security rule: get_or_create_ledger_entry always stores balance=0.0 in the DB
+    # regardless of initial_balance argument. New entries start at zero.
+    entry = storage.get_or_create_ledger_entry(key, initial_balance=0.0)
+    assert entry.balance == 0.0
     assert entry.tasks_provided == 0
     assert entry.tasks_consumed == 0
 
@@ -39,9 +41,14 @@ def test_ledger_update_consumer(storage):
 
 def test_variable_pricing(storage):
     key = "peer1"
-    storage.get_or_create_ledger_entry(key, initial_balance=3.0)
+    # A1.2: new entries always start at 0.0. Set the working balance via direct SQL
+    # (same pattern used by test_credit_balancer.py) to verify provider charge logic.
+    storage.get_or_create_ledger_entry(key, initial_balance=0.0)
+    conn = storage._get_conn()
+    conn.execute("UPDATE ledger SET balance = 3.0 WHERE peer_public_key = ?", (key,))
+    conn.commit()
     storage.update_ledger_provider(key, 2.0)
-    
+
     entry = storage.get_or_create_ledger_entry(key)
     assert entry.balance == 1.0  # 3.0 - 2.0
 

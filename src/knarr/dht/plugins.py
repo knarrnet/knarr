@@ -136,6 +136,7 @@ class PluginContext:
     query_receipts: Optional[Callable] = None     # v0.35.0: query receipt_log with filters
     query_prepaid_balance: Optional[Callable] = None  # v0.36.0: (peer_key) -> float
     economy_config: Optional[dict] = None         # v0.42.0: global [economy] config section
+    get_plugin: Optional[Callable] = None         # v0.46.0: (name: str) -> Optional[PluginHooks]
 
 
 class PluginLoader:
@@ -161,6 +162,7 @@ class PluginLoader:
         self._node_id = node_id
         self._delivery_cb = delivery_cb
         self.plugins: List[PluginHooks] = []
+        self._name_to_plugin: Dict[str, PluginHooks] = {}  # v0.46.0: name → instance
 
     def load_plugins(self) -> None:
         """
@@ -255,6 +257,7 @@ class PluginLoader:
 
                     plugin_instance = plugin_class(plugin_context, config=plugin_config.get("config", {}))
                     self.plugins.append(plugin_instance)
+                    self._name_to_plugin[plugin_config["name"]] = plugin_instance  # v0.46.0
                     log.info(f"Loaded plugin: {plugin_config['name']} v{plugin_config.get('version', 'unknown')}")
 
                 except (ImportError, AttributeError, TypeError) as e:
@@ -368,6 +371,10 @@ class PluginLoader:
                 log.error(f"Plugin {plugin.__class__.__name__} failed in on_inbound_settlement: {e}")
                 return False  # fail-closed
         return True
+
+    def get_plugin_by_name(self, name: str) -> Optional[PluginHooks]:
+        """v0.46.0: Return the loaded plugin instance for the given plugin name, or None."""
+        return self._name_to_plugin.get(name)
 
     async def _safe_run_plugin_hook(self, hook_method: Callable, *args, **kwargs):
         """Helper to run plugin hooks, catching exceptions to prevent crashing the node."""

@@ -91,10 +91,10 @@ class TestPeerEconomy:
         assert pe.trust == 0.8
 
     def test_utilization_calculation(self):
-        # credit_limit=10, soft_limit=-5 → range=15
-        # balance=10 → utilization=0%, balance=-5 → utilization=100%
+        # A1.3 formula: utilization = abs(min(balance, 0)) / abs(hard_limit) * 100
+        # 0% = no debt (balance >= 0), 100% = at hard_limit (-10.0 default)
         pe_full = peer_economy_from_row(
-            _ledger_row(balance=-5.0, credit_limit=10.0, soft_limit=-5.0)
+            _ledger_row(balance=-10.0, credit_limit=10.0, soft_limit=-5.0)
         )
         assert pe_full.utilization_pct == 100.0
 
@@ -104,7 +104,7 @@ class TestPeerEconomy:
         assert pe_zero.utilization_pct == 0.0
 
         pe_half = peer_economy_from_row(
-            _ledger_row(balance=2.5, credit_limit=10.0, soft_limit=-5.0)
+            _ledger_row(balance=-5.0, credit_limit=10.0, soft_limit=-5.0)
         )
         assert pe_half.utilization_pct == 50.0
 

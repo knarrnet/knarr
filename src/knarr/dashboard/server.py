@@ -767,6 +767,8 @@ class CockpitServer:
                 else:
                     reason = getattr(result, "reason", "") or result.status
                     self._respond_error(writer, 409, f"Task rejected: {reason}")
+            except asyncio.TimeoutError:
+                self._respond_error(writer, 503, "Provider timeout — retry later")
             except Exception as e:
                 logger.error(f"API local async execute failed: {e}")
                 self._respond_error(writer, 500, "Task submission failed")
@@ -801,6 +803,8 @@ class CockpitServer:
                 else:
                     reason = getattr(result, "reason", "") or result.status
                     self._respond_error(writer, 409, f"Task rejected: {reason}")
+            except asyncio.TimeoutError:
+                self._respond_error(writer, 503, "Provider timeout — retry later")
             except Exception as e:
                 logger.error(f"API local async execute failed: {e}")
                 self._respond_error(writer, 500, "Task submission failed")
@@ -848,6 +852,8 @@ class CockpitServer:
             else:
                 reason = getattr(result, "reason", "") or result.status
                 self._respond_error(writer, 409, f"Task rejected: {reason}")
+        except asyncio.TimeoutError:
+            self._respond_error(writer, 503, "Provider timeout — retry later")
         except Exception as e:
             logger.error(f"API remote async execute failed: {e}")
             self._respond_error(writer, 500, "Task submission failed")

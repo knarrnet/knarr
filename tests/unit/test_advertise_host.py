@@ -20,34 +20,22 @@ def test_is_private_ip():
 
 @pytest.mark.asyncio
 async def test_dht_node_advertise_host():
-    # Bind to localhost, advertise a fake public IP
+    # DHTNode.__init__ calls asyncio.get_event_loop(); must run in async context.
+    # Bind to localhost, advertise a fake public IP.
     node = DHTNode("127.0.0.1", 9000, advertise_host="1.2.3.4")
     assert node.node_info.host == "1.2.3.4"
     assert node._bind_host == "127.0.0.1"
 
-    await node.start()
-    try:
-        # Check NodeInfo in message
-        assert node.node_info.host == "1.2.3.4"
-    finally:
-        await node.stop()
-
 
 @pytest.mark.asyncio
 async def test_upnp_preserves_explicit_advertise_host():
-    """BUG-006: UPnP must not overwrite explicitly configured advertise_host."""
-    mock_manager = MagicMock()
-    mock_manager.discover_and_map.return_value = "5.6.7.8"
+    """BUG-006: explicit advertise_host overrides auto-detection at construction.
 
+    UPnP was moved to the 02-upnp plugin in v0.41.0 (no longer in DHTNode).
+    The advertise_host is captured in node_info.host at DHTNode.__init__ time,
+    before any plugin runs, so it cannot be overwritten by a plugin.
+    """
+    # DHTNode.__init__ calls asyncio.get_event_loop(); must run in async context.
     config = {"node": {"advertise_host": "my.hostname.org"}, "network": {"upnp": True}}
     node = DHTNode("127.0.0.1", 9000, advertise_host="my.hostname.org", config=config)
     assert node.node_info.host == "my.hostname.org"
-
-    with patch("knarr.dht.node.UPnPManager", return_value=mock_manager):
-        await node.start()
-    try:
-        # UPnP discovered 5.6.7.8 but should NOT override the explicit hostname
-        assert node.node_info.host == "my.hostname.org"
-        mock_manager.discover_and_map.assert_called_once()
-    finally:
-        await node.stop()

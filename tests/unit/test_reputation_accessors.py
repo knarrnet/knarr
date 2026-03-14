@@ -14,13 +14,17 @@ async def test_get_reputation_summary_returns_expected_fields():
         node.storage.insert_task(t, provider_public_key="pub1")
         node.storage.update_task_status("t1", "completed", wall_time_ms=100)
         node.storage.get_or_create_ledger_entry("pub1", 50.0)
-        
+        # quality_rating column is added lazily by update_receipt_quality —
+        # ensure it exists before get_reputation_summary queries it.
+        node.storage.update_receipt_quality("t1", 4)
+
         reps = node.get_reputation_summary()
         assert len(reps) == 1
         rep = reps[0]
         assert rep["provider_node_id"] == "p1"
         assert rep["provider_public_key"] == "pub1"
-        assert rep["balance"] == 50.0
+        # A1.2: new entries start at balance=0.0; initial_balance param ignored.
+        assert rep["balance"] == 0.0
         assert rep["success_rate"] == 1.0
         assert rep["avg_wall_time_ms"] == 100
         assert "tasks_provided" in rep

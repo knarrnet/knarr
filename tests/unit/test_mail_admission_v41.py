@@ -41,7 +41,9 @@ class FakeNode:
         self._reminders = []
         self._config = {
             "mail": {"price": price},
-            "economy": {"default_soft_limit": 1.0, "default_hard_limit": 0.0},
+            # A1.2: balance starts at 0.0; hard_limit must be negative to extend credit.
+            # -1.0 allows exactly one 1.0-price mail before the sender is blocked.
+            "economy": {"default_soft_limit": 1.0, "default_hard_limit": -1.0},
             "skills": {},
         }
         if config:
@@ -136,7 +138,8 @@ async def test_first_mail_from_unknown_sender_is_accepted():
 
     assert ack.item_ids == ["m1"]
     assert node.storage.count_mail_inbox() == 1
-    assert node.storage.get_ledger_balance(public_key) == 0.0
+    # A1.2: balance starts at 0.0; after 1.0-cost mail is accepted, balance is -1.0
+    assert node.storage.get_ledger_balance(public_key) == -1.0
 
 
 @pytest.mark.asyncio

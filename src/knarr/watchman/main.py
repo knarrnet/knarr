@@ -65,14 +65,14 @@ def cmd_run(args: argparse.Namespace) -> None:
     log = logging.getLogger("knarr.watchman")
     log.info("WATCHMAN_INIT data_dir=%s config=%s", data_dir, args.config)
 
-    supervisor = Supervisor(cfg)
+    supervisor = Supervisor(cfg, config_path=args.config)
 
     async def _run() -> None:
         loop = asyncio.get_running_loop()
         if sys.platform != "win32":
             import signal as _signal
             loop.add_signal_handler(_signal.SIGTERM, lambda: asyncio.create_task(supervisor.stop()))
-            loop.add_signal_handler(_signal.SIGHUP, lambda: asyncio.create_task(supervisor.stop()))
+            loop.add_signal_handler(_signal.SIGHUP, lambda: supervisor.reload_config(args.config))
         try:
             await supervisor.run()
         finally:

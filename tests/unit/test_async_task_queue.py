@@ -4,14 +4,25 @@ import json
 import uuid
 import sys
 import hashlib
+from dataclasses import replace
 from unittest.mock import patch, MagicMock, AsyncMock
 from knarr.dht.node import DHTNode
 from knarr.core.messages import TaskRequest, TaskStatus, TaskResult
 
-# Mock knarr.mail.tls
+# Mock knarr.mail.tls so DHTNode can import without live TLS bindings.
+# Cleaned up after this module's tests via _cleanup_tls_mock to prevent
+# sys.modules contamination of test_tls.py and any other TLS-importing tests.
 mock_tls = MagicMock()
 mock_tls.resolve_cert_paths = MagicMock(return_value=("cert.pem", "key.pem"))
 sys.modules["knarr.mail.tls"] = mock_tls
+
+import pytest as _pytest
+
+@_pytest.fixture(autouse=True, scope="module")
+def _cleanup_tls_mock():
+    """Remove the knarr.mail.tls mock from sys.modules after this module's tests."""
+    yield
+    sys.modules.pop("knarr.mail.tls", None)
 
 @pytest.mark.asyncio
 async def test_async_mode_returns_accepted():
@@ -100,36 +111,41 @@ async def test_async_result_via_mail():
     await node.register_system_skills(config)
     await node.announce({"name": "test", "version": "1.0.0", "description": "test", "tags": ["test"], "input_schema": {}, "output_schema": {}})
     
+    # Use external public_key so caller_node_id != self.node_info.node_id.
+    # node.py:763 skips mail enqueue for self-calls (SELF_DELIVERY_SKIP);
+    # an external caller forces the mail path. _handle_task_request does not
+    # verify signatures, so replacing public_key after signing is safe.
+    ext_pub_key = "bb" * 32  # 64-char hex external caller key
+    ext_caller_node_id = hashlib.sha256(bytes.fromhex(ext_pub_key)).hexdigest()
+
     try:
         # Mock call_local("knarr-mail", ...) to verify it's called
         original_call_local = node.call_local
         node.call_local = AsyncMock(side_effect=original_call_local)
-        
-        req = node._sign(TaskRequest(
+
+        req = replace(node._sign(TaskRequest(
             task_id="t1",
             skill_name="test",
             requester_node_id="req",
             requester_host="127.0.0.1",
             requester_port=9999,
             mode="async"
-        ))
-        
+        )), public_key=ext_pub_key)
+
         resp = await node._handle_task_request(req)
         assert isinstance(resp, TaskStatus)
         job_id = resp.task_id
-        
+
         # Wait for worker to finish task
         await asyncio.sleep(0.5)
-        
+
         # Verify job status in storage
         job = node.storage.get_async_job(job_id)
         assert job["status"] == "completed"
         assert job["result"] == {"ok": True}
-        
-        # Verify mail was enqueued in outbox
-        # to_node is derived from public key
-        to_node = hashlib.sha256(bytes.fromhex(node._public_key_hex)).hexdigest()
-        outbox = node.storage.get_pending_outbox(to_node, limit=10)
+
+        # Verify mail was enqueued in outbox for the external caller
+        outbox = node.storage.get_pending_outbox(ext_caller_node_id, limit=10)
         found_mail = False
         for item in outbox:
             body = json.loads(item["body_json"])
