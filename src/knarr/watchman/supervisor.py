@@ -6,6 +6,7 @@ import logging
 import os
 import signal
 import socket
+import ssl
 import sys
 import time
 import urllib.error
@@ -311,11 +312,16 @@ class Supervisor:
             return False
 
         # Probe 2: HTTP GET /health
+        # WM-01: use unverified SSL context so self-signed cockpit certs don't
+        # trigger SSLCertVerificationError → health failure → crash loop.
         health_url = f"{cockpit_url}/health"
         try:
             def _fetch():
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
                 req = urllib.request.Request(health_url)
-                with urllib.request.urlopen(req, timeout=3) as resp:
+                with urllib.request.urlopen(req, timeout=3, context=ctx) as resp:
                     return resp.status == 200
             result = await loop.run_in_executor(None, _fetch)
             return result
