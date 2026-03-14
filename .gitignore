@@ -35,3 +35,10 @@ vault.db
 
 # Git worktrees
 .worktrees/
+
+# Internal sprint artifacts (must never reach public repo)
+REVIEW-*.md
+REMOVAL-MANIFEST-*.md
+BRIEF-*.md
+ROSTER-*.md
+agents/
