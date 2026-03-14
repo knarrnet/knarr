@@ -1,4 +1,5 @@
 import asyncio
+import importlib.util
 import logging
 import pytest
 import sqlite3
@@ -7,16 +8,24 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock, patch
 
-# Add firewall plugin dir to sys.path so we can import handler
-plugin_path = Path(__file__).parents[2] / "plugins" / "01-firewall"
-sys.path.insert(0, str(plugin_path))
-
 from knarr.core.messages import (
     Message, NodeInfo, Heartbeat, Announce, SyncRequest, SyncResponse,
     TaskRequest, TaskResult, TaskStatus, JoinRequest, Query, Warn, Blocked
 )
 from knarr.dht.plugins import PluginContext, NodeHealth
-from handler import FirewallPlugin
+
+# Load firewall handler with a unique module name to avoid sys.modules["handler"]
+# contamination when run alongside tests that also dynamically load plugin handlers
+# (e.g. test_seams_v37.py loads BCW/punchhole handlers, leaving "handler" in sys.modules).
+_plugin_dir = Path(__file__).parents[2] / "plugins" / "01-firewall"
+_fw_spec = importlib.util.spec_from_file_location("firewall_handler", str(_plugin_dir / "handler.py"))
+_fw_mod = importlib.util.module_from_spec(_fw_spec)
+sys.path.insert(0, str(_plugin_dir))
+try:
+    _fw_spec.loader.exec_module(_fw_mod)
+finally:
+    sys.path.remove(str(_plugin_dir))
+FirewallPlugin = _fw_mod.FirewallPlugin
 
 @pytest.fixture
 def firewall_ctx(tmp_path):

@@ -124,6 +124,10 @@ def _make_settle_body(signing_key, proposer_node_id, amount=8.0,
         "accepted_receipt_id": "sa_test",
         "schema_version": "1.0",
         "timestamp": 0.0,
+        # Required by validate_settle_request (added in v0.35.0)
+        "current_balance": -amount,
+        "credit_limit": 3.0,
+        "provider_wallet": "A" * 32,
     }
 
 
@@ -266,18 +270,19 @@ class TestH5_SettleRequestReplay:
         body = _make_settle_body(PEER_SK, PEER_NODE_ID, amount=8.0)
         item = {"from_node": PEER_NODE_ID, "body": body}
 
-        # First delivery succeeds
+        # First delivery succeeds — handler queues via storage.queue_settlement
+        # (handle_settle_request no longer calls on_inbound_settlement directly)
         _run(handler(item))
-        node._plugins.on_inbound_settlement.assert_called_once()
+        node.storage.queue_settlement.assert_called_once()
 
         # Simulate receipt already exists for second delivery
         node.storage.get_receipt = MagicMock(return_value={"receipt_id": "sa_test"})
-        node._plugins.on_inbound_settlement.reset_mock()
+        node.storage.queue_settlement.reset_mock()
         node.storage.update_ledger_refund.reset_mock()
 
         _run(handler(item))
-        # Second delivery must NOT trigger plugin or ledger update
-        node._plugins.on_inbound_settlement.assert_not_called()
+        # Second delivery must NOT queue settlement (dedup by accepted_receipt_id)
+        node.storage.queue_settlement.assert_not_called()
         node.storage.update_ledger_refund.assert_not_called()
 
 

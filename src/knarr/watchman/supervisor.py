@@ -6,6 +6,7 @@ import logging
 import os
 import signal
 import socket
+import ssl
 import sys
 import time
 import urllib.error
@@ -24,8 +25,9 @@ class Supervisor:
     - emits structured WATCHMAN_* log events
     """
 
-    def __init__(self, cfg: Dict[str, Any]):
+    def __init__(self, cfg: Dict[str, Any], config_path: str = ""):
         self._cfg = cfg
+        self._config_path = config_path
         self._node_cfg = cfg["node"]
         self._health_cfg = cfg["health"]
         self._recovery_cfg = cfg["recovery"]
@@ -74,6 +76,33 @@ class Supervisor:
         self._shutdown_requested = True
         self._running = False
         await self._terminate()
+
+    def reload_config(self, path: str = "") -> None:
+        """Reload watchman configuration from disk.
+
+        Live-updates health and recovery settings without restarting the
+        supervisor or the node process.  Call via SIGHUP (Linux/macOS) or by
+        dropping a ``.watchman_reload`` sentinel file next to watchman.toml
+        (Windows).
+        """
+        target = path or self._config_path
+        if not target:
+            log.warning("WATCHMAN_RELOAD_SKIP reason=no_config_path")
+            return
+        try:
+            from .config import load_config
+            new_cfg = load_config(target)
+            self._cfg = new_cfg
+            self._health_cfg = new_cfg["health"]
+            self._recovery_cfg = new_cfg["recovery"]
+            log.info(
+                "WATCHMAN_CONFIG_RELOAD path=%s health_interval=%s fail_threshold=%s",
+                target,
+                new_cfg["health"]["health_interval"],
+                new_cfg["health"]["health_fail_threshold"],
+            )
+        except Exception as e:
+            log.warning("WATCHMAN_RELOAD_ERROR error=%s — keeping previous config", e)
 
     def get_status(self) -> Dict[str, Any]:
         """Return current supervisor status dict."""
@@ -211,10 +240,24 @@ class Supervisor:
             await asyncio.sleep(check_interval)
 
     async def _health_loop(self) -> None:
-        interval = self._health_cfg["health_interval"]
-        fail_threshold = self._health_cfg["health_fail_threshold"]
-
         while self._running:
+            # Re-read each iteration so reload_config() takes effect immediately.
+            interval = self._health_cfg["health_interval"]
+            fail_threshold = self._health_cfg["health_fail_threshold"]
+
+            # Windows sentinel-file reload (SIGHUP unavailable on win32).
+            if sys.platform == "win32" and self._config_path:
+                sentinel = os.path.join(
+                    os.path.dirname(os.path.abspath(self._config_path)),
+                    ".watchman_reload",
+                )
+                if os.path.exists(sentinel):
+                    try:
+                        os.unlink(sentinel)
+                    except OSError:
+                        pass
+                    self.reload_config()
+
             await asyncio.sleep(interval)
             if not self._running:
                 break
@@ -269,11 +312,16 @@ class Supervisor:
             return False
 
         # Probe 2: HTTP GET /health
+        # WM-01: use unverified SSL context so self-signed cockpit certs don't
+        # trigger SSLCertVerificationError → health failure → crash loop.
         health_url = f"{cockpit_url}/health"
         try:
             def _fetch():
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
                 req = urllib.request.Request(health_url)
-                with urllib.request.urlopen(req, timeout=3) as resp:
+                with urllib.request.urlopen(req, timeout=3, context=ctx) as resp:
                     return resp.status == 200
             result = await loop.run_in_executor(None, _fetch)
             return result

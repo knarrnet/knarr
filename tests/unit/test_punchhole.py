@@ -116,6 +116,7 @@ def make_mock_ctx(tmp_path: Path, with_sign=False, sk=None, node_id=None):
     ctx = MagicMock()
     ctx.node_id = node_id or "a" * 64
     ctx.plugin_dir = tmp_path
+    ctx.state_dir = None  # forces fallback to plugin_dir for DB paths
     ctx.storage_path = None
 
     # Captured events
@@ -584,7 +585,7 @@ class TestStartupSequence:
         plugin = PunchholeBackendPlugin(ctx, {"schema_file": "exposure_schema.toml"})
 
         # Run the startup coroutine directly
-        asyncio.get_event_loop().run_until_complete(plugin._startup())
+        asyncio.run(plugin._startup())
 
         emitted = ctx._emitted
         event_types = [e["event"] for e in emitted]
@@ -617,7 +618,8 @@ class TestFrontendCacheHitMiss:
         }
         return sign_doc(doc, sk, node_id)
 
-    def test_request_before_backend_ready_rejected(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_request_before_backend_ready_rejected(self, tmp_path):
         """Test 6: request before backend.ready is rejected/not served."""
         sk, vk, node_id = make_keypair()
         ctx = make_mock_ctx(tmp_path)
@@ -628,15 +630,14 @@ class TestFrontendCacheHitMiss:
         signed_req = self._make_signed_request(sk, node_id)
         body = {"action": "request", "object_key": "skills", "payload": signed_req}
 
-        asyncio.get_event_loop().run_until_complete(
-            plugin.on_mail_received("punchhole.request", node_id, "us", body, None)
-        )
+        await plugin.on_mail_received("punchhole.request", node_id, "us", body, None)
 
         # No punchhole.response emitted — request silently dropped
         resp_events = [e for e in ctx._emitted if e["event"] == "punchhole.response"]
         assert len(resp_events) == 0
 
-    def test_request_invalid_signature_rejected(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_request_invalid_signature_rejected(self, tmp_path):
         """Test 2: invalid signature -> reject, no response emitted."""
         ctx = make_mock_ctx(tmp_path)
         plugin = PunchholeFrontendPlugin(ctx, {"disclosure_log": "test_disc2.db"})
@@ -647,14 +648,13 @@ class TestFrontendCacheHitMiss:
         bad_request = {"document_type": "punchhole_request", "version": 1, "object_key": "skills"}
         body = {"action": "request", "object_key": "skills", "payload": bad_request}
 
-        asyncio.get_event_loop().run_until_complete(
-            plugin.on_mail_received("punchhole.request", requester_nid, "us", body, None)
-        )
+        await plugin.on_mail_received("punchhole.request", requester_nid, "us", body, None)
 
         resp_events = [e for e in ctx._emitted if e["event"] == "punchhole.response"]
         assert len(resp_events) == 0
 
-    def test_cache_hit_serves_object(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_cache_hit_serves_object(self, tmp_path):
         """Test 1: valid sig + cached object -> punchhole.response emitted."""
         sk, vk, node_id = make_keypair()
         ctx = make_mock_ctx(tmp_path)
@@ -670,16 +670,15 @@ class TestFrontendCacheHitMiss:
         signed_req = self._make_signed_request(sk, node_id, "skills")
         body = {"action": "request", "object_key": "skills", "payload": signed_req}
 
-        asyncio.get_event_loop().run_until_complete(
-            plugin.on_mail_received("punchhole.request", node_id, "us", body, None)
-        )
+        await plugin.on_mail_received("punchhole.request", node_id, "us", body, None)
 
         resp_events = [e for e in ctx._emitted if e["event"] == "punchhole.response"]
         assert len(resp_events) == 1
         assert resp_events[0]["from_cache"] is True
         assert resp_events[0]["object_key"] == "skills"
 
-    def test_cache_miss_emits_miss_event(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_cache_miss_emits_miss_event(self, tmp_path):
         """Test 3: cache miss -> emits cache.miss.data.{key} with requester_node_id."""
         sk, vk, node_id = make_keypair()
         ctx = make_mock_ctx(tmp_path)
@@ -691,30 +690,28 @@ class TestFrontendCacheHitMiss:
         signed_req = self._make_signed_request(sk, node_id, "skills")
         body = {"action": "request", "object_key": "skills", "payload": signed_req}
 
-        asyncio.get_event_loop().run_until_complete(
-            plugin.on_mail_received("punchhole.request", node_id, "us", body, None)
-        )
+        await plugin.on_mail_received("punchhole.request", node_id, "us", body, None)
 
         miss_events = [e for e in ctx._emitted if e["event"].startswith("cache.miss.")]
         assert len(miss_events) == 1
         assert miss_events[0]["requester_node_id"] == node_id  # CRITICAL
         assert miss_events[0]["object_key"] == "skills"
 
-    def test_cache_fill_event_populates_cache(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_cache_fill_event_populates_cache(self, tmp_path):
         """Test 4: cache fill event -> object cached in memory."""
         ctx = make_mock_ctx(tmp_path)
         plugin = PunchholeFrontendPlugin(ctx, {"disclosure_log": "test_disc5.db"})
 
         fake_signed = {"document_type": "cache_object", "data": {}}
         # Simulate the effect of a cache.fill.* bus event being processed
-        asyncio.get_event_loop().run_until_complete(
-            _simulate_fill(plugin, "skills", "all_signed", fake_signed)
-        )
+        await _simulate_fill(plugin, "skills", "all_signed", fake_signed)
 
         assert ("skills", "all_signed") in plugin._cache
         assert plugin._cache[("skills", "all_signed")]["stale"] is False
 
-    def test_cache_stale_marks_entry_stale(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_cache_stale_marks_entry_stale(self, tmp_path):
         """Test 5: cache stale event -> entry marked stale, next request triggers miss."""
         ctx = make_mock_ctx(tmp_path)
         plugin = PunchholeFrontendPlugin(ctx, {"disclosure_log": "test_disc6.db"})
@@ -728,7 +725,8 @@ class TestFrontendCacheHitMiss:
 
         assert plugin._cache[("skills", "all_signed")]["stale"] is True
 
-    def test_disclosure_log_written(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_disclosure_log_written(self, tmp_path):
         """Test 7: disclosure log written on every request (hit or miss)."""
         sk, vk, node_id = make_keypair()
         ctx = make_mock_ctx(tmp_path)
@@ -740,9 +738,7 @@ class TestFrontendCacheHitMiss:
         signed_req = self._make_signed_request(sk, node_id, "skills")
         body = {"action": "request", "object_key": "skills", "payload": signed_req}
 
-        asyncio.get_event_loop().run_until_complete(
-            plugin.on_mail_received("punchhole.request", node_id, "us", body, None)
-        )
+        await plugin.on_mail_received("punchhole.request", node_id, "us", body, None)
 
         conn = sqlite3.connect(str(tmp_path / "test_disc7.db"))
         rows = conn.execute("SELECT requester, object_key, outcome FROM disclosure_log").fetchall()

@@ -110,7 +110,7 @@ class TestBusIdentityField:
         # security.* events should have identity
         assert 'security.egress_blocked' in content
         assert 'security.signature_invalid' in content
-        assert 'security.receipt_forgery' in content
+        assert 'security.identity_mismatch' in content
 
     def test_node_events_identity_source(self):
         """Test node.* events use self node_id as identity."""

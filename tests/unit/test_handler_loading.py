@@ -22,7 +22,7 @@ def test_load_handler_default_name(tmp_path):
 async def handle(data):
     return 1
 """)
-    handler = load_handler(str(skill_file), str(tmp_path))
+    handler = load_handler("skill.py", str(tmp_path))
     assert asyncio.run(handler({})) == 1
 
 def test_load_handler_missing_file(tmp_path):

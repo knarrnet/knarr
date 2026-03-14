@@ -1,6 +1,7 @@
 import asyncio
 import pytest
 import time
+from dataclasses import replace
 from knarr.dht.node import DHTNode
 from knarr.core.messages import TaskRequest
 
@@ -35,23 +36,23 @@ async def test_retry_after_estimation():
         return {"res": "ok"}
     node.register_handler("test", slow_handler)
 
-    try:
-        # Start one task (saturates the single worker)
-        req1 = node._sign(TaskRequest(task_id="t1", skill_name="test", requester_node_id="r", requester_host="127.0.0.1", requester_port=9999))
-        t1 = asyncio.create_task(node._process_message(req1))
-        await asyncio.sleep(0.1)
+    # Use external public_key to bypass v0.37.0 A1 self-call fast path.
+    # Saturate _active_workers directly (same pattern as test_provider_busy_when_queue_full)
+    # to avoid relying on timing of multiple _enqueue_write calls in _handle_task_request.
+    ext_key = "bb" * 32
 
+    try:
+        # Simulate one worker occupied (saturates task_slots=1)
+        node._active_workers = 1
         assert node._active_workers == 1
 
-        # Second task (fast): should get RETRY_AFTER immediately
-        req2 = node._sign(TaskRequest(task_id="t2", skill_name="test", requester_node_id="r", requester_host="127.0.0.1", requester_port=9999))
+        # Fast task (not slow=True): _active_workers >= task_slots AND not slow → RETRY_AFTER
+        req2 = replace(node._sign(TaskRequest(task_id="t2", skill_name="test", requester_node_id="r", requester_host="127.0.0.1", requester_port=9999)), public_key=ext_key)
         res2 = await node._process_message(req2)
 
         assert res2.status == "failed"
         assert res2.error["code"] == "RETRY_AFTER"
         assert res2.error["retry_after_seconds"] >= 1
-
-        await t1
 
     finally:
         await node.stop()
@@ -59,8 +60,8 @@ async def test_retry_after_estimation():
 @pytest.mark.asyncio
 async def test_provider_busy_when_queue_full():
     """Slow task gets PROVIDER_BUSY when queue is full."""
-    # task_slots=1 -> queue_max=2.
-    node = DHTNode("127.0.0.1", 0, config={"node": {"task_slots": 1}})
+    # task_slots=1, max_queue_depth=2: queue holds 2 items before rejecting
+    node = DHTNode("127.0.0.1", 0, config={"node": {"task_slots": 1, "max_queue_depth": 2}})
     await node.start()
 
     async def slow_handler(data):
@@ -90,7 +91,8 @@ async def test_provider_busy_when_queue_full():
         assert node._task_queue.qsize() == 2
 
         # Next slow task: queue full → PROVIDER_BUSY
-        req = node._sign(TaskRequest(task_id="busy", skill_name="test", requester_node_id="r", requester_host="127.0.0.1", requester_port=9999))
+        # External key bypasses self-call fast path so queue admission is reached.
+        req = replace(node._sign(TaskRequest(task_id="busy", skill_name="test", requester_node_id="r", requester_host="127.0.0.1", requester_port=9999)), public_key="bb" * 32)
         res = await node._process_message(req)
 
         assert res.status == "failed"

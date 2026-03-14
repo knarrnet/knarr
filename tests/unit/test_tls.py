@@ -5,6 +5,8 @@ import os
 import ssl
 import time
 
+import sys
+
 import pytest
 from nacl.signing import SigningKey
 
@@ -15,6 +17,29 @@ from knarr.mail.tls import (
     create_client_ssl_context,
 )
 from knarr.dht.sidecar import AssetSidecar
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _ensure_real_tls_bindings(request):
+    """Guard against sys.modules contamination from test_async_task_queue.py.
+
+    test_async_task_queue.py patches sys.modules["knarr.mail.tls"] at module
+    level and runs before this file alphabetically. By the time pytest collects
+    this module, the mock is in place and the from-import above binds mock
+    objects. This fixture reimports the real module before the first test and
+    rebinds the module-level names so that all tests use the real functions.
+    Python test functions resolve global names from the module's __dict__ at
+    call time, so this rebind takes effect for all tests in the module.
+    """
+    import importlib
+    sys.modules.pop("knarr.mail.tls", None)
+    real_tls = importlib.import_module("knarr.mail.tls")
+    mod = request.module
+    mod.generate_tls_cert = real_tls.generate_tls_cert
+    mod.resolve_cert_paths = real_tls.resolve_cert_paths
+    mod.create_server_ssl_context = real_tls.create_server_ssl_context
+    mod.create_client_ssl_context = real_tls.create_client_ssl_context
+    yield
 
 
 @pytest.fixture
@@ -84,6 +109,7 @@ def test_auto_cert_no_overwrite(tmp_path, node_identity):
     assert os.path.getmtime(cert_path2) == cert_mtime
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="chmod 0600 not applicable on Windows")
 def test_key_pem_permissions(tmp_path, node_identity):
     """key.pem should be chmod 0600."""
     key_bytes, node_id = node_identity
@@ -143,6 +169,9 @@ async def test_sidecar_tls_rejects_plaintext(tmp_path, signing_key):
         cert_path=cert_path, key_path=key_path,
     )
     await sidecar.start()
+    # Yield to the event loop so the server's TLS state machine can settle before
+    # the first connection attempt (prevents ssl_handshake_timeout in slow combined runs).
+    await asyncio.sleep(0.1)
     try:
         # Plaintext connection should fail (TLS is mandatory)
         reader, writer = await asyncio.open_connection("127.0.0.1", sidecar.port)
@@ -175,6 +204,9 @@ async def test_sidecar_tls_roundtrip(tmp_path, signing_key):
         cert_path=cert_path, key_path=key_path,
     )
     await sidecar.start()
+    # Yield to the event loop so the server's TLS state machine can settle before
+    # the first connection attempt (prevents ssl_handshake_timeout in slow combined runs).
+    await asyncio.sleep(0.1)
     try:
         data = b"test tls upload"
         content_hash = hashlib.sha256(data).hexdigest()

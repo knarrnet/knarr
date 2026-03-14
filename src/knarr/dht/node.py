@@ -1558,7 +1558,16 @@ class DHTNode:
             mode="async"
         ))
         
-        resp = await request_response(provider_host, provider_port, req, timeout=10.0)
+        # NODE-02: respect caller's timeout_ms rather than a hardcoded 10s.
+        # request_response returns None on timeout or connection failure — handle
+        # that explicitly so callers receive a retriable asyncio.TimeoutError
+        # instead of a RuntimeError("Unexpected response type: NoneType") → HTTP 500.
+        ack_timeout = min(60.0, timeout_ms / 1000.0)
+        resp = await request_response(provider_host, provider_port, req, timeout=ack_timeout)
+        if resp is None:
+            raise asyncio.TimeoutError(
+                f"Provider {provider_host}:{provider_port} did not acknowledge task within {ack_timeout:.0f}s"
+            )
         if isinstance(resp, TaskStatus) and verify_message(resp):
             return resp
         elif isinstance(resp, TaskResult) and verify_message(resp):
@@ -1685,6 +1694,7 @@ class DHTNode:
                 ctx.sign_document = _sign_cb       # v0.35.0
                 ctx.query_receipts = _query_cb     # v0.35.0
                 ctx.economy_config = dict(self._config.get("economy", {}))  # v0.42.0
+                ctx.get_plugin = self._plugins.get_plugin_by_name  # v0.46.0
                 # If plugin set itself as group_engine, pick it up
                 if ctx.group_engine is not None:
                     self._group_engine = ctx.group_engine

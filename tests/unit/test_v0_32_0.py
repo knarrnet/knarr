@@ -8,6 +8,28 @@ Test plan:
   Meta receipts endpoint: counterparty fetch, forbidden, not_found
 """
 import asyncio
+
+
+def _run_async(coro):
+    """Run a coroutine without leaving the thread's current event loop as None.
+
+    asyncio.run() closes the loop it creates and sets the thread-local current
+    loop to None on exit.  On Python 3.12+ asyncio.get_event_loop() raises
+    RuntimeError when the current loop is None, breaking any subsequent test
+    that calls asyncio.get_event_loop() (e.g. test_v0_32_0_exploits).
+    This helper installs a fresh open loop after teardown so the invariant is
+    preserved.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
+        asyncio.set_event_loop(asyncio.new_event_loop())
 import base64
 import json
 import math
@@ -108,29 +130,30 @@ class TestEventBusSlowSubscriber(unittest.TestCase):
 
     def setUp(self):
         from knarr.dht.eventbus import EventBus
-        self.bus = EventBus(size=4)  # tiny ring to force wrap-around
+        # EventBus enforces minimum size of 16 (max(16, size)), so size=16 is the smallest ring.
+        self.bus = EventBus(size=16)
 
     def test_slow_subscriber_skips(self):
         sub = self.bus.subscribe("*")
-        # Emit 6 events — ring size is 4, so oldest 2 are evicted
-        for i in range(6):
+        # Emit 20 events — ring size is 16, so oldest 4 are evicted
+        for i in range(20):
             self.bus.emit(f"event.{i}", seq=i)
-        # Subscriber was at cursor=0 but oldest available is now at head-size = 6-4=2
+        # Subscriber was at cursor=0 but oldest available is now at head-size = 20-16=4
         events = sub.poll()
-        # Should skip to oldest and return 4 events (indices 2,3,4,5)
-        self.assertEqual(len(events), 4)
+        # Should skip to oldest and return 16 events (indices 4..19)
+        self.assertEqual(len(events), 16)
         seqs = [e["seq"] for e in events]
-        self.assertEqual(seqs, [2, 3, 4, 5])
+        self.assertEqual(seqs, list(range(4, 20)))
 
     def test_slow_subscriber_no_crash(self):
         """Verifies that a very slow subscriber doesn't crash the bus."""
         sub = self.bus.subscribe("*")
-        # Emit 100 events through a size-4 ring
+        # Emit 100 events through a size-16 ring
         for i in range(100):
             self.bus.emit("tick", i=i)
         events = sub.poll()
-        # Should receive only the last 4
-        self.assertEqual(len(events), 4)
+        # Should receive only the last 16
+        self.assertEqual(len(events), 16)
         self.assertEqual(events[-1]["i"], 99)
 
 
@@ -774,7 +797,7 @@ class TestEventBusAsync(unittest.TestCase):
     """Async tests for EventBus.next() blocking behavior."""
 
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return _run_async(coro)
 
     def test_next_returns_existing_event(self):
         from knarr.dht.eventbus import EventBus
@@ -827,7 +850,7 @@ class TestEventBusAsync(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_bumped(self):
         from knarr import __version__
-        self.assertEqual(__version__, "0.32.0")
+        self.assertEqual(__version__, "0.45.0")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

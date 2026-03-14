@@ -103,15 +103,15 @@ class TestCumulativeRefund:
 # ── B3: Commerce handler refund cap ──────────────────────────────
 
 class TestCommerceRefundCap:
-    def test_refund_capped_at_2x_original(self):
-        """Credit note rejected when cumulative refund exceeds 2x original price."""
+    def test_refund_capped_at_1x_original(self):
+        """Credit note rejected when amount exceeds original price (1x cap)."""
         from knarr.commerce.handlers import make_commerce_handlers
 
         node = MagicMock()
         node._enqueue_write = AsyncMock()
         node.storage = MagicMock()
         node.storage.get_execution_log_entry.return_value = {"price": 10.0}
-        node.storage.get_cumulative_refund.return_value = 15.0  # already 15 of 20 max
+        # get_cumulative_refund removed from handler (v0.35.0): 1x per-note cap replaces 2x cumulative cap
         node.storage.get_all_ledger_entries.return_value = [
             {"peer_public_key": "ab" * 32}
         ]
@@ -121,7 +121,7 @@ class TestCommerceRefundCap:
 
         item = {"body": {
             "type": "knarr/commerce/credit_note",
-            "amount": 10.0,  # 15 + 10 = 25 > 20 (2x cap)
+            "amount": 11.0,  # exceeds 1x cap of 10.0 → rejected
             "reason": "quality_rejection",
             "timestamp": 0,
             "schema_version": "1.0",
@@ -129,7 +129,7 @@ class TestCommerceRefundCap:
         }, "from_node": sender_id}
 
         _run(handlers["knarr/commerce/credit_note"](item))
-        # Should NOT call update_ledger_refund because cap exceeded
+        # Should NOT call _enqueue_write because amount > original price
         node._enqueue_write.assert_not_called()
 
 
@@ -177,6 +177,7 @@ class TestStaleInboxMessages:
 class TestMinimumPriceFloor:
     def test_global_minimum_price_applied(self):
         """Global minimum_price from [skills] config overrides low prices."""
+        import types
         from knarr.dht.node import DHTNode
 
         node = MagicMock(spec=DHTNode)
@@ -189,12 +190,16 @@ class TestMinimumPriceFloor:
         node.storage = MagicMock()
         node.storage._get_conn.return_value.execute.return_value.fetchall.return_value = []
         node.storage._get_conn.return_value.execute.return_value.fetchone.return_value = None
+        # MagicMock(spec=DHTNode) intercepts _resolve_price_builtin — bind real impl so
+        # _resolve_price can delegate to it correctly.
+        node._resolve_price_builtin = types.MethodType(DHTNode._resolve_price_builtin, node)
 
         price, breakdown = DHTNode._resolve_price(node, "deadbeef" * 8, 0.1, "test-skill")
         assert price >= 0.5
 
     def test_no_minimum_price_default(self):
         """When minimum_price not set, global minimum is 0.0 (existing static floor still applies)."""
+        import types
         from knarr.dht.node import DHTNode
 
         node = MagicMock(spec=DHTNode)
@@ -207,6 +212,8 @@ class TestMinimumPriceFloor:
         node.storage = MagicMock()
         node.storage._get_conn.return_value.execute.return_value.fetchall.return_value = []
         node.storage._get_conn.return_value.execute.return_value.fetchone.return_value = None
+        # Bind real _resolve_price_builtin — MagicMock otherwise intercepts and returns empty mock.
+        node._resolve_price_builtin = types.MethodType(DHTNode._resolve_price_builtin, node)
 
         price, breakdown = DHTNode._resolve_price(node, "deadbeef" * 8, 0.0, "free-skill")
         # The pricing system has a static floor of 0.01 by default (from pricing.min_price).

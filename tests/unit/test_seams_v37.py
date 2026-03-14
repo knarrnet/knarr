@@ -35,6 +35,33 @@ from knarr.cli.config import (
 )
 
 
+def _run_async(coro):
+    """Run a coroutine in an isolated event loop without leaving the thread's
+    current event loop as None afterwards.
+
+    ``asyncio.run()`` closes the loop it creates and sets the thread-local
+    current event loop to None on exit.  On Python 3.12+ that causes
+    ``asyncio.get_event_loop()`` to raise RuntimeError in any subsequent test
+    that calls it synchronously (e.g. the punchhole backend __init__ which
+    calls asyncio.ensure_future).  This helper installs a fresh, open loop
+    after the coroutine finishes, preserving the pre-3.12 behaviour that other
+    tests in the suite depend on.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
+        # Install a fresh loop so subsequent asyncio.get_event_loop() calls
+        # in the same thread (e.g. punchhole backend __init__) don't raise
+        # RuntimeError on Python 3.12+.
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+
 # ---------- Shared test infrastructure ----------
 
 NODE_ID = "a" * 64
@@ -55,9 +82,10 @@ class _QuarantineStorage:
 
     def quarantine_store(self, id, document_type, document_json,
                          originator_pubkey, status, gate_results, reason):
+        import json as _json
         self._rows[id] = {
             "id": id, "document_type": document_type,
-            "document_json": document_json,
+            "document_json": _json.dumps(document_json, sort_keys=True) if isinstance(document_json, dict) else document_json,
             "originator_pubkey": originator_pubkey,
             "status": status, "gate_results": gate_results,
             "reason": reason, "received_at": time.time(),
@@ -91,6 +119,7 @@ def _make_wm(config_override=None, storage=None):
         identity_fragments=IDENTITY_FRAGMENTS,
         bus=bus, storage=st, config=config,
         write_receipt_cb=wr,
+        internal_signer_keys={},
     )
     return wm, bus, st, wr
 
@@ -297,6 +326,7 @@ class TestFrontendObjectKeyToBus(unittest.TestCase):
         ctx = SimpleNamespace(
             node_id="a" * 64,
             plugin_dir=tmp_path,
+            state_dir=None,
             storage_path=None,
             subscribe_events=None,
             sign_document=None,
@@ -310,64 +340,64 @@ class TestFrontendObjectKeyToBus(unittest.TestCase):
     def test_valid_key_emits_miss(self, mock_verify):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            plugin, emitted = self._make_frontend(Path(tmp))
-            sk = SigningKey.generate()
-            node_id = sk.verify_key.encode().hex()
-            body = {
-                "action": "request",
-                "object_key": "economy.summary",
-                "payload": sign_document(
-                    {"document_type": "punchhole_request", "version": 1,
-                     "object_key": "economy.summary", "ts": time.time()},
-                    sk, f"did:knarr:{node_id}#key-1",
-                ),
-            }
-            asyncio.get_event_loop().run_until_complete(
-                plugin.on_mail_received("punchhole.request", node_id,
-                                        "a" * 64, body, None)
-            )
-            miss = [e for e in emitted if e["event"].startswith("cache.miss.")]
-            self.assertEqual(len(miss), 1)
-            self.assertEqual(miss[0]["event"], "cache.miss.data.economy.summary")
+            async def _run():
+                plugin, emitted = self._make_frontend(Path(tmp))
+                sk = SigningKey.generate()
+                node_id = sk.verify_key.encode().hex()
+                body = {
+                    "action": "request",
+                    "object_key": "economy.summary",
+                    "payload": sign_document(
+                        {"document_type": "punchhole_request", "version": 1,
+                         "object_key": "economy.summary", "ts": time.time()},
+                        sk, f"did:knarr:{node_id}#key-1",
+                    ),
+                }
+                await plugin.on_mail_received("punchhole.request", node_id,
+                                              "a" * 64, body, None)
+                miss = [e for e in emitted if e["event"].startswith("cache.miss.")]
+                self.assertEqual(len(miss), 1)
+                self.assertEqual(miss[0]["event"], "cache.miss.data.economy.summary")
+            _run_async(_run())
 
     @patch.object(_FRONTEND_MOD, "verify_document", return_value=True)
     def test_path_traversal_key_blocked(self, mock_verify):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            plugin, emitted = self._make_frontend(Path(tmp))
-            sk = SigningKey.generate()
-            node_id = sk.verify_key.encode().hex()
-            body = {
-                "action": "request",
-                "object_key": "../../etc/passwd",
-                "payload": sign_document(
-                    {"document_type": "punchhole_request", "version": 1,
-                     "object_key": "../../etc/passwd", "ts": time.time()},
-                    sk, f"did:knarr:{node_id}#key-1",
-                ),
-            }
-            asyncio.get_event_loop().run_until_complete(
-                plugin.on_mail_received("punchhole.request", node_id,
-                                        "a" * 64, body, None)
-            )
-            miss = [e for e in emitted if e["event"].startswith("cache.miss.")]
-            self.assertEqual(len(miss), 0, "Path traversal key must not emit bus event")
+            async def _run():
+                plugin, emitted = self._make_frontend(Path(tmp))
+                sk = SigningKey.generate()
+                node_id = sk.verify_key.encode().hex()
+                body = {
+                    "action": "request",
+                    "object_key": "../../etc/passwd",
+                    "payload": sign_document(
+                        {"document_type": "punchhole_request", "version": 1,
+                         "object_key": "../../etc/passwd", "ts": time.time()},
+                        sk, f"did:knarr:{node_id}#key-1",
+                    ),
+                }
+                await plugin.on_mail_received("punchhole.request", node_id,
+                                              "a" * 64, body, None)
+                miss = [e for e in emitted if e["event"].startswith("cache.miss.")]
+                self.assertEqual(len(miss), 0, "Path traversal key must not emit bus event")
+            _run_async(_run())
 
     @patch.object(_FRONTEND_MOD, "verify_document", return_value=True)
     def test_list_body_does_not_crash(self, mock_verify):
         """JSON list body must be rejected gracefully, not crash."""
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            plugin, emitted = self._make_frontend(Path(tmp))
-            # String that parses to a list
-            body = "[1, 2, 3]"
-            asyncio.get_event_loop().run_until_complete(
-                plugin.on_mail_received("punchhole.request", "b" * 64,
-                                        "a" * 64, body, None)
-            )
-            # Should not crash, no events emitted
-            miss = [e for e in emitted if e["event"].startswith("cache.miss.")]
-            self.assertEqual(len(miss), 0)
+            async def _run():
+                plugin, emitted = self._make_frontend(Path(tmp))
+                # String that parses to a list
+                body = "[1, 2, 3]"
+                await plugin.on_mail_received("punchhole.request", "b" * 64,
+                                              "a" * 64, body, None)
+                # Should not crash, no events emitted
+                miss = [e for e in emitted if e["event"].startswith("cache.miss.")]
+                self.assertEqual(len(miss), 0)
+            _run_async(_run())
 
 
 # =====================================================================
@@ -400,26 +430,28 @@ class TestCardThroughWM(unittest.TestCase):
             )
 
             ctx = SimpleNamespace(
-                node_id=node_id, plugin_dir=tmp_path, storage_path=None,
+                node_id=node_id, plugin_dir=tmp_path, state_dir=None, storage_path=None,
                 subscribe_events=None,
                 emit_event=lambda *a, **kw: None,
                 sign_document=lambda doc: sign_document(doc, sk, f"did:knarr:{node_id}#key-1"),
                 log=SimpleNamespace(warning=lambda *a, **k: None),
             )
-            backend = PunchholeBackendPlugin(ctx, {"schema_file": "exposure_schema.toml"})
+            async def _run():
+                backend = PunchholeBackendPlugin(ctx, {"schema_file": "exposure_schema.toml"})
 
-            # Build a card
-            requester = "b" * 64
-            card = backend.build_card(requester)
-            self.assertIsNotNone(card)
+                # Build a card
+                requester = "b" * 64
+                card = backend.build_card(requester)
+                self.assertIsNotNone(card)
 
-            # Feed it through WM as a punchhole_card document
-            card["document_type"] = "punchhole_card"
-            card["type"] = "knarr/commerce/punchhole_card"
-            wm, bus, st, wr = _make_wm()
-            result = wm.ingest(card, FAKE_PUBKEY)
-            self.assertEqual(result.status, "promoted",
-                             f"Card from backend should pass WM gates, got: {result}")
+                # Feed it through WM as a punchhole_card document
+                card["document_type"] = "punchhole_card"
+                card["type"] = "knarr/commerce/punchhole_card"
+                wm, bus, st, wr = _make_wm()
+                result = wm.ingest(card, FAKE_PUBKEY)
+                self.assertEqual(result.status, "promoted",
+                                 f"Card from backend should pass WM gates, got: {result}")
+            _run_async(_run())
 
 
 # =====================================================================
@@ -526,20 +558,20 @@ class TestStartupIdempotency(unittest.TestCase):
             )
 
             ctx = SimpleNamespace(
-                node_id=node_id, plugin_dir=tmp_path, storage_path=None,
+                node_id=node_id, plugin_dir=tmp_path, state_dir=None, storage_path=None,
                 subscribe_events=None,
                 emit_event=lambda et, **kw: emitted.append({"event": et, **kw}),
                 sign_document=lambda doc: sign_document(doc, sk, f"did:knarr:{node_id}#key-1"),
                 log=SimpleNamespace(warning=lambda *a, **k: None),
             )
 
-            plugin = PunchholeBackendPlugin(ctx, {"schema_file": "exposure_schema.toml"})
-            # __init__ schedules startup via ensure_future, run it
-            asyncio.get_event_loop().run_until_complete(plugin._startup())
-
-            ready_count = sum(1 for e in emitted if e["event"] == "cache.backend.ready")
-            self.assertEqual(ready_count, 1,
-                             f"cache.backend.ready emitted {ready_count} times, expected 1")
+            async def _run():
+                plugin = PunchholeBackendPlugin(ctx, {"schema_file": "exposure_schema.toml"})
+                await plugin._startup()
+                ready_count = sum(1 for e in emitted if e["event"] == "cache.backend.ready")
+                self.assertEqual(ready_count, 1,
+                                 f"cache.backend.ready emitted {ready_count} times, expected 1")
+            _run_async(_run())
 
 
 # =====================================================================
@@ -557,6 +589,7 @@ def _make_bcw(tmp_path):
 
     ctx = SimpleNamespace(
         plugin_dir=tmp_path,
+        state_dir=None,
         node_id="a" * 64,
         subscribe_events=lambda *patterns: SimpleNamespace(poll=lambda: []),
         get_peers=lambda: [],

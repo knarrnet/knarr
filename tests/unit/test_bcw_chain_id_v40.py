@@ -66,8 +66,8 @@ def _load_handler_module():
 # Source-level check (does not require nacl import to succeed)
 # ---------------------------------------------------------------------------
 
-def test_source_has_startswith_solana():
-    """Verify the handler.py source was patched to use startswith('solana-')."""
+def test_source_has_multi_chain_support():
+    """Verify handler.py supports multiple Solana chain IDs (not just mainnet)."""
     handler_path = os.path.join(
         os.path.dirname(__file__),
         "../../src/knarr/plugins/10-bcw/handler.py"
@@ -75,15 +75,18 @@ def test_source_has_startswith_solana():
     with open(handler_path, "r", encoding="utf-8") as f:
         source = f.read()
 
-    # All checks should use startswith("solana-") (with dash, not bare "solana")
-    assert 'startswith("solana-")' in source, (
-        'Expected startswith("solana-") in handler.py'
+    # Source uses a supported-chain set, not a single mainnet equality check
+    assert "_SUPPORTED_SOLANA_CHAIN_IDS" in source, (
+        "Expected _SUPPORTED_SOLANA_CHAIN_IDS set in handler.py"
     )
-    # Should not have any remaining == "solana-mainnet" chains
+    # testnet and devnet must be in the set definition
+    assert "solana-testnet" in source, "Expected solana-testnet in supported chains"
+    assert "solana-devnet" in source, "Expected solana-devnet in supported chains"
+    # Chain admission uses set membership — verify by checking set is used in validation
     import re
-    eq_mainnet = re.findall(r'chain_id\s*==\s*["\']solana-mainnet["\']', source)
-    assert not eq_mainnet, (
-        f"Found {len(eq_mainnet)} remaining == 'solana-mainnet' check(s): {eq_mainnet}"
+    set_checks = re.findall(r'chain_id\s+(?:not\s+)?in\s+_SUPPORTED_SOLANA_CHAIN_IDS', source)
+    assert len(set_checks) >= 3, (
+        f"Expected >= 3 set membership checks for chain admission, found {len(set_checks)}"
     )
 
 
@@ -151,8 +154,8 @@ def test_derive_master_address_non_solana_rejected():
 # Source-level check for SolanaWatcher instantiation (third occurrence)
 # ---------------------------------------------------------------------------
 
-def test_solana_watcher_init_uses_startswith():
-    """The SolanaWatcher init block uses startswith too."""
+def test_solana_watcher_init_uses_supported_set():
+    """The SolanaWatcher init block validates chain ID against the supported set."""
     handler_path = os.path.join(
         os.path.dirname(__file__),
         "../../src/knarr/plugins/10-bcw/handler.py"
@@ -160,8 +163,10 @@ def test_solana_watcher_init_uses_startswith():
     with open(handler_path, "r", encoding="utf-8") as f:
         source = f.read()
 
-    # Count all startswith("solana-") occurrences (tightened from bare "solana")
+    # Source uses set membership checks, not startswith
     import re
-    count = len(re.findall(r'startswith\(["\']solana-["\']\)', source))
-    # Expect at least 3 (derive_counterparty, _derive_master, SolanaWatcher init)
-    assert count >= 3, f"Expected >= 3 startswith('solana-') checks, found {count}"
+    # Expect at least 3 "chain_id ... _SUPPORTED_SOLANA_CHAIN_IDS" references
+    count = len(re.findall(r'_SUPPORTED_SOLANA_CHAIN_IDS', source))
+    assert count >= 3, (
+        f"Expected >= 3 _SUPPORTED_SOLANA_CHAIN_IDS references, found {count}"
+    )

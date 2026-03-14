@@ -138,7 +138,7 @@ async def test_sweep_loop_triggers_rejoin_on_single_peer_after_timeout():
 
     join_called = []
 
-    async def fake_join(peers):
+    async def fake_join(peers, **kwargs):
         join_called.append(peers)
         node._running = False  # stop after first trigger
 
@@ -230,7 +230,7 @@ async def test_sweep_loop_still_rebootstraps_on_zero_peers():
 
     join_called = []
 
-    async def fake_join(peers):
+    async def fake_join(peers, **kwargs):
         join_called.append(peers)
         node._running = False
 

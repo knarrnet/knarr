@@ -12,48 +12,49 @@ def test_task_context_has_cancelled():
 
 
 def test_system_mail_rejects_wrong_sender():
-    """V21-004: System mail handlers must reject status updates from non-provider senders."""
-    from knarr.dht.node import DHTNode
+    """V21-004: System mail handlers must reject status updates from non-provider senders.
 
-    # We need to test the handler logic without constructing a full node.
-    # Extract the handler method and call it with a mock self.
-    mock_node = MagicMock()
-    mock_node.storage = MagicMock()
+    Logic lives in MailHandlers._handle_task_result_mail (moved from DHTNode in v0.43.0 C1).
+    """
+    from knarr.dht.mail_handlers import MailHandlers
 
-    # Simulate a remote job tracked with provider_node_id = "aaa..."
     provider_id = "a" * 64
     attacker_id = "b" * 64
     job_id = "job-test-001"
 
-    mock_node.storage.get_async_job.return_value = {
+    mock_storage = MagicMock()
+    mock_storage.get_async_job.return_value = {
         "job_id": job_id,
         "provider_node_id": provider_id,
         "status": "remote",
     }
-    mock_node._enqueue_write = AsyncMock()
+    mock_sidecar = MagicMock()
+    mock_sidecar._signing_key = None
 
-    # Call the handler with attacker as sender
+    handlers = MailHandlers(
+        storage=mock_storage, bus=MagicMock(), asset_dir="", sidecar=mock_sidecar
+    )
+    handlers._enqueue_write = AsyncMock()
+
+    # Call with attacker as sender — _enqueue_write must NOT be called
     item = {
         "from_node": attacker_id,
         "body": {"job_id": job_id, "output_data": {"result": "pwned"}},
     }
-
-    # Run the unbound method with our mock
     loop = asyncio.new_event_loop()
     try:
-        loop.run_until_complete(DHTNode._handle_task_result_mail(mock_node, item))
+        loop.run_until_complete(handlers._handle_task_result_mail(item))
     finally:
         loop.close()
 
-    # _enqueue_write should NOT have been called — sender doesn't match provider
-    mock_node._enqueue_write.assert_not_called()
+    handlers._enqueue_write.assert_not_called()
 
-    # Now test with correct sender — should go through
+    # Call with correct sender — _enqueue_write must be called
     item["from_node"] = provider_id
     loop = asyncio.new_event_loop()
     try:
-        loop.run_until_complete(DHTNode._handle_task_result_mail(mock_node, item))
+        loop.run_until_complete(handlers._handle_task_result_mail(item))
     finally:
         loop.close()
 
-    mock_node._enqueue_write.assert_called_once()
+    handlers._enqueue_write.assert_called_once()

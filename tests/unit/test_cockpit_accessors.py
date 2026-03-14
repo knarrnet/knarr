@@ -79,9 +79,10 @@ async def test_get_economy_summary_returns_ledger():
         assert "summary" in summary
         assert len(summary["peers"]) == 1
         assert summary["peers"][0]["public_key"] == "key1"
-        assert summary["peers"][0]["balance"] == 5.0
+        # A1.2: new entries start at balance=0.0 regardless of initial_balance param
+        assert summary["peers"][0]["balance"] == 0.0
         assert summary["peers"][0]["status"] in ("green", "amber", "red")
-        assert summary["summary"]["net_position"] == 5.0
+        assert summary["summary"]["net_position"] == 0.0
     finally:
         await node.stop()
 
@@ -196,8 +197,8 @@ async def test_secret_injection():
     node = DHTNode("127.0.0.1", 0)
     await node.start()
     try:
-        # Manually set secrets (no file needed for unit test)
-        node._secrets = {"echo": {"api_key": "secret123", "default_mode": "fast"}}
+        # Manually set secrets via SecretsManager (node._inject_secrets delegates to _secrets_mgr)
+        node._secrets_mgr._secrets = {"echo": {"api_key": "secret123", "default_mode": "fast"}}
 
         # Injection adds missing keys
         result = node._inject_secrets("echo", {"text": "hello"})

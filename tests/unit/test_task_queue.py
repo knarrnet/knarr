@@ -1,6 +1,7 @@
 import asyncio
 import pytest
 import time
+from dataclasses import replace
 from knarr.dht.node import DHTNode
 from knarr.core.messages import TaskRequest
 
@@ -39,8 +40,10 @@ async def test_task_queue_accepts_within_capacity():
 @pytest.mark.asyncio
 async def test_task_queue_rejects_when_full():
     """Slow tasks fill the queue; next slow task gets PROVIDER_BUSY."""
-    # task_slots=1, maxsize=2
-    node = DHTNode("127.0.0.1", 0, config={"node": {"task_slots": 1}})
+    # task_slots=1, max_queue_depth=2: queue holds 2 items before rejecting
+    # Use external public_key to bypass the v0.37.0 A1 self-call fast path.
+    # _handle_task_request does not verify signatures, so replacing public_key is safe.
+    node = DHTNode("127.0.0.1", 0, config={"node": {"task_slots": 1, "max_queue_depth": 2}})
     await node.start()
 
     async def slow_handler(data):
@@ -53,11 +56,13 @@ async def test_task_queue_rejects_when_full():
         "input_schema": {}, "output_schema": {}
     })
 
+    ext_key = "bb" * 32  # 64-char hex external caller — bypasses is_self_call fast path
+
     try:
-        req1 = node._sign(TaskRequest(task_id="t1", skill_name="slow", requester_node_id="r", requester_host="127.0.0.1", requester_port=9999))
-        req2 = node._sign(TaskRequest(task_id="t2", skill_name="slow", requester_node_id="r", requester_host="127.0.0.1", requester_port=9999))
-        req3 = node._sign(TaskRequest(task_id="t3", skill_name="slow", requester_node_id="r", requester_host="127.0.0.1", requester_port=9999))
-        req4 = node._sign(TaskRequest(task_id="t4", skill_name="slow", requester_node_id="r", requester_host="127.0.0.1", requester_port=9999))
+        req1 = replace(node._sign(TaskRequest(task_id="t1", skill_name="slow", requester_node_id="r", requester_host="127.0.0.1", requester_port=9999)), public_key=ext_key)
+        req2 = replace(node._sign(TaskRequest(task_id="t2", skill_name="slow", requester_node_id="r", requester_host="127.0.0.1", requester_port=9999)), public_key=ext_key)
+        req3 = replace(node._sign(TaskRequest(task_id="t3", skill_name="slow", requester_node_id="r", requester_host="127.0.0.1", requester_port=9999)), public_key=ext_key)
+        req4 = replace(node._sign(TaskRequest(task_id="t4", skill_name="slow", requester_node_id="r", requester_host="127.0.0.1", requester_port=9999)), public_key=ext_key)
 
         # t1: worker available, enqueued + accepted (slow)
         t1 = asyncio.create_task(node._process_message(req1))

@@ -36,8 +36,9 @@ async def test_any_message_updates_last_activity():
             with patch("knarr.dht.node.verify_node_id", return_value=True):
                 # We need to bypass the process_message logic or mock it
                 with patch.object(node, "_process_message", return_value=None):
-                    # Mock _enqueue_write (writer task not started in unit tests)
+                    # Mock _enqueue_write and _enqueue_write_proto (writer task not started in unit tests)
                     node._enqueue_write = AsyncMock()
+                    node._enqueue_write_proto = AsyncMock()
                     # We need to bypass the connection tracking
                     node._active_connections = 0
                     await node._handle_connection(mock_reader, mock_writer)
@@ -65,7 +66,7 @@ async def test_silent_peer_gets_heartbeat():
     # For unit test, we can just trigger the loop once.
     with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
         try:
-            await node._heartbeat_loop()
+            await node._peer_heartbeat_sweep_loop()
         except asyncio.CancelledError:
             pass
             
@@ -92,7 +93,7 @@ async def test_active_peer_skips_heartbeat():
     
     with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
         try:
-            await node._heartbeat_loop()
+            await node._peer_heartbeat_sweep_loop()
         except asyncio.CancelledError:
             pass
             
@@ -116,7 +117,7 @@ async def test_dead_peer_removed_after_timeout():  # SENTINEL
     
     with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
         try:
-            await node._heartbeat_loop()
+            await node._peer_heartbeat_sweep_loop()
         except asyncio.CancelledError:
             pass
             
@@ -138,8 +139,10 @@ async def test_rebootstrap_when_no_peers():
     with patch.object(node, "join", new_callable=AsyncMock) as mock_join:
         with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
             try:
-                await node._heartbeat_loop()
+                await node._peer_heartbeat_sweep_loop()
             except asyncio.CancelledError:
                 pass
 
-    mock_join.assert_called_once_with(["1.1.1.1:9000"])
+    # _peer_heartbeat_sweep_loop calls join(..., skip_jitter=True) to avoid the
+    # exponential startup delay when re-bootstrapping from isolation.
+    mock_join.assert_called_once_with(["1.1.1.1:9000"], skip_jitter=True)

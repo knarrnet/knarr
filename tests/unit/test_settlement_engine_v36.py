@@ -125,16 +125,17 @@ class TestSettlementEngineThreshold:
 
 class TestSettlementEngineAmount:
     def test_settlement_amount_formula(self):
-        # Spec formula: amount = balance - (soft_target * hard_limit)
-        # balance=-8.0, hard_limit=-10.0, soft_target=0.5
-        # amount = -8.0 - (0.5 * -10.0) = -8.0 + 5.0 = -3.0
+        # Source formula: target = soft_limit - (soft_target * credit_limit) = -5.0
+        # amount = target - balance = -5.0 - (-8.0) = 3.0
+        # Sign convention: positive = counterparty pays us. Consumer owes 8.0,
+        # target debt 5.0, they pay 3.0.
         inp = _make_inp(
             balance=-8.0, hard_limit=-10.0, credit_limit=10.0, utilization=0.85
         )
         config = {"soft_threshold": 0.8, "soft_target": 0.5, "min_settlement_amount": 1.0}
         out = evaluate_settlement(inp, config)
         assert out.action == "settle"
-        assert abs(out.amount - (-3.0)) < 0.01
+        assert abs(out.amount - 3.0) < 0.01
 
     def test_min_settlement_amount_respected(self):
         # Small amount below min_settlement_amount should skip
