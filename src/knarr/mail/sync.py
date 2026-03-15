@@ -8,6 +8,13 @@ from ..core.messages import MailSync, MailAck, MailPullReq, MailPullResp, MailPu
 
 logger = logging.getLogger("knarr.mail.sync")
 
+# BR-GATE-001: commerce message types that are generated locally and carry no proof field.
+# WM auto_approve already covers these in wm-review.toml — these types bypass Gate 1/2
+# because they are not received from untrusted external sources; they are enqueued by
+# the local node itself (credit accounting path). Signed commerce documents (settlements,
+# credit_notes) are NOT in this set and always pass through WM normally.
+_TRUSTED_UNSIGNED_COMMERCE = {"knarr/commerce/tab_reminder"}
+
 class SyncEngine:
     """Core protocol store-and-forward mail sync engine."""
 
@@ -881,6 +888,15 @@ class SyncEngine:
                     # only go through WM if they carry a proof field; unsigned
                     # system messages are authenticated at the transport layer.
                     if not msg_type.startswith("knarr/commerce/"):
+                        if not isinstance(wm_document, dict) or "proof" not in wm_document:
+                            await handler(dispatch_item)
+                            return
+                    # BR-GATE-001: trusted unsigned commerce types bypass Gate 1/2.
+                    # These are locally-generated notifications with no proof field;
+                    # WM auto_approve covers them in wm-review.toml but Gate 1 rejects
+                    # before reaching the review rule (empty sender pubkey on self-delivery,
+                    # missing proof on cross-node path).
+                    if msg_type in _TRUSTED_UNSIGNED_COMMERCE:
                         if not isinstance(wm_document, dict) or "proof" not in wm_document:
                             await handler(dispatch_item)
                             return
