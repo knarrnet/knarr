@@ -731,6 +731,9 @@ class SyncEngine:
                         await self.push_to_peer(to_node, sh, sp)
                     else:
                         self._log.warning(f"MAIL_FLUSH_SKIP to={to_node[:16]} (not in peers, no override, no skill address)")
+                        _bus = getattr(self._node, 'bus', None)
+                        if _bus:
+                            _bus.emit("mail.flush_skip", to_node=to_node[:16])
 
     async def cleanup(self):
         """Periodic cleanup: expire outbox items, purge delivered items."""

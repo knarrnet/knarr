@@ -661,7 +661,10 @@ class BCWPlugin(PluginHooks):
 
         from knarr.core.constants import KNARR_DECIMALS
 
-        raw_amount = float(event.get("amount", 0.0))
+        raw_amount = int(event.get("amount", 0))
+        if raw_amount <= 0:
+            self._log_warning("BCW deposit credit skipped: non-positive amount %d", raw_amount)
+            return
         amount = raw_amount / (10 ** KNARR_DECIMALS)
         rate = get_conversion_rate({"economy": self._economy_config()})
         credits = token_to_credits(amount, rate)

@@ -110,6 +110,8 @@ def validate_tab_reminder(body: dict) -> tuple[bool, str | None]:
         v = body[nf]
         if not isinstance(v, (int, float)) or not _is_finite(v):
             return False, f"{nf} must be a finite number, got {v!r}"
+    if not (0.0 <= body["utilization_pct"] <= 100.0):
+        return False, f"utilization_pct must be 0-100, got {body['utilization_pct']!r}"
     return True, None
 
 

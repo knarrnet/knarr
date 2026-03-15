@@ -16,6 +16,7 @@ from .schemas import (
     validate_credit_note,
     validate_settle_request,
     validate_settlement_confirmation,
+    validate_tab_reminder,
 )
 
 logger = logging.getLogger("knarr.commerce")
@@ -164,6 +165,22 @@ def make_commerce_handlers(node) -> dict:
                     f"tx={body['tx_hash'][:16]} amount={body['amount_settled']} "
                     f"token={body.get('token', 'KNARR')}")
 
+    async def handle_tab_reminder(item: dict) -> None:
+        """Process knarr/commerce/tab_reminder mail."""
+        body = _parse_body(item)
+        if body is None:
+            return
+
+        valid, err = validate_tab_reminder(body)
+        if not valid:
+            logger.warning(f"Invalid tab_reminder from {item.get('from_node', '?')[:16]}: {err}")
+            return
+
+        logger.info(
+            f"TAB_REMINDER from={item.get('from_node', '?')[:16]} "
+            f"balance={body['current_balance']} utilization_pct={body['utilization_pct']}"
+        )
+
     # FIX-004/005/006: Netting session store — tracks active proposals by netting_id.
     # Keyed by netting_id; value is from_node and proposal details.
     _netting_sessions: dict = {}
@@ -232,6 +249,7 @@ def make_commerce_handlers(node) -> dict:
         "knarr/commerce/credit_note": handle_credit_note,
         "knarr/commerce/settle_request": handle_settle_request,
         "knarr/commerce/settlement_confirmation": handle_settlement_confirmation,
+        "knarr/commerce/tab_reminder": handle_tab_reminder,
         "knarr/commerce/netting_proposal": handle_netting_proposal,
         "knarr/commerce/netting_acceptance": handle_netting_acceptance,
     }
