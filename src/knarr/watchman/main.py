@@ -49,6 +49,39 @@ def _read_pid(data_dir: str) -> int | None:
         return None
 
 
+def _is_pid_alive(pid: int) -> bool:
+    """Return True if a process with *pid* is alive, False if confirmed dead.
+
+    On Windows, os.kill(pid, 0) raises OSError even for live processes when
+    the caller lacks PROCESS_QUERY_INFORMATION rights.  Use OpenProcess with
+    PROCESS_QUERY_LIMITED_INFORMATION (0x1000) instead:
+      - non-NULL handle  → alive (close it and return True)
+      - NULL + ERROR_ACCESS_DENIED (5) → alive but restricted (return True)
+      - NULL + any other error → dead or no such process (return False)
+    """
+    if sys.platform == "win32":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return ctypes.windll.kernel32.GetLastError() == 5  # ERROR_ACCESS_DENIED
+    else:
+        import errno
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError as e:
+            if e.errno == errno.EPERM:
+                return True  # alive but we lack rights
+            return False
+        except ProcessLookupError:
+            return False
+
+
 # ------------------------------------------------------------------
 # Commands
 # ------------------------------------------------------------------
@@ -94,12 +127,9 @@ def cmd_status(args: argparse.Namespace) -> None:
     cockpit_url = cfg["health"]["cockpit_url"]
 
     # Validate PID is actually alive (stale PID files on Windows after SIGTERM)
-    if pid is not None:
-        try:
-            os.kill(pid, 0)
-        except (OSError, ProcessLookupError):
-            _remove_pid(data_dir)
-            pid = None
+    if pid is not None and not _is_pid_alive(pid):
+        _remove_pid(data_dir)
+        pid = None
 
     print(f"watchman pid: {pid or 'not running'}")
 

@@ -98,6 +98,7 @@ class DHTNode:
         self._x25519_private = None
         self._x25519_public = None
         self._encryption_key_hex: str = ""
+        self._debug: bool = self._config.get("node", {}).get("debug", False)
         self._enc_debug: bool = self._config.get("encryption", {}).get("debug", False)
         # Egress filter initialization
         from ..core.egress_filter import EgressFilter
@@ -1614,6 +1615,11 @@ class DHTNode:
         
         addr = self.server.sockets[0].getsockname()
         logger.info(f"DHT node {self.node_info.node_id} serving on {addr}")
+        if not self._config.get("network", {}).get("bootstrap", []):
+            logger.warning(
+                "No bootstrap peers configured — this node is isolated from the network. "
+                "Add [network] bootstrap = [...] to knarr.toml or use --bootstrap flag"
+            )
         
         # Auto-generate TLS cert if missing (only for default paths, not custom)
         config_dir = self._config.get("_config_dir", os.getcwd())
@@ -4702,7 +4708,7 @@ class DHTNode:
         if last_settlement is not None:
             elapsed = max(0.0, time.time() - last_settlement)
             if elapsed < min_interval:
-                if self._debug:
+                if self._debug if hasattr(self, '_debug') else False:
                     logger.info(
                         "SETTLEMENT_CADENCE_GUARD peer=%s elapsed=%.0fs min_interval=%.0fs",
                         peer_key[:16], elapsed, min_interval,
@@ -4783,7 +4789,7 @@ class DHTNode:
         # A4: cadence written after successful enqueue — prevents burning the window on prepare failures
         now = time.time()
         self.storage.set_settlement_cadence(peer_key, now)
-        if self._debug:
+        if self._debug if hasattr(self, '_debug') else False:
             logger.info("SETTLEMENT_CADENCE_SET peer=%s", peer_key[:16])
 
     async def _handle_settlement_request(self, item: dict):
@@ -5198,7 +5204,8 @@ class DHTNode:
                 )
             except Exception as exc:
                 logger.error(
-                    f"SETTLEMENT_ITEM_FAILED id={item['id']} type={item['item_type']}: {exc}"
+                    f"SETTLEMENT_ITEM_FAILED id={item['id']} type={item['item_type']}: {exc}",
+                    exc_info=True,
                 )
                 await self._enqueue_write(
                     self.storage.mark_settlement_processed, item["id"], "failed"
@@ -5240,23 +5247,28 @@ class DHTNode:
             self._sweep_offset = (self._sweep_offset + SWEEP_BATCH_SIZE) % len(peers)
         else:
             batch = peers
-        for peer in batch:
-            last_seen = self._peer_last_activity.get(peer.node_id)
-            if last_seen is None:
-                # New peer — initialize activity to now, evaluate next cycle
-                self._peer_last_activity[peer.node_id] = now
-                continue
-            silence = now - last_seen
+        sem = asyncio.Semaphore(10)
 
-            if silence > self._peer_dead_timeout:
-                # Dead: no activity of any kind for too long
-                logger.warning(f"Removing dead peer {peer.node_id[:16]} (silent {silence:.0f}s)")
-                await self._enqueue_write(self.storage.remove_peer, peer.node_id)
-                await self._pool.remove(peer.node_id)
-                self._peer_last_activity.pop(peer.node_id, None)
-                continue
+        async def _hb_one(peer):
+            async with sem:
+                last_seen = self._peer_last_activity.get(peer.node_id)
+                if last_seen is None:
+                    # New peer — initialize activity to now, evaluate next cycle
+                    self._peer_last_activity[peer.node_id] = now
+                    return
+                silence = now - last_seen
 
-            if silence > self._heartbeat_silence_threshold:
+                if silence > self._peer_dead_timeout:
+                    # Dead: no activity of any kind for too long
+                    logger.warning(f"Removing dead peer {peer.node_id[:16]} (silent {silence:.0f}s)")
+                    await self._enqueue_write(self.storage.remove_peer, peer.node_id)
+                    await self._pool.remove(peer.node_id)
+                    self._peer_last_activity.pop(peer.node_id, None)
+                    return
+
+                if silence <= self._heartbeat_silence_threshold:
+                    return
+
                 # Silent: send dedicated heartbeat
                 logger.debug(f"HB_SEND to={peer.node_id[:16]} silence={silence:.0f}s")
                 msg = self._sign(Heartbeat(
@@ -5269,7 +5281,7 @@ class DHTNode:
                     resp = await self._pool.send(peer.node_id, h, p, msg)
                 except Exception:
                     logger.debug(f"HB_SEND_FAIL to={peer.node_id[:16]}", exc_info=True)
-                    continue
+                    return
                 if isinstance(resp, Heartbeat) and verify_message(resp) and verify_node_id(resp):
                     self._peer_last_activity[peer.node_id] = time.monotonic()
                     logger.debug(f"HB_SEND_OK to={peer.node_id[:16]}")
@@ -5308,6 +5320,10 @@ class DHTNode:
                             # v0.33.0: node.upgrade_available
                             if self.bus:
                                 self.bus.emit("node.upgrade_available", current_version=__version__, available_version=resp.version, identity=self.node_info.node_id)
+
+        results = await asyncio.gather(*(_hb_one(peer) for peer in batch), return_exceptions=True)
+        failed = sum(1 for r in results if isinstance(r, BaseException))
+        logger.debug("HB_SWEEP completed=%d failed=%d", len(results), failed)
 
     async def _heartbeat_tick(self):
         """Single heartbeat maintenance cycle. Separated for resilience.

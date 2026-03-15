@@ -119,7 +119,7 @@ class Supervisor:
     # Spawn / terminate
     # ------------------------------------------------------------------
 
-    async def _spawn(self) -> None:
+    async def _spawn(self, detached: bool = False) -> None:
         command = self._node_cfg["command"]
         args = list(self._node_cfg.get("args", []))
 
@@ -130,15 +130,39 @@ class Supervisor:
             argv = [command] + args
 
         log.info(
-            "WATCHMAN_START cmd=%s args=%s restart=%d",
-            command, " ".join(args), self._restart_count,
+            "WATCHMAN_START cmd=%s args=%s restart=%d detached=%s",
+            command, " ".join(args), self._restart_count, detached,
         )
 
-        self._proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=None,  # inherit — node writes its own logs
-            stderr=None,
-        )
+        if detached:
+            # Spawn outside the asyncio subprocess transport so the node survives
+            # ProactorEventLoop teardown (Windows) or supervisor exit (any platform).
+            import subprocess
+            if sys.platform == "win32":
+                DETACHED_PROCESS = 0x00000008
+                CREATE_NEW_PROCESS_GROUP = 0x00000200
+                subprocess.Popen(
+                    argv,
+                    creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                    close_fds=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                subprocess.Popen(
+                    argv,
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            # Detached processes are not tracked — health check via URL polling.
+            self._proc = None
+        else:
+            self._proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=None,  # inherit — node writes its own logs
+                stderr=None,
+            )
         self._start_time = time.monotonic()
 
     async def _terminate(self) -> None:

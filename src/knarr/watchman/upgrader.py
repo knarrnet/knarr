@@ -141,7 +141,8 @@ class Upgrader:
         source = self._upgrade_cfg["source"]
         org, repo = _parse_source(source)
         drain_timeout = self._upgrade_cfg["drain_timeout"]
-        health_timeout = self._upgrade_cfg["health_timeout"]
+        health_timeout = self._upgrade_cfg.get("upgrade_health_timeout",
+                                                self._upgrade_cfg["health_timeout"])
         current_version = _get_running_version()
 
         # --- CHECK ---
@@ -165,22 +166,13 @@ class Upgrader:
         expected_sha256 = None
 
         if release:
-            # Look for a wheel or sdist in release assets
-            for asset in release.get("assets", []):
-                name: str = asset.get("name", "")
-                if name.endswith(".whl") and "knarr" in name.lower():
-                    tarball_path = os.path.join(staging_dir, name)
-                    try:
-                        loop = asyncio.get_running_loop()
-                        await loop.run_in_executor(
-                            None, _download_file, asset["browser_download_url"], tarball_path
-                        )
-                    except Exception as e:
-                        log.warning("UPGRADE_DOWNLOAD_FAIL asset=%s error=%s", name, e)
-                        tarball_path = None
-                    break
+            assets = release.get("assets", [])
 
-                if name.lower() == "checksums.txt":
+            # O-033: Pass 1 — collect checksums before downloading any asset.
+            # Single-pass broke when checksums.txt appeared after the .whl in
+            # the asset list; the loop hit `break` before reaching checksums.txt.
+            for asset in assets:
+                if asset.get("name", "").lower() == "checksums.txt":
                     try:
                         req = urllib.request.Request(asset["browser_download_url"])
                         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -191,6 +183,24 @@ class Upgrader:
                                 expected_sha256 = parts[0]
                     except Exception:
                         pass
+                    break
+
+            # O-033: Pass 2 — download the wheel now that we have the checksum.
+            # O-031: os.path.basename() prevents path traversal via crafted asset names.
+            for asset in assets:
+                name: str = asset.get("name", "")
+                if name.endswith(".whl") and "knarr" in name.lower():
+                    safe_name = os.path.basename(name)  # O-031: strip any directory components
+                    tarball_path = os.path.join(staging_dir, safe_name)
+                    try:
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(
+                            None, _download_file, asset["browser_download_url"], tarball_path
+                        )
+                    except Exception as e:
+                        log.warning("UPGRADE_DOWNLOAD_FAIL asset=%s error=%s", safe_name, e)
+                        tarball_path = None
+                    break
 
         # --- VERIFY ---
         if tarball_path and os.path.exists(tarball_path):
@@ -229,8 +239,8 @@ class Upgrader:
             await self._rollback(org, repo, current_version, backup_dir)
             return False
 
-        # Start new version
-        await self._supervisor._spawn()
+        # Start new version — detached so it survives asyncio.run() teardown
+        await self._supervisor._spawn(detached=True)
 
         # --- HEALTH ---
         log.info("UPGRADE_HEALTH_CHECK timeout=%ds", health_timeout)
@@ -289,5 +299,5 @@ class Upgrader:
             log.error("UPGRADE_ROLLBACK_FAIL error=%s", e)
             return
 
-        await self._supervisor._spawn()
+        await self._supervisor._spawn(detached=True)
         log.info("UPGRADE_ROLLBACK_DONE version=%s", version)

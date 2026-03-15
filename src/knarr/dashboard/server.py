@@ -218,24 +218,42 @@ class CockpitServer:
         if isinstance(raw, dict):
             policy.update(raw)
         defaults = raw.get("defaults", {}) if isinstance(raw, dict) else {}
-        local_weight = defaults.get("local_weight", 1.0) if isinstance(defaults, dict) else 1.0
-        try:
-            local_weight = float(local_weight)
-        except (TypeError, ValueError):
-            logger.warning("ROUTING_LOCAL_WEIGHT_INVALID path=%s value=%r", routing_path, local_weight)
-            local_weight = 1.0
-        clamped_weight = max(0.0, min(2.0, local_weight))
-        if clamped_weight != local_weight:
-            logger.warning(
-                "ROUTING_LOCAL_WEIGHT_CLAMPED path=%s value=%s clamped=%s",
-                routing_path, local_weight, clamped_weight,
-            )
-        policy["defaults"] = {"local_weight": clamped_weight}
+        if not isinstance(defaults, dict):
+            defaults = {}
+
+        def _clamp_weight(key: str, default: float) -> float:
+            val = defaults.get(key, default)
+            try:
+                val = float(val)
+            except (TypeError, ValueError):
+                logger.warning("ROUTING_WEIGHT_INVALID path=%s key=%s value=%r", routing_path, key, val)
+                return default
+            clamped = max(0.0, min(2.0, val))
+            if clamped != val:
+                logger.warning(
+                    "ROUTING_WEIGHT_CLAMPED path=%s key=%s value=%s clamped=%s",
+                    routing_path, key, val, clamped,
+                )
+            return clamped
+
+        policy["defaults"] = {
+            "local_weight": _clamp_weight("local_weight", 1.0),
+            "explicit_weight": _clamp_weight("explicit_weight", 0.8),
+            "remote_weight": _clamp_weight("remote_weight", 0.5),
+        }
         return policy
 
     def get_local_weight(self, skill_name=None) -> float:
         """Return the configured local routing weight for /api/execute scoring."""
         return float(self._routing_policy.get("defaults", {}).get("local_weight", 1.0))
+
+    def get_explicit_weight(self) -> float:
+        """Return the configured explicit-tier routing weight."""
+        return float(self._routing_policy.get("defaults", {}).get("explicit_weight", 0.8))
+
+    def get_remote_weight(self) -> float:
+        """Return the configured remote (DHT-only) routing weight."""
+        return float(self._routing_policy.get("defaults", {}).get("remote_weight", 0.5))
 
     def _select_execute_provider(self, skill: str) -> Optional[Dict[str, Any]]:
         candidates = []
@@ -264,18 +282,41 @@ class CockpitServer:
         if not candidates:
             return None
 
+        # C1: Build explicit-tier set from the address book.  A single indexed
+        # SQLite read per /api/execute call.  Graceful if storage is absent.
+        explicit_ids: set = set()
+        storage = getattr(self._node, "storage", None)
+        if storage is not None:
+            try:
+                explicit_ids = {
+                    row["node_id"]
+                    for row in storage.get_addresses_by_tier("explicit")
+                }
+            except Exception:
+                pass  # address book unavailable — treat all remote as equal weight
+
         local_weight = self.get_local_weight(skill)
+        explicit_weight = self.get_explicit_weight()
+        remote_weight = self.get_remote_weight()
+
         scored = []
         for index, candidate in enumerate(candidates):
             normalized = dict(candidate)
-            score = 1.0
             if normalized.get("_local"):
-                score *= local_weight
-            scored.append((score, 0 if normalized.get("_local") else 1, index, normalized))
+                score = local_weight
+                tier_rank = 0
+            elif normalized.get("node_id") in explicit_ids:
+                score = explicit_weight
+                tier_rank = 1
+            else:
+                score = remote_weight
+                tier_rank = 2
+            scored.append((score, tier_rank, index, normalized))
+
         scored.sort(key=lambda entry: (-entry[0], entry[1], entry[2]))
         # Pick randomly among all equal-scored top-tier candidates to distribute load.
-        top_score, top_local = scored[0][0], scored[0][1]
-        top_tier = [c for c in scored if c[0] == top_score and c[1] == top_local]
+        top_score, top_tier_rank = scored[0][0], scored[0][1]
+        top_tier = [c for c in scored if c[0] == top_score and c[1] == top_tier_rank]
         import random
         return random.choice(top_tier)[3]
 
@@ -591,6 +632,8 @@ class CockpitServer:
                             self._respond_404(writer)
                         else:
                             self._respond_json(writer, schema)
+                    elif path == "/api/settlements":
+                        await self._handle_settlements_list(writer, query)
                     elif path.startswith("/api/receipts/"):
                         # v0.32.0: GET /api/receipts/{reference} — fetch credit note by job_id
                         reference = path[len("/api/receipts/"):]
@@ -2597,6 +2640,61 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
         limit = max(1, min(limit, 1000))
         logs = self._log_handler.tail(limit)
         self._respond_json(writer, {"logs": logs, "count": len(logs)})
+
+    async def _handle_settlements_list(self, writer, query: dict):
+        """GET /api/settlements — list settlement queue items."""
+        try:
+            status_filter = query.get("status", [None])[0]
+            limit = max(1, min(int(query.get("limit", ["50"])[0]), 500))
+            offset = max(0, int(query.get("offset", ["0"])[0]))
+        except (ValueError, TypeError):
+            self._respond_error(writer, 400, "Invalid limit or offset")
+            return
+        try:
+            conn = self._node.storage._get_conn()
+            if status_filter:
+                rows = conn.execute(
+                    "SELECT id, item_type, from_node, body, priority, status, created_at, processed_at "
+                    "FROM settlement_queue WHERE status = ? ORDER BY priority ASC, created_at ASC "
+                    "LIMIT ? OFFSET ?",
+                    (status_filter, limit, offset),
+                ).fetchall()
+                total_row = conn.execute(
+                    "SELECT COUNT(*) FROM settlement_queue WHERE status = ?",
+                    (status_filter,),
+                ).fetchone()
+            else:
+                rows = conn.execute(
+                    "SELECT id, item_type, from_node, body, priority, status, created_at, processed_at "
+                    "FROM settlement_queue ORDER BY priority ASC, created_at ASC "
+                    "LIMIT ? OFFSET ?",
+                    (limit, offset),
+                ).fetchall()
+                total_row = conn.execute(
+                    "SELECT COUNT(*) FROM settlement_queue"
+                ).fetchone()
+            total = total_row[0] if total_row else 0
+            settlements = []
+            for row in rows:
+                body_val = row[3]
+                if isinstance(body_val, str):
+                    try:
+                        body_val = json.loads(body_val)
+                    except Exception:
+                        pass
+                settlements.append({
+                    "id": row[0],
+                    "item_type": row[1],
+                    "from_node": row[2],
+                    "body": body_val,
+                    "priority": row[4],
+                    "status": row[5],
+                    "created_at": row[6],
+                    "processed_at": row[7],
+                })
+            self._respond_json(writer, {"settlements": settlements, "total": total})
+        except Exception:
+            self._respond_error(writer, 500, "Settlement query failed")
 
     async def _handle_settlement_execute(self, writer, body: bytes):
         """POST /api/settlements/execute — execute a countersigned settlement."""
