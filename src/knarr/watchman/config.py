@@ -34,6 +34,7 @@ _DEFAULTS: Dict[str, Any] = {
         "check_interval": 3600,
         "drain_timeout": 60,
         "health_timeout": 30,
+        "upgrade_health_timeout": 60,  # post-spawn health wait for cmd_upgrade detached spawn
         "source": "github:knarrnet/knarr",
     },
     "plugins": {

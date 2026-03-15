@@ -5,11 +5,15 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tarfile
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
+
+# O-034: plugin names written into TOML section headers must be safe identifiers.
+_PLUGIN_NAME_RE = re.compile(r'^[a-zA-Z0-9_-]+$')
 
 log = logging.getLogger("knarr.watchman.plugins")
 
@@ -57,6 +61,11 @@ def _write_manifest_simple(path: str, manifest: Dict[str, Any]) -> None:
     """Minimal TOML writer for plugins.toml — no library required."""
     lines = []
     for name, cfg in manifest.get("plugins", {}).items():
+        # O-034: reject names that would escape the TOML section header syntax.
+        if not _PLUGIN_NAME_RE.match(name):
+            raise ValueError(
+                f"Invalid plugin name {name!r}: must match [a-zA-Z0-9_-]+"
+            )
         lines.append(f"[plugins.{name}]")
         for k, v in cfg.items():
             if isinstance(v, bool):
@@ -168,7 +177,14 @@ def _extract_tarball(tarball_path: str, plugin_dir: str) -> None:
                 member.name = member.name[len(prefix):]
             if not member.name:
                 continue
-            tar.extract(member, path=plugin_dir)
+            # O-032: reject members whose name (after prefix strip) escapes the
+            # plugin directory — e.g. "../../../etc/passwd" or absolute paths.
+            if os.path.isabs(member.name) or member.name.startswith(".."):
+                log.warning("PLUGIN_EXTRACT_SKIP unsafe_member=%r", member.name)
+                continue
+            # WM-DEPR-01: filter='data' silences the Python 3.12+ DeprecationWarning
+            # and adds defence-in-depth path validation at the tarfile layer.
+            tar.extract(member, path=plugin_dir, filter="data")
 
 
 def install_plugin(
@@ -181,6 +197,12 @@ def install_plugin(
     Install a single plugin. Returns installed version tag.
     plugin_root: base directory where plugins live (e.g. data_dir/plugins/)
     """
+    # O-034: validate name before it is written into a TOML section header or
+    # used as a filesystem path component.
+    if not _PLUGIN_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid plugin name {name!r}: must match [a-zA-Z0-9_-]+"
+        )
     source: str = plugin_cfg.get("source", "")
     version_constraint: str = plugin_cfg.get("version", ">=0.0.0")
     expected_sha256: Optional[str] = plugin_cfg.get("sha256")
