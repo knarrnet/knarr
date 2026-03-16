@@ -29,9 +29,10 @@ class TestPluginContextField:
     """query_prepaid_balance must be a field in PluginContext."""
 
     def test_query_prepaid_balance_field_exists(self):
-        import dataclasses
-        fields = {f.name for f in dataclasses.fields(PluginContext)}
-        assert "query_prepaid_balance" in fields
+        """PluginContext is a regular class (D-007 Phase D); use hasattr not dataclasses.fields."""
+        ctx_vars = PluginContext.__init__.__code__.co_varnames
+        assert "query_prepaid_balance" in ctx_vars or hasattr(PluginContext, "query_prepaid_balance"), \
+            "query_prepaid_balance not found in PluginContext"
 
     def test_query_prepaid_balance_defaults_to_none(self):
         from pathlib import Path

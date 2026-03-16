@@ -4,15 +4,23 @@ from knarr.dht.plugins import PluginContext
 
 
 def test_plugin_context_has_register_mail_handler():
-    """PluginContext exposes register_mail_handler field."""
-    fields = {f.name for f in dataclasses.fields(PluginContext)}
-    assert "register_mail_handler" in fields
+    """PluginContext exposes register_mail_handler attribute.
+
+    PluginContext is a regular class (D-007 Phase D); use hasattr not dataclasses.fields.
+    """
+    assert hasattr(PluginContext, "register_mail_handler") or \
+        "register_mail_handler" in PluginContext.__init__.__code__.co_varnames, \
+        "PluginContext does not expose register_mail_handler"
 
 
 def test_plugin_context_has_send_mail():
-    """PluginContext exposes send_mail field."""
-    fields = {f.name for f in dataclasses.fields(PluginContext)}
-    assert "send_mail" in fields
+    """PluginContext exposes send_mail attribute.
+
+    PluginContext is a regular class (D-007 Phase D); use hasattr not dataclasses.fields.
+    """
+    assert hasattr(PluginContext, "send_mail") or \
+        "send_mail" in PluginContext.__init__.__code__.co_varnames, \
+        "PluginContext does not expose send_mail"
 
 
 def test_register_handler_dispatch():

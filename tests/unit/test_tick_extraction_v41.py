@@ -87,7 +87,7 @@ class FakeNode:
             return await fn(*args, **kwargs)
         return fn(*args, **kwargs)
 
-    def _run_netting_cycle_if_due(self):
+    async def _run_netting_cycle_if_due(self):
         pass
 
     async def join(self, peers):

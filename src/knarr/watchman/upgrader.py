@@ -239,8 +239,8 @@ class Upgrader:
             await self._rollback(org, repo, current_version, backup_dir)
             return False
 
-        # Start new version — detached so it survives asyncio.run() teardown
-        await self._supervisor._spawn(detached=True)
+        # Start new version — WM-04: tracked spawn (not detached), proc reference restored
+        await self._supervisor._spawn()
 
         # --- HEALTH ---
         log.info("UPGRADE_HEALTH_CHECK timeout=%ds", health_timeout)
@@ -299,5 +299,5 @@ class Upgrader:
             log.error("UPGRADE_ROLLBACK_FAIL error=%s", e)
             return
 
-        await self._supervisor._spawn(detached=True)
+        await self._supervisor._spawn()  # WM-04: tracked spawn
         log.info("UPGRADE_ROLLBACK_DONE version=%s", version)

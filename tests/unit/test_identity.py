@@ -56,15 +56,21 @@ def test_wrong_key_rejected():
     assert verify_message(wrong_key_msg) == False
 
 def test_hops_excluded_from_signature():
+    """hops remains in SIGNATURE_EXCLUDED_FIELDS for Announce relay compatibility.
+
+    TP-7 fix: on-path hops suppression for EventNotify is addressed by removing
+    the hops>0 gate in _handle_event_notify (loop prevention via origin_node marker),
+    NOT by signing hops globally (which would break Announce relay).
+    """
     key = SigningKey.generate()
     msg = Announce(node_id="n1", skill_key="k", skill_sheet={"name":"k", "tags":["t"]}, hops=0)
     signed = sign_message(msg, key)
-    
-    # Change hops
+
+    # Change hops — relay nodes can increment without breaking signature
     d = signed.to_dict()
     d["hops"] = 1
     msg_v1 = Announce(**d)
-    
+
     assert verify_message(msg_v1) == True
 
 def test_canonical_json_deterministic():

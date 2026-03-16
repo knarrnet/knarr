@@ -24,6 +24,7 @@ def _make_node():
     node._sync = MagicMock()
     node._sync.enqueue = AsyncMock()
     node.storage = MagicMock()
+    node._get_settlement_config = MagicMock(return_value={})
     return node
 
 

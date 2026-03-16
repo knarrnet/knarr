@@ -18,8 +18,11 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 # ---------------------------------------------------------------------------
 # Supervisor._spawn detached tests
+# WM-04 (v0.48.0): detached spawn replaced with tracked spawn.
+# These tests are superseded by test_watchman_br_gate_v48.py.
 # ---------------------------------------------------------------------------
 
+@unittest.skip("Superseded by WM-04: detached spawn replaced with tracked spawn in v0.48.0")
 class TestSupervisorSpawnDetached(unittest.IsolatedAsyncioTestCase):
 
     def _make_supervisor(self, cfg=None):
@@ -108,6 +111,7 @@ class TestUpgraderDetachedSpawn(unittest.IsolatedAsyncioTestCase):
         upgrader = Upgrader(cfg, sup)
         return upgrader, sup
 
+    @unittest.skip("Superseded by WM-04: upgrader now uses tracked spawn, not detached=True")
     async def test_run_upgrade_calls_detached_spawn(self):
         """run_upgrade must call _spawn(detached=True) for the new version."""
         upgrader, sup = self._make_upgrader_and_supervisor()

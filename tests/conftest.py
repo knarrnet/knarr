@@ -1,4 +1,13 @@
 """Global test fixtures — resource leak prevention."""
+import sys
+import os as _os
+
+# Force local src onto sys.path ahead of any installed knarr package.
+# Prevents installed package from shadowing local src imports.
+_src = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "src")
+if _src not in sys.path:
+    sys.path.insert(0, _src)
+
 import asyncio
 import concurrent.futures
 import pytest

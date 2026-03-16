@@ -181,6 +181,18 @@ def make_commerce_handlers(node) -> dict:
             f"balance={body['current_balance']} utilization_pct={body['utilization_pct']}"
         )
 
+        settlement_cfg = node._get_settlement_config()
+        if settlement_cfg.get("tab_reminder_auto_netting", False):
+            threshold = settlement_cfg.get("tab_reminder_threshold", 80.0)
+            if body["utilization_pct"] >= threshold:
+                logger.debug(
+                    f"BR_MAIL_001_AUTO_NETTING_TRIGGERED utilization_pct={body['utilization_pct']:.2f}"
+                )
+                try:
+                    await node._run_netting_cycle_if_due()
+                except Exception as e:
+                    logger.warning(f"BR_MAIL_001_AUTO_NETTING_FAILED error={e!r}")
+
     # FIX-004/005/006: Netting session store — tracks active proposals by netting_id.
     # Keyed by netting_id; value is from_node and proposal details.
     _netting_sessions: dict = {}

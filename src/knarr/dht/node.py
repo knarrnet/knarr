@@ -8,6 +8,7 @@ import numbers
 import os
 import random
 import secrets
+import signal
 import threading
 import time
 import uuid
@@ -24,7 +25,7 @@ from ..core.messages import (
     JoinRequest, JoinResponse, Announce, Query, QueryResponse,
     Deregister, Heartbeat, Ack, Message, TaskRequest, TaskStatus, TaskResult,
     SyncRequest, SyncResponse, Warn, Blocked, MailSync, MailAck, PluginMessage,
-    MailPullReq, MailPullResp, MailPullAck,
+    MailPullReq, MailPullResp, MailPullAck, EventNotify,  # BUS-01
     sign_message, verify_message, verify_node_id
 )
 from ..core.validation import validate_skill_sheet, validate_task_input, ValidationError
@@ -52,6 +53,11 @@ PEER_HEARTBEAT_SWEEP_TIMEOUT = 10.0
 MIN_PEER_FLOOR = 8  # never prune below this many peers
 SWEEP_BATCH_SIZE = 50  # B3: max peers processed per sweep cycle (P-025)
 
+# BUS-01: topics forwarded cross-node via EventNotify (fire-and-forget)
+BUS_BROADCAST_TOPICS: frozenset = frozenset({"mail.flush_skip"})
+# BUS-01: topics allowed for cross-node EventNotify propagation (receive side)
+_EVENT_BROADCAST_TOPICS: frozenset = frozenset({"mail.flush_skip"})
+
 def _parse_version(v: str) -> tuple:
     """Parse 'major.minor.patch' to tuple for comparison."""
     try:
@@ -66,7 +72,7 @@ class DHTNode:
                  advertise_host: Optional[str] = None, policy: Optional[Policy] = None,
                  config: Optional[Dict[str, Any]] = None, ephemeral: bool = False,
                  signing_key: Optional[SigningKey] = None):
-        self._main_loop = asyncio.get_event_loop()
+        self._main_loop = None  # set in start() via asyncio.get_running_loop()
         self.storage = Storage(storage_path)
         network_cfg = (config or {}).get("network", {})
         self._pool = ConnectionPool(max_connections=int(network_cfg.get("max_connections", 50)))
@@ -1602,6 +1608,7 @@ class DHTNode:
 
     async def start(self):
         """Starts the server and background tasks."""
+        self._main_loop = asyncio.get_running_loop()  # TEST-02: capture running loop (not deprecated get_event_loop)
         self.server = await asyncio.start_server(
             self._handle_connection, self._bind_host, self.node_info.port
         )
@@ -1624,6 +1631,16 @@ class DHTNode:
         # Auto-generate TLS cert if missing (only for default paths, not custom)
         config_dir = self._config.get("_config_dir", os.getcwd())
         data_dir = self._config.get("_data_dir", config_dir)
+
+        # WM-I1: Delete stale shutdown sentinel from a previous session
+        _sentinel_path = os.path.join(data_dir, "knarr.stop")
+        if os.path.exists(_sentinel_path):
+            try:
+                os.unlink(_sentinel_path)
+                logger.info(f"NODE_STALE_SENTINEL_REMOVED sentinel={_sentinel_path}")
+            except OSError:
+                pass
+
         from ..mail.tls import generate_tls_cert, resolve_cert_paths
         cert_path, key_path = resolve_cert_paths(self._config, data_dir)
         network_cfg = self._config.get("network", {})
@@ -1701,6 +1718,10 @@ class DHTNode:
                 ctx.query_receipts = _query_cb     # v0.35.0
                 ctx.economy_config = dict(self._config.get("economy", {}))  # v0.42.0
                 ctx.get_plugin = self._plugins.get_plugin_by_name  # v0.46.0
+                # D-007 Phase D: peer-management callbacks for KAD structured sweep
+                ctx.remove_peer = self._remove_peer_cb
+                ctx.upsert_address = self._upsert_address_cb
+                ctx.push_to_peer = self._push_to_peer_cb
                 # If plugin set itself as group_engine, pick it up
                 if ctx.group_engine is not None:
                     self._group_engine = ctx.group_engine
@@ -1771,8 +1792,6 @@ class DHTNode:
         # v0.41.0 A2: Independent background loops for network I/O (extracted from _heartbeat_tick)
         self.background_tasks.append(asyncio.create_task(self._flush_outbox_loop()))
         self.background_tasks.append(asyncio.create_task(self._pull_from_correspondents_loop()))
-        self.background_tasks.append(asyncio.create_task(self._peer_heartbeat_sweep_loop()))
-
         if self.wm is not None:
             try:
                 pending = self.storage.quarantine_list_pending()
@@ -1787,6 +1806,15 @@ class DHTNode:
                     logger.info(f"WM recovery re-emitted {len(pending)} held document(s)")
             except Exception as exc:
                 logger.warning(f"WM_RECOVERY_ERROR: {exc}")
+
+        # Peer heartbeat sweep (O(n) with semaphore, ceiling ~200 peers)
+        # D-007 Phase D will migrate this into KAD plugin on_tick — tracked as CR D-007-D
+        self.background_tasks.append(asyncio.create_task(self._peer_heartbeat_sweep_loop()))
+
+        # BUS-01: Subscribe to broadcast topics and forward cross-node via EventNotify
+        if self.bus:
+            self.background_tasks.append(asyncio.create_task(self._bus_broadcast_loop()))
+            logger.info("BUS01_SUBSCRIBED topics=%s", sorted(BUS_BROADCAST_TOPICS))
 
     async def stop(self):
         """Stops the server, MCP bridges, and background tasks."""
@@ -1869,6 +1897,17 @@ class DHTNode:
                 continue
         logger.info("PEER_CACHE no cached peer responded, falling back to bootstrap")
         return False
+
+    def _check_bootstrap_isolation(self) -> None:
+        """B2-EXT: Warn if node has no effective bootstrap peers (config + CLI combined)."""
+        config_bootstrap = list(self._config.get("network", {}).get("bootstrap", []))
+        runtime_bootstrap = list(self._config.get("_bootstrap_peers", getattr(self, "_bootstrap_peers", [])))
+        effective = list(dict.fromkeys(config_bootstrap + runtime_bootstrap))
+        if not effective:
+            logger.warning(
+                "BOOTSTRAP_ISOLATION: no bootstrap peers in config or --bootstrap. "
+                "Node may be isolated from the network."
+            )
 
     async def join(self, bootstrap_peers: List[str], skip_jitter: bool = False):
         """Joins the network and re-announces own skills."""
@@ -2221,11 +2260,71 @@ class DHTNode:
         # C-01: Apply group-based discovery filters (require/prefer/exclude)
         unique_results = self._filter_providers_by_group(unique_results)
 
+        # C1-EXT: if DHT returned nothing for a name query, inject explicit-tier address book peers
+        # as speculative candidates. The address book entry IS the operator signal; no special flag
+        # needed — if the peer doesn't serve the skill, the call fails normally. (Elder ruling)
+        if not unique_results and query_type == "name":
+            speculative = await self._select_execute_provider(value_norm)
+            if speculative:
+                logger.info(
+                    "C1_EXT_SPECULATIVE skill=%s candidates=%d",
+                    value_norm, len(speculative),
+                )
+                unique_results = speculative
+
         # Record demand for zero-result queries
         if not unique_results:
             await self._enqueue_write(self.storage.record_demand, query_type, value_norm)
 
         return unique_results
+
+    async def _select_execute_provider(
+        self, skill_name: str, exclude: Optional[Set[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """C1-EXT: Return provider candidates combining DHT announcements and explicit-tier address book.
+
+        Explicit-tier = operator-declared trusted peer (deliberate act — Elder ruling).
+        The address book entry is the routing signal; no speculative flag needed.
+        """
+        exclude = exclude or set()
+        candidates: List[Dict[str, Any]] = []
+        seen_ids: Set[str] = set()
+
+        # Include DHT-announced providers from local storage
+        try:
+            for entry in self.storage.query_skills_by_name(skill_name) or []:
+                node_id = entry.get("node_id", "") if isinstance(entry, dict) else getattr(entry, "node_id", "")
+                if not node_id or node_id in exclude or node_id in seen_ids:
+                    continue
+                seen_ids.add(node_id)
+                candidates.append(entry if isinstance(entry, dict) else {"node_id": node_id})
+        except Exception as e:
+            logger.warning("C1_EXT_DHT_FAIL skill=%s err=%s", skill_name, e)
+
+        # Inject explicit-tier address book peers not already in DHT results
+        try:
+            for entry in self.storage.get_addresses_by_tier("explicit", limit=50) or []:
+                if not isinstance(entry, dict):
+                    continue
+                node_id = entry.get("node_id", "")
+                host = entry.get("last_ip", "")
+                port = entry.get("last_port", 0)
+                if not node_id or node_id in exclude or node_id in seen_ids:
+                    continue
+                if not host or host == "0.0.0.0" or not port:
+                    continue
+                seen_ids.add(node_id)
+                candidates.append({
+                    "node_id": node_id,
+                    "host": host,
+                    "port": int(port),
+                    "sidecar_port": entry.get("sidecar_port", 0),
+                    "skill_sheet": {"name": skill_name},
+                    "_source": "explicit",
+                })
+        except Exception as e:
+            logger.warning("C1_EXT_FAIL skill=%s err=%s", skill_name, e)
+        return candidates
 
     def _rank_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Ranks query results by liveness, freshness, bilateral balance, and availability (load)."""
@@ -3234,6 +3333,9 @@ class DHTNode:
             await self._sync.handle_mail_pull_ack(msg)
             return self._sign(Ack(status="ok", msg_id=msg.msg_id))
 
+        elif isinstance(msg, EventNotify):
+            return await self._handle_event_notify(msg, peer_ip=peer_ip)
+
         elif isinstance(msg, PluginMessage):
             # Route to plugin chain — plugins handle via on_inbound.
             # Core does nothing with PluginMessage content.
@@ -3252,9 +3354,14 @@ class DHTNode:
             return
         utilization = max(0.0, min(100.0, ((initial_credit - balance) / credit_range) * 100.0))
 
-        threshold = self._get_settlement_config().get("tab_reminder_threshold", 80.0)
+        settlement_cfg = self._get_settlement_config()
+        threshold = float(settlement_cfg.get("tab_reminder_threshold", 80.0))
         if utilization < threshold:
             return
+
+        # BR-MAIL-001-EXT: auto-netting trigger when utilization exceeds threshold
+        if settlement_cfg.get("tab_reminder_auto_netting", False):
+            await self._run_netting_cycle_if_due()
 
         # v0.33.0: credit.warning — soft limit breach
         if self.bus:
@@ -3828,12 +3935,125 @@ class DHTNode:
             "uptime": uptime,
         })
 
+    async def _bus_broadcast_loop(self) -> None:
+        """BUS-01: Forward selected local bus events cross-node via EventNotify.
+
+        Subscribes to BUS_BROADCAST_TOPICS, awaits each event, serializes
+        kwargs to fields_json, and fire-and-forgets an EventNotify to all
+        known peers. Loop runs for the lifetime of the node.
+        """
+        if not self.bus:
+            return
+        # Subscribe to all broadcast topics with a single wildcard subscriber
+        # (we filter by topic inside the loop)
+        sub = self.bus.subscribe(*BUS_BROADCAST_TOPICS)
+        logger.debug("BUS01_LOOP_START topics=%s", sorted(BUS_BROADCAST_TOPICS))
+        while self._running:
+            try:
+                event = await asyncio.wait_for(sub.next(), timeout=5.0)
+                topic = event.get("event", "")
+                if topic not in BUS_BROADCAST_TOPICS:
+                    continue
+                # Don't re-broadcast events that arrived from remote nodes
+                if "origin_node" in event and event["origin_node"] != self.node_info.node_id:
+                    continue
+                # Build fields_json — strip bus internals, keep user fields
+                kwargs = {k: v for k, v in event.items()
+                          if k not in ("event", "event_id", "ts", "valid_from", "valid_until", "origin_node")}
+                fields_json = json.dumps(kwargs)
+                notify = EventNotify(
+                    node_id=self.node_info.node_id,
+                    origin_node_id=self.node_info.node_id,
+                    event_type=topic,
+                    event_payload=fields_json,
+                    event_ts=time.time(),
+                )
+                peers = self.storage.get_peers()
+                for peer in peers:
+                    asyncio.ensure_future(self._send_fire_forget(peer, notify))
+                logger.debug("BUS01_BROADCAST topic=%s peers=%d", topic, len(peers))
+            except asyncio.TimeoutError:
+                continue  # keep loop alive, check _running
+            except Exception as e:
+                logger.warning("BUS01_LOOP_ERR err=%s", e)
+
+    async def _handle_event_notify(self, msg: "EventNotify", peer_ip: str = "") -> None:
+        """BUS-01: Handle an incoming EventNotify cross-node bus event.
+
+        Verifies signature and node ID, enforces hops guard and topic allowlist,
+        parses and validates the JSON payload, strips wire-internal fields, and
+        re-emits on the local bus.
+        """
+        if not verify_message(msg):
+            logger.warning(f"EVENT_NOTIFY dropped: invalid signature from {peer_ip}")
+            return None
+        if not verify_node_id(msg):
+            logger.warning(f"EVENT_NOTIFY dropped: node_id mismatch from {peer_ip}")
+            return None
+        # TP-7: hops guard removed — on-path attacker could flip hops=0→1 to suppress events.
+        # Loop prevention is already handled by origin_node marker in _bus_broadcast_loop
+        # (events from remote nodes have origin_node set → broadcast loop skips re-emit).
+        if msg.event_type not in _EVENT_BROADCAST_TOPICS:
+            logger.debug(f"EVENT_NOTIFY dropped: event_type={msg.event_type} not in broadcast topics")
+            return None
+        try:
+            payload = json.loads(msg.event_payload)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(f"EVENT_NOTIFY dropped: invalid event_payload JSON from {peer_ip}")
+            return None
+        if not isinstance(payload, dict):
+            logger.warning(f"EVENT_NOTIFY dropped: non-object event_payload from {peer_ip}")
+            return None
+        for key in ("event", "event_id", "ts", "valid_from", "valid_until", "origin_node"):
+            payload.pop(key, None)
+        if self.bus:
+            # origin_node marker prevents _bus_broadcast_loop from re-broadcasting remote events
+            self.bus.emit(msg.event_type, origin_node=msg.origin_node_id, **payload)
+        logger.debug(
+            f"EVENT_NOTIFY_RECV event_type={msg.event_type} origin={msg.origin_node_id[:16]}"
+        )
+        return None
+
     async def _process_message_callback(self, msg: Message, peer_ip: str = ""):
         """Callback for plugins to deliver fire-and-forget messages into the node's processing pipeline."""
         await self._process_message(msg, peer_ip=peer_ip)
 
     # Per-skill secret store
     # Per-skill secret store — C2: delegated to SecretsManager in dht/secrets.py
+
+    # ------------------------------------------------------------------
+    # D-007 Phase D: peer management callbacks for KAD plugin
+    # ------------------------------------------------------------------
+
+    def _remove_peer_cb(self, node_id: str) -> None:
+        """D-007: remove peer from gossip table (KAD bucket eviction signal)."""
+        try:
+            self.storage.remove_peer(node_id)
+            self._peer_last_activity.pop(node_id, None)
+            logger.debug("KAD_REMOVE_PEER node_id=%s", node_id[:16])
+        except Exception as e:
+            logger.debug("KAD_REMOVE_PEER_ERR node_id=%s err=%s", node_id[:16], e)
+
+    def _upsert_address_cb(self, node_id: str, tier: str, host: str = "", port: int = 0) -> None:
+        """D-007: upsert address into address_book (KAD-learned endpoints)."""
+        try:
+            self.storage.upsert_address(node_id, tier, last_ip=host, last_port=port)
+        except Exception as e:
+            logger.debug("KAD_UPSERT_ADDR_ERR node_id=%s err=%s", node_id[:16], e)
+
+    async def _push_to_peer_cb(self, node_id: str, host: str, port: int) -> None:
+        """D-007: send heartbeat to rescue an isolated peer (KAD-triggered)."""
+        try:
+            peer = NodeInfo(node_id=node_id, host=host, port=port)
+            hb = self._sign(Heartbeat(
+                node_id=self.node_info.node_id,
+                timestamp=time.time(),
+                version=__version__,
+            ))
+            await self._send_fire_forget(peer, hb)
+            logger.debug("KAD_PUSH_TO_PEER node_id=%s", node_id[:16])
+        except Exception as e:
+            logger.debug("KAD_PUSH_TO_PEER_ERR node_id=%s err=%s", node_id[:16], e)
 
     def load_secrets(self, secrets_path: str = ""):
         """Load per-skill secrets from vault. Delegates to SecretsManager."""
@@ -5092,6 +5312,28 @@ class DHTNode:
     async def _heartbeat_loop(self):
         while self._running:
             await asyncio.sleep(HEARTBEAT_CHECK_INTERVAL)
+
+            # WM-I1: Poll for shutdown sentinel file
+            _data_dir = self._config.get("_data_dir", self._config.get("_config_dir", "."))
+            _sentinel = os.path.join(_data_dir, "knarr.stop")
+            if os.path.exists(_sentinel):
+                logger.info(f"NODE_STOP_SENTINEL sentinel={_sentinel}")
+                try:
+                    os.unlink(_sentinel)
+                except OSError:
+                    pass
+                self._running = False
+                # Drain: wait for task queue to empty and active workers to finish
+                _drain_start = time.monotonic()
+                while (not self._task_queue.empty() or self._active_workers > 0) and (time.monotonic() - _drain_start < 30.0):
+                    await asyncio.sleep(0.5)
+                logger.info(f"NODE_STOP_DRAINED remaining_tasks={self._task_queue.qsize()}")
+                if self._shutdown_event:
+                    self._shutdown_event.set()
+                else:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return
+
             try:
                 await self._heartbeat_tick()
             except Exception:
@@ -5129,16 +5371,20 @@ class DHTNode:
         while self._running:
             await asyncio.sleep(interval)
             try:
+                effective_bootstrap_peers = list(dict.fromkeys(
+                    list(self._config.get("network", {}).get("bootstrap", []))
+                    + list(self._bootstrap_peers)
+                ))
                 peers = self.storage.get_peers()
                 if not peers:
                     # Clear isolation tracking — no peers triggers immediate re-bootstrap
                     self._isolation_since = None
-                    if self._bootstrap_peers:
+                    if effective_bootstrap_peers:
                         logger.warning("No peers — attempting re-bootstrap")
                         if self.bus:
                             self.bus.emit("node.rebootstrap", reason="no_peers", identity=self.node_info.node_id)
                         try:
-                            await self.join(self._bootstrap_peers, skip_jitter=True)
+                            await self.join(effective_bootstrap_peers, skip_jitter=True)
                         except Exception as e:
                             logger.warning(f"Re-bootstrap failed: {e}")
                             if self.bus:
@@ -5150,18 +5396,20 @@ class DHTNode:
                     if not self._isolation_since:
                         self._isolation_since = time.monotonic()
                     elif time.monotonic() - self._isolation_since > _isolation_timeout:
-                        logger.warning(
-                            "ISOLATION_DETECTED peer_count=%d isolated_for=%.0fs — re-bootstrapping",
-                            len(peers), time.monotonic() - self._isolation_since,
-                        )
+                        isolated_for = time.monotonic() - self._isolation_since
                         self._isolation_since = None
-                        if self._bootstrap_peers:
+                        if effective_bootstrap_peers:
                             if self.bus:
                                 self.bus.emit("node.rebootstrap", reason="isolation", identity=self.node_info.node_id)
                             try:
-                                await self.join(self._bootstrap_peers, skip_jitter=True)
+                                await self.join(effective_bootstrap_peers, skip_jitter=True)
                             except Exception as e:
                                 logger.warning(f"Re-bootstrap (isolation) failed: {e}")
+                        else:
+                            logger.warning(
+                                "ISOLATION_DETECTED peer_count=%d isolated_for=%.0fs — no bootstrap peers configured",
+                                len(peers), isolated_for,
+                            )
                         continue
                 else:
                     # Healthy peer count — clear isolation tracking
@@ -5223,7 +5471,7 @@ class DHTNode:
         else:
             logger.warning(f"SETTLEMENT_UNKNOWN_TYPE type={item_type} id={item.get('id')}")
 
-    def _run_netting_cycle_if_due(self, now: Optional[float] = None) -> int:
+    async def _run_netting_cycle_if_due(self, now: Optional[float] = None) -> int:
         """Run the settlement netting cycle if its interval has elapsed."""
         now = time.time() if now is None else now
         netting_interval = float(self._get_settlement_config().get("netting_interval", 3600))
@@ -5353,7 +5601,7 @@ class DHTNode:
         await self._pool.evict_idle(self._connection_idle_timeout)
 
         # Netting cycle (runs hourly, checks bilateral positions against soft threshold)
-        self._run_netting_cycle_if_due()
+        await self._run_netting_cycle_if_due()
 
     async def _event_loop_watchdog(self):
         """Detects event loop blocking by measuring scheduling latency."""

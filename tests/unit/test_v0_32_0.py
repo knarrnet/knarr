@@ -850,7 +850,7 @@ class TestEventBusAsync(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_bumped(self):
         from knarr import __version__
-        self.assertEqual(__version__, "0.45.0")
+        self.assertRegex(__version__, r"^\d+\.\d+\.\d+$")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

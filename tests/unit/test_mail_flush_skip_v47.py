@@ -32,7 +32,7 @@ async def test_flush_outbox_emits_flush_skip_event_for_unresolvable_recipient():
 
     await engine.flush_outbox()
 
-    node.bus.emit.assert_called_once_with("mail.flush_skip", to_node="abcdef1234567890")
+    node.bus.emit.assert_called_once_with("mail.flush_skip", to_node="abcdef1234567890", reason="no_route")
     engine.push_to_peer.assert_not_called()
 
 
