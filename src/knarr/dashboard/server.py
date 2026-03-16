@@ -2641,6 +2641,21 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
         logs = self._log_handler.tail(limit)
         self._respond_json(writer, {"logs": logs, "count": len(logs)})
 
+    async def _handle_settlements(self, req):
+        """GET /api/settlements — B1-EXT: aiohttp handler with input validation."""
+        from aiohttp import web
+        query = req.rel_url.query
+        try:
+            limit = max(1, min(int(query.get("limit", "50")), 500))
+            offset = max(0, int(query.get("offset", "0")))
+        except (ValueError, TypeError):
+            return web.Response(status=400, text="Invalid limit or offset")
+        try:
+            settlements = self._node.storage.get_settlements(limit=limit, offset=offset) or []
+            return web.json_response({"settlements": settlements, "total": len(settlements)})
+        except Exception:
+            return web.Response(status=500, text="Settlement query failed")
+
     async def _handle_settlements_list(self, writer, query: dict):
         """GET /api/settlements — list settlement queue items."""
         try:
@@ -2790,3 +2805,4 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
         except Exception as e:
             logger.warning(f"UPGRADE_CHECK_FAIL: {e}")
             return {"status": "error", "error": str(e)}
+

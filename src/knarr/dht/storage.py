@@ -1118,7 +1118,7 @@ class Storage:
         conn.commit()
 
     # Ledger methods
-    def get_or_create_ledger_entry(self, peer_public_key: str, initial_balance: float = 0.0, initial_trust: float = 0.3) -> LedgerEntry:
+    def get_or_create_ledger_entry(self, peer_public_key: str = "", initial_balance: float = 0.0, initial_trust: float = 0.3) -> LedgerEntry:
         """Gets or creates a ledger entry. New entries get initial_balance and initial_trust."""
         conn = self._get_conn()
         cursor = conn.execute(
@@ -1167,7 +1167,7 @@ class Storage:
             )
         conn.commit()
         return LedgerEntry(
-            peer_public_key=peer_public_key, balance=initial_balance,
+            peer_public_key=peer_public_key, balance=0.0,  # TEST-03: always 0.0 — matches DB INSERT
             tasks_provided=0, tasks_consumed=0, first_seen=now, last_updated=now,
             held_balance=0.0
         )
@@ -1614,7 +1614,7 @@ class Storage:
         return next_seq
 
     def get_pending_outbox(self, to_node: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Returns pending items for a peer, ordered by batch_seq."""
+        """Returns pending outbox items for a specific peer, ordered by batch_seq."""
         conn = self._get_conn()
         cursor = conn.execute("""
             SELECT item_id, batch_seq, body_json, created_at, ttl_expires

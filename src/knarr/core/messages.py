@@ -191,6 +191,17 @@ class MailPullAck(Message):
     item_ids: List[str] = field(default_factory=list)
     type: str = "MAIL_PULL_ACK"
 
+@dataclass(frozen=True)
+class EventNotify(Message):
+    """Cross-node bus event notification. Never relayed (hops guard)."""
+    node_id: str = ""          # TP-4: signer node_id for verify_node_id() check
+    origin_node_id: str = ""
+    event_type: str = ""
+    event_payload: str = ""   # JSON-encoded kwargs from bus.emit()
+    event_ts: float = 0.0
+    hops: int = 0
+    type: str = "EVENT_NOTIFY"
+
 
 def serialize_message(msg: Message) -> bytes:
     """Serializes a message to JSON bytes."""
@@ -224,6 +235,7 @@ def deserialize_message(data: bytes) -> Message:
         "MAIL_PULL_REQ": MailPullReq,
         "MAIL_PULL_RESP": MailPullResp,
         "MAIL_PULL_ACK": MailPullAck,
+        "EVENT_NOTIFY": EventNotify,
     }
     
     cls = type_map.get(msg_type)

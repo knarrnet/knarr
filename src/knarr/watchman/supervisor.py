@@ -30,7 +30,7 @@ class Supervisor:
         self._config_path = config_path
         self._node_cfg = cfg["node"]
         self._health_cfg = cfg["health"]
-        self._recovery_cfg = cfg["recovery"]
+        self._recovery_cfg = cfg.get("recovery", {})
 
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._start_time: float = 0.0
@@ -94,7 +94,7 @@ class Supervisor:
             new_cfg = load_config(target)
             self._cfg = new_cfg
             self._health_cfg = new_cfg["health"]
-            self._recovery_cfg = new_cfg["recovery"]
+            self._recovery_cfg = new_cfg.get("recovery", {})
             log.info(
                 "WATCHMAN_CONFIG_RELOAD path=%s health_interval=%s fail_threshold=%s",
                 target,
@@ -119,7 +119,8 @@ class Supervisor:
     # Spawn / terminate
     # ------------------------------------------------------------------
 
-    async def _spawn(self, detached: bool = False) -> None:
+    async def _spawn(self) -> asyncio.subprocess.Process:
+        """Spawn the node process and return the Process handle. WM-04: always tracked."""
         command = self._node_cfg["command"]
         args = list(self._node_cfg.get("args", []))
 
@@ -130,45 +131,52 @@ class Supervisor:
             argv = [command] + args
 
         log.info(
-            "WATCHMAN_START cmd=%s args=%s restart=%d detached=%s",
-            command, " ".join(args), self._restart_count, detached,
+            "WATCHMAN_START cmd=%s args=%s restart=%d",
+            command, " ".join(args), self._restart_count,
         )
 
-        if detached:
-            # Spawn outside the asyncio subprocess transport so the node survives
-            # ProactorEventLoop teardown (Windows) or supervisor exit (any platform).
-            import subprocess
-            if sys.platform == "win32":
-                DETACHED_PROCESS = 0x00000008
-                CREATE_NEW_PROCESS_GROUP = 0x00000200
-                subprocess.Popen(
-                    argv,
-                    creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-                    close_fds=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            else:
-                subprocess.Popen(
-                    argv,
-                    start_new_session=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            # Detached processes are not tracked — health check via URL polling.
-            self._proc = None
-        else:
-            self._proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=None,  # inherit — node writes its own logs
-                stderr=None,
-            )
+        self._proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=None,  # inherit — node writes its own logs
+            stderr=None,
+        )
         self._start_time = time.monotonic()
+        return self._proc
+
+    async def cmd_upgrade(self) -> None:
+        """Trigger upgrade: terminate current node, re-spawn, restore proc tracking. WM-04."""
+        await self._terminate()
+        self._proc = await self._spawn()
 
     async def _terminate(self) -> None:
         if self._proc is None or self._proc.returncode is not None:
             return
         log.info("WATCHMAN_STOP reason=shutdown pid=%d", self._proc.pid)
+        # WM-I1: write sentinel so node drains gracefully before we force-terminate
+        data_dir = self._node_cfg.get("data_dir", ".")
+        sentinel = os.path.join(data_dir, "knarr.stop")
+        try:
+            with open(sentinel, "w") as _f:
+                _f.write("")
+            log.info("WATCHMAN_SENTINEL_WRITTEN sentinel=%s", sentinel)
+        except OSError as _e:
+            log.warning("WATCHMAN_SENTINEL_FAIL error=%s — proceeding with terminate", _e)
+        # WM-I1: wait for node to drain and self-exit before force-terminating.
+        # Node polls knarr.stop, drains in-flight tasks, then exits cleanly.
+        drain_timeout = self._recovery_cfg.get("shutdown_drain_timeout", 30)
+        try:
+            await asyncio.wait_for(self._proc.wait(), timeout=drain_timeout)
+            log.info("WATCHMAN_DRAIN_DONE pid=%d — node exited cleanly", self._proc.pid)
+            try:
+                os.unlink(sentinel)
+            except OSError:
+                pass
+            return  # node self-exited after draining — no force-kill needed
+        except asyncio.TimeoutError:
+            log.warning(
+                "WATCHMAN_DRAIN_TIMEOUT timeout=%ds — force-terminating pid=%d",
+                drain_timeout, self._proc.pid,
+            )
         try:
             if sys.platform == "win32":
                 self._proc.terminate()
@@ -213,10 +221,10 @@ class Supervisor:
     # ------------------------------------------------------------------
 
     async def _restart(self) -> None:
-        max_restarts = self._recovery_cfg["max_restarts"]
-        initial_backoff = self._recovery_cfg["initial_backoff"]
-        max_backoff = self._recovery_cfg["max_backoff"]
-        reset_uptime = self._recovery_cfg["backoff_reset_uptime"]
+        max_restarts = self._recovery_cfg.get("max_restarts", 5)
+        initial_backoff = self._recovery_cfg.get("initial_backoff", 2.0)
+        max_backoff = self._recovery_cfg.get("max_backoff", 120.0)
+        reset_uptime = self._recovery_cfg.get("backoff_reset_uptime", 300.0)
 
         uptime = time.monotonic() - self._start_time
         if uptime >= reset_uptime:

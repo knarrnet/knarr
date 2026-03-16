@@ -68,7 +68,7 @@ def _make_node(peers, send_side_effect):
     node._heartbeat_silence_threshold = 90.0
     node._sign = lambda msg: msg
     node.resolve_peer = lambda _node_id, host, port: (host, port)
-    node._run_netting_cycle_if_due = MagicMock()
+    node._run_netting_cycle_if_due = AsyncMock()
     node._version_gated = False
     return node
 

@@ -110,33 +110,112 @@ class PluginHooks:
         return True
 
 
-@dataclasses.dataclass
 class PluginContext:
-    """Provides plugins with access to node information and utilities."""
-    node_id: str
-    plugin_dir: Path
-    get_peers: Callable[[], List[NodeInfo]]
-    send_to_peer: Callable[[NodeInfo, Message], Any]
-    send_fire_forget: Callable[[NodeInfo, Message], Any]
-    delivery_cb: Optional[Callable[[Message, str], Any]]
-    log: logging.Logger
-    state_dir: Optional[Path] = None
-    group_engine: Optional[Any] = None      # GroupEngine instance, set after engine init
-    storage_path: Optional[str] = None      # Path to node.db for read-only queries
-    register_mail_handler: Optional[Callable] = None
-    send_mail: Optional[Callable] = None
-    register_egress_material: Optional[Callable] = None
-    vault_get: Optional[Callable] = None
-    vault_set: Optional[Callable] = None
-    update_cache: Optional[Callable] = None  # ctx.update_cache(realm, key, data_dict)
-    subscribe_events: Optional[Callable] = None   # v0.32.0: (*patterns) -> Subscriber
-    emit_event: Optional[Callable] = None         # v0.32.0: (event_type, **fields) -> None
-    bus: Optional[Any] = None                     # v0.33.0: EventBus reference
-    sign_document: Optional[Callable] = None      # v0.35.0: sign dict per eddsa-jcs-2022
-    query_receipts: Optional[Callable] = None     # v0.35.0: query receipt_log with filters
-    query_prepaid_balance: Optional[Callable] = None  # v0.36.0: (peer_key) -> float
-    economy_config: Optional[dict] = None         # v0.42.0: global [economy] config section
-    get_plugin: Optional[Callable] = None         # v0.46.0: (name: str) -> Optional[PluginHooks]
+    """Provides plugins with access to node information and utilities.
+
+    Supports two construction paths:
+      - Legacy: PluginContext(node_id=..., plugin_dir=..., get_peers=..., ...)
+      - v0.48.0 D-007: PluginContext(node=node, plugin_name="...", send_fn=..., data_dir=...)
+    """
+
+    def __init__(
+        self,
+        node_id: str = "",
+        plugin_dir=None,
+        get_peers=None,
+        send_to_peer=None,
+        send_fire_forget=None,
+        delivery_cb=None,
+        log=None,
+        *,
+        state_dir=None,
+        group_engine=None,
+        storage_path=None,
+        register_mail_handler=None,
+        send_mail=None,
+        register_egress_material=None,
+        vault_get=None,
+        vault_set=None,
+        update_cache=None,
+        subscribe_events=None,
+        emit_event=None,
+        bus=None,
+        sign_document=None,
+        query_receipts=None,
+        query_prepaid_balance=None,
+        economy_config=None,
+        get_plugin=None,
+        remove_peer=None,
+        upsert_address=None,
+        push_to_peer=None,
+        # v0.48.0 D-007: node= factory path
+        node=None,
+        plugin_name=None,
+        send_fn=None,
+        data_dir=None,
+    ):
+        if node is not None:
+            # D-007 Phase D: node-centric factory path
+            self._node = node
+            self.node_id = node.node_info.node_id if not node_id else node_id
+            self.plugin_dir = data_dir
+            self.get_peers = get_peers or (lambda: [])
+            self.send_to_peer = send_fn
+            self.send_fire_forget = send_fn
+            self.delivery_cb = delivery_cb
+            self.log = log or logging.getLogger(f"plugin.{plugin_name or 'unknown'}")
+            self.state_dir = state_dir
+            self.group_engine = group_engine
+            self.storage_path = storage_path
+            self.register_mail_handler = register_mail_handler
+            self.send_mail = send_mail
+            self.register_egress_material = register_egress_material
+            self.vault_get = vault_get
+            self.vault_set = vault_set
+            self.update_cache = update_cache
+            self.subscribe_events = subscribe_events
+            self.emit_event = emit_event
+            self.bus = bus if bus is not None else getattr(node, "bus", None)
+            self.sign_document = sign_document
+            self.query_receipts = query_receipts
+            self.query_prepaid_balance = query_prepaid_balance
+            self.economy_config = economy_config
+            self.get_plugin = get_plugin
+            self.remove_peer = remove_peer or (lambda nid: node.storage.remove_peer(nid))
+            self.upsert_address = upsert_address or (
+                lambda nid, host, port: node.storage.upsert_address(nid, host, port)
+            )
+            self.push_to_peer = push_to_peer or send_fn
+        else:
+            # Legacy positional/keyword construction (PluginLoader path)
+            self._node = None
+            self.node_id = node_id
+            self.plugin_dir = plugin_dir
+            self.get_peers = get_peers
+            self.send_to_peer = send_to_peer
+            self.send_fire_forget = send_fire_forget
+            self.delivery_cb = delivery_cb
+            self.log = log or logging.getLogger("plugin")
+            self.state_dir = state_dir
+            self.group_engine = group_engine
+            self.storage_path = storage_path
+            self.register_mail_handler = register_mail_handler
+            self.send_mail = send_mail
+            self.register_egress_material = register_egress_material
+            self.vault_get = vault_get
+            self.vault_set = vault_set
+            self.update_cache = update_cache
+            self.subscribe_events = subscribe_events
+            self.emit_event = emit_event
+            self.bus = bus
+            self.sign_document = sign_document
+            self.query_receipts = query_receipts
+            self.query_prepaid_balance = query_prepaid_balance
+            self.economy_config = economy_config
+            self.get_plugin = get_plugin
+            self.remove_peer = remove_peer                     # v0.48.0 D-007
+            self.upsert_address = upsert_address               # v0.48.0 D-007
+            self.push_to_peer = push_to_peer                   # v0.48.0 D-007
 
 
 class PluginLoader:
