@@ -7,6 +7,7 @@ matching the signature expected by ``SyncEngine._dispatch_system_item``:
 
 Node access is captured via closure from ``make_commerce_handlers(node)``.
 """
+import asyncio
 import hashlib
 import logging
 import time
@@ -196,6 +197,7 @@ def make_commerce_handlers(node) -> dict:
     # FIX-004/005/006: Netting session store — tracks active proposals by netting_id.
     # Keyed by netting_id; value is from_node and proposal details.
     _netting_sessions: dict = {}
+    _netting_lock = asyncio.Lock()
 
     async def handle_netting_proposal(item: dict) -> None:
         """Process knarr/commerce/netting_proposal mail.
@@ -221,11 +223,18 @@ def make_commerce_handlers(node) -> dict:
             logger.warning("NETTING_PROPOSAL rejected: missing netting_id")
             return
 
-        _netting_sessions[netting_id] = {
-            "from_node": item.get("from_node"),
-            "chain_id": proposal_chain_id,
-            "settlement_amount": body.get("settlement_amount"),
-        }
+        now = time.time()
+        async with _netting_lock:
+            # Clean up expired entries
+            expired_keys = [k for k, v in _netting_sessions.items() if v.get("expires_at", 0) < now]
+            for k in expired_keys:
+                del _netting_sessions[k]
+            _netting_sessions[netting_id] = {
+                "from_node": item.get("from_node"),
+                "chain_id": proposal_chain_id,
+                "settlement_amount": body.get("settlement_amount"),
+                "expires_at": now + 300,
+            }
         logger.info(f"NETTING_PROPOSAL netting_id={netting_id[:16]} chain={proposal_chain_id}")
 
     async def handle_netting_acceptance(item: dict) -> None:
@@ -243,14 +252,25 @@ def make_commerce_handlers(node) -> dict:
             logger.warning("NETTING_ACCEPTANCE rejected: missing netting_id")
             return
 
-        if netting_id not in _netting_sessions:
+        async with _netting_lock:
+            if netting_id not in _netting_sessions:
+                logger.warning(
+                    f"NETTING_ACCEPTANCE rejected: no active session for "
+                    f"netting_id={netting_id[:16]} (replay or forgery)"
+                )
+                return
+            session = _netting_sessions.pop(netting_id)
+
+        # Sender check after lock (pop already consumed the session — no retries)
+        if item.get("from_node") != session.get("from_node"):
             logger.warning(
-                f"NETTING_ACCEPTANCE rejected: no active session for "
-                f"netting_id={netting_id[:16]} (replay or forgery)"
+                f"NETTING_ACCEPTANCE rejected: sender mismatch "
+                f"netting_id={netting_id[:16]} "
+                f"expected={str(session.get('from_node', ''))[:16]} "
+                f"got={str(item.get('from_node', ''))[:16]}"
             )
             return
 
-        session = _netting_sessions.pop(netting_id)
         logger.info(
             f"NETTING_ACCEPTANCE accepted netting_id={netting_id[:16]} "
             f"from={item.get('from_node', '?')[:16]}"

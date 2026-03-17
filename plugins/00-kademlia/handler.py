@@ -1,5 +1,6 @@
 import json
 import asyncio
+import inspect
 import random
 import logging
 import time
@@ -27,10 +28,14 @@ class KademliaPlugin(PluginHooks):
     behavior: a malformed message must never cause message drops.
     """
 
+    _SWEEP_SILENCE_THRESHOLD = 30.0
+    _SWEEP_DEAD_THRESHOLD = 120.0
+
     def __init__(self, ctx: PluginContext, config: dict):
         self._ctx = ctx
         self._log = ctx.log
         self._debug = config.get("debug", False)
+        self._sweep_bucket_idx: int = 0
 
         self.k = max(1, int(config.get("k", 20)))
         self.max_provider_records = max(1, int(config.get("max_provider_records", 50000)))
@@ -443,6 +448,45 @@ class KademliaPlugin(PluginHooks):
 
             break  # One bucket per tick (don't flood)
 
+    def _is_well_covered(self, health: NodeHealth) -> bool:
+        bucket_stats = self.kbuckets.get_bucket_stats()
+        peers_in_table = sum(bucket_stats.values())
+        filled_buckets = len(bucket_stats)
+        return (
+            (peers_in_table >= 10 and filled_buckets >= 5)
+            or getattr(health, "peer_count", 0) >= 10
+        )
+
+    async def _sweep_k_buckets(self, health: NodeHealth) -> None:
+        bucket_count = len(self.kbuckets.buckets)
+        if bucket_count <= 0:
+            return
+
+        for _ in range(min(8, bucket_count)):
+            bucket_idx = self._sweep_bucket_idx % 256
+            self._sweep_bucket_idx = (self._sweep_bucket_idx + 1) % 256
+            bucket = self.kbuckets.buckets[bucket_idx]
+            if not bucket:
+                continue
+
+            node_id, host, port, last_seen = bucket[0]
+            silence = time.monotonic() - last_seen
+
+            try:
+                if silence > self._SWEEP_DEAD_THRESHOLD:
+                    self.kbuckets.remove_peer(node_id)
+                    remove_result = self._ctx.remove_peer(node_id)
+                    if inspect.isawaitable(remove_result):
+                        await remove_result
+                    continue
+
+                if silence > self._SWEEP_SILENCE_THRESHOLD and not self._is_well_covered(health):
+                    push_result = self._ctx.push_to_peer(node_id, host, port)
+                    if inspect.isawaitable(push_result):
+                        await push_result
+            except Exception as e:
+                self._log.warning(f"KAD_SWEEP_ERR {type(e).__name__}: {e}")
+
     async def on_tick(self, peers: List[NodeInfo], health: NodeHealth) -> None:
         """Periodic maintenance: evict expired records, sync k-buckets."""
         try:
@@ -466,6 +510,8 @@ class KademliaPlugin(PluginHooks):
                 stale = [k for k, v in self._find_node_log.items() if not v or now - max(v) > 120]
                 for k in stale:
                     del self._find_node_log[k]
+
+            await self._sweep_k_buckets(health)
 
             if self._debug:
                 stats = self.providers.stats()
