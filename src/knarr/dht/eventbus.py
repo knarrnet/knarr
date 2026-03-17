@@ -38,7 +38,7 @@ class EventBus:
     Events with valid_until in the past at emit time are silently discarded.
     """
 
-    __slots__ = ("_ring", "_size", "_head", "_subs", "_debug", "_lock", "_deferred")
+    __slots__ = ("_ring", "_size", "_head", "_subs", "_debug", "_lock", "_deferred", "_loop")
 
     def __init__(self, size: int = 256, debug: bool = False):
         size = max(16, min(65536, size))  # clamp to sane range
@@ -51,6 +51,10 @@ class EventBus:
         # v0.40.0: deferred store — list of entry dicts sorted by valid_from asc.
         # Protected by the same _lock as ring buffer writes.
         self._deferred: list[dict] = []
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None  # outside event loop (tests) — fallback to direct set
 
     def subscribe(self, *patterns: str) -> "Subscriber":
         """Create a subscriber for events matching any of the given glob patterns.
@@ -158,11 +162,14 @@ class EventBus:
             self._head += 1
 
     def _wake_subscribers(self, event_type: str) -> None:
-        """Wake all subscribers matching event_type."""
+        """Wake all subscribers matching event_type. Thread-safe via call_soon_threadsafe."""
         for sub in self._subs:
             if sub._matches(event_type):
                 try:
-                    sub._wake.set()
+                    if self._loop is not None and self._loop.is_running():
+                        self._loop.call_soon_threadsafe(sub._wake.set)
+                    else:
+                        sub._wake.set()
                 except Exception:
                     pass  # dead subscriber — cleaned up on next unsubscribe
 
@@ -197,7 +204,10 @@ class EventBus:
                     # Ready to fire — collect in order (list is sorted by valid_from)
                     ready.append(entry)
                 else:
-                    # List is sorted ascending; all subsequent entries are also future
+                    # Do NOT break — check every entry regardless of position.
+                    # Deferred entries are inserted in sorted order but may have
+                    # sub-millisecond timestamp ties or floating-point edge cases.
+                    # Checking all entries avoids events being permanently stuck. (F-13)
                     remaining.append(entry)
 
             self._deferred = remaining

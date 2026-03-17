@@ -215,6 +215,34 @@ class WarehouseManager:
         if not originator_pubkey:
             internal_signer = self._is_internal_signer(document)
             if internal_signer:
+                # F-01: Must verify the signature against the named internal key before
+                # trusting the document. Matching the verificationMethod fragment is not
+                # sufficient — anyone can set that field without the private key.
+                proof = document.get("proof", {})
+                vm = proof.get("verificationMethod", "")
+                _, _, fragment = vm.partition("#")
+                internal_key_bytes = self._internal_signer_keys.get(fragment)
+                if not internal_key_bytes:
+                    return self._quarantine(
+                        document, doc_type, qid, gate_results, b"",
+                        "Gate 1 failed: internal signer key not found in registry",
+                    )
+                try:
+                    verify_key = VerifyKey(internal_key_bytes)
+                    if verify_document(document, verify_key):
+                        gate_results[1] = "pass"
+                    else:
+                        gate_results[1] = "fail"
+                        return self._quarantine(
+                            document, doc_type, qid, gate_results, b"",
+                            "Gate 1 failed: internal signer signature verification failed",
+                        )
+                except Exception as exc:
+                    gate_results[1] = "fail"
+                    return self._quarantine(
+                        document, doc_type, qid, gate_results, b"",
+                        f"Gate 1 failed: internal signer key error: {exc}",
+                    )
                 required_gates = [3, 4]
                 action = "auto_promote"
             else:

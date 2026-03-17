@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import math
 from dataclasses import dataclass
@@ -246,3 +247,229 @@ class SolanaWatcher:
         if amount <= 0:
             return None
         return amount
+
+
+class SolanaSubscriptionManager:
+    def __init__(self, chain_id: str, ws_url: str):
+        self.chain_id = chain_id
+        self._ws_url = ws_url
+        self._ws = None
+        self._connected = False
+        self._subscriptions: dict[str, dict[str, Any]] = {}
+        self._pending: dict[int, dict[str, Any]] = {}
+        self._request_id = 0
+        self._receive_task: Optional[asyncio.Task] = None
+        self._reconnect_task: Optional[asyncio.Task] = None
+        self._reconnect_delay = 2.0
+        self._closing = False
+        self.on_notification = None
+        self._on_reconnect_callback = None
+
+    async def connect(self) -> None:
+        if self._connected and self._ws is not None:
+            return
+        import websockets
+
+        self._closing = False
+        self._ws = await websockets.connect(self._ws_url)
+        self._connected = True
+        self._reconnect_delay = 2.0
+        self._receive_task = asyncio.create_task(self._receive_loop())
+
+    async def disconnect(self) -> None:
+        self._closing = True
+        reconnect_task = self._reconnect_task
+        if reconnect_task is not None and reconnect_task is not asyncio.current_task():
+            reconnect_task.cancel()
+        self._reconnect_task = None
+
+        receive_task = self._receive_task
+        if receive_task is not None and receive_task is not asyncio.current_task():
+            receive_task.cancel()
+        self._receive_task = None
+
+        ws = self._ws
+        self._ws = None
+        self._connected = False
+        self._pending = {}
+        self._subscriptions = {}
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    async def _reconnect_loop(self) -> None:
+        current_task = asyncio.current_task()
+        if (
+            self._reconnect_task is not None
+            and self._reconnect_task is not current_task
+            and not self._reconnect_task.done()
+        ):
+            return
+        self._reconnect_task = current_task
+        try:
+            while not self._connected and not self._closing:
+                try:
+                    await self.connect()
+                    callback = self._on_reconnect_callback
+                    if callable(callback):
+                        callback_result = callback(self.chain_id)
+                        if asyncio.iscoroutine(callback_result):
+                            await callback_result
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning("WS reconnect failed for %s: %s", self.chain_id, exc)
+                await asyncio.sleep(self._reconnect_delay)
+                self._reconnect_delay = min(60.0, self._reconnect_delay * 2)
+        finally:
+            if self._reconnect_task is current_task:
+                self._reconnect_task = None
+
+    async def subscribe_account(
+        self,
+        address: str,
+        node_id: str,
+        correlation_id: Optional[str],
+    ) -> Optional[str]:
+        if not self._connected or self._ws is None:
+            return None
+        return await self._send_subscription(
+            "accountSubscribe",
+            [
+                address,
+                {"encoding": "jsonParsed", "commitment": "finalized"},
+            ],
+            {
+                "type": "account",
+                "address": address,
+                "node_id": node_id,
+                "chain_id": self.chain_id,
+                "correlation_id": correlation_id,
+            },
+        )
+
+    async def subscribe_signature(
+        self,
+        tx_hash: str,
+        node_id: str,
+        correlation_id: Optional[str],
+    ) -> Optional[str]:
+        if not self._connected or self._ws is None:
+            return None
+        return await self._send_subscription(
+            "signatureSubscribe",
+            [
+                tx_hash,
+                {"commitment": "finalized"},
+            ],
+            {
+                "type": "signature",
+                "tx_hash": tx_hash,
+                "node_id": node_id,
+                "chain_id": self.chain_id,
+                "correlation_id": correlation_id,
+            },
+        )
+
+    async def _send_subscription(
+        self,
+        method: str,
+        params: list[Any],
+        meta: dict[str, Any],
+    ) -> Optional[str]:
+        if self._ws is None:
+            return None
+        self._request_id += 1
+        request_id = self._request_id
+        self._pending[request_id] = meta
+        await self._ws.send(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                }
+            )
+        )
+        return str(request_id)
+
+    async def unsubscribe(self, sub_id) -> None:
+        key = str(sub_id)
+        meta = self._subscriptions.pop(key, None)
+        if meta is None:
+            return
+        if not self._connected or self._ws is None:
+            return
+
+        self._request_id += 1
+        method = "accountUnsubscribe" if meta.get("type") == "account" else "signatureUnsubscribe"
+        try:
+            payload_sub_id = int(sub_id)
+        except (TypeError, ValueError):
+            payload_sub_id = sub_id
+        await self._ws.send(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": self._request_id,
+                    "method": method,
+                    "params": [payload_sub_id],
+                }
+            )
+        )
+
+    async def unsubscribe_all_for(self, node_id: str, chain_id: str) -> None:
+        targets = [
+            sub_id
+            for sub_id, meta in self._subscriptions.items()
+            if meta.get("node_id") == node_id and meta.get("chain_id") == chain_id
+        ]
+        for sub_id in targets:
+            await self.unsubscribe(sub_id)
+
+    async def _receive_loop(self) -> None:
+        try:
+            while self._connected and self._ws is not None:
+                raw_message = await self._ws.recv()
+                message = json.loads(raw_message)
+                if not isinstance(message, dict):
+                    continue
+
+                if "id" in message and message["id"] in self._pending:
+                    meta = self._pending.pop(message["id"])
+                    sub_id = message.get("result")
+                    if sub_id is not None:
+                        self._subscriptions[str(sub_id)] = meta
+                    continue
+
+                params = message.get("params")
+                if not isinstance(params, dict):
+                    continue
+                sub_id = params.get("subscription")
+                meta = self._subscriptions.get(str(sub_id))
+                if meta is None:
+                    continue
+                callback = self.on_notification
+                if callable(callback):
+                    callback_result = callback(meta, params.get("result"))
+                    if asyncio.iscoroutine(callback_result):
+                        asyncio.create_task(callback_result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("WS receive loop failed for %s: %s", self.chain_id, exc)
+        finally:
+            self._connected = False
+            self._ws = None
+            self._pending = {}
+            self._subscriptions = {}
+            if self._receive_task is asyncio.current_task():
+                self._receive_task = None
+            if not self._closing and (
+                self._reconnect_task is None or self._reconnect_task.done()
+            ):
+                self._reconnect_task = asyncio.create_task(self._reconnect_loop())

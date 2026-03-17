@@ -58,8 +58,11 @@ def sign_document(
     }
 
     # 2-3. Canonicalize
+    # Strip any existing proof before hashing — verify_document pops proof
+    # before canonicalizing, so the signed and verified bytes must match. (F-15)
+    doc_without_proof = {k: v for k, v in document.items() if k != "proof"}
     canonical_proof = rfc8785.dumps(proof_options)
-    canonical_doc = rfc8785.dumps(document)
+    canonical_doc = rfc8785.dumps(doc_without_proof)
 
     # 4. Double-hash: proof_config FIRST, then document
     hash_data = hashlib.sha256(canonical_proof).digest() + hashlib.sha256(canonical_doc).digest()

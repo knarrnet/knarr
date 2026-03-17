@@ -1,4 +1,6 @@
+import asyncio
 import hashlib
+import importlib
 import json
 import logging
 import secrets
@@ -8,7 +10,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from knarr.commerce.conversion import get_conversion_rate, token_to_credits
 from nacl.signing import SigningKey
 
 from knarr.commerce.transfer_event import ConfirmationStatus, TransferEvent
@@ -16,9 +17,9 @@ from knarr.core.wallet import b58decode, b58encode, derive_solana_address
 from knarr.dht.plugins import NodeHealth, PluginContext, PluginHooks
 
 try:
-    from .solana import PollResult, SolanaWatcher
+    from .solana import PollResult, SolanaWatcher, SolanaSubscriptionManager
 except ImportError:  # PluginLoader injects sibling modules as top-level names
-    from solana import PollResult, SolanaWatcher
+    from solana import PollResult, SolanaWatcher, SolanaSubscriptionManager
 
 log = logging.getLogger("knarr.plugin.bcw")
 
@@ -107,6 +108,31 @@ def derive_ata(owner_b58: str, mint_b58: str) -> str:
     return b58encode(addr_bytes)
 
 
+def _ws_url_from_rpc(rpc_url: str) -> str:
+    if rpc_url.startswith("https://"):
+        return "wss://" + rpc_url[len("https://"):]
+    if rpc_url.startswith("http://"):
+        return "ws://" + rpc_url[len("http://"):]
+    return rpc_url
+
+
+def _serialize_watch_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, sort_keys=True)
+
+
+def _parse_watch_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
 class WatchStore:
     def __init__(self, db_path: Path):
         self._db_path = Path(db_path)
@@ -131,6 +157,19 @@ class WatchStore:
                 )
                 """
             )
+            for column_sql in (
+                "ALTER TABLE bcw_watchlist ADD COLUMN token_filter TEXT",
+                "ALTER TABLE bcw_watchlist ADD COLUMN requested_by TEXT",
+                "ALTER TABLE bcw_watchlist ADD COLUMN correlation_id TEXT",
+                "ALTER TABLE bcw_watchlist ADD COLUMN created_at REAL",
+                "ALTER TABLE bcw_watchlist ADD COLUMN expires_at REAL",
+                "ALTER TABLE bcw_watchlist ADD COLUMN last_seen REAL",
+                "ALTER TABLE bcw_watchlist ADD COLUMN status TEXT NOT NULL DEFAULT 'watching'",
+            ):
+                try:
+                    conn.execute(column_sql)
+                except sqlite3.OperationalError:
+                    pass
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS bcw_seen (
@@ -154,16 +193,51 @@ class WatchStore:
                 """
             )
 
-    def upsert_watch(self, node_id: str, chain_id: str, address: str) -> None:
+    def upsert_watch(
+        self,
+        node_id: str,
+        chain_id: str,
+        address: str,
+        *,
+        token_filter: Optional[str] = None,
+        requested_by: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        created_at: Optional[float] = None,
+        expires_at: Optional[float] = None,
+        last_seen: Optional[float] = None,
+        status: str = "watching",
+    ) -> None:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO bcw_watchlist (node_id, chain_id, address, last_signature)
-                VALUES (?, ?, ?, NULL)
+                INSERT INTO bcw_watchlist (
+                    node_id, chain_id, address, last_signature, token_filter,
+                    requested_by, correlation_id, created_at, expires_at, last_seen, status
+                )
+                VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(node_id, chain_id)
-                DO UPDATE SET address=excluded.address
+                DO UPDATE SET
+                    address=excluded.address,
+                    token_filter=excluded.token_filter,
+                    requested_by=excluded.requested_by,
+                    correlation_id=excluded.correlation_id,
+                    created_at=COALESCE(excluded.created_at, bcw_watchlist.created_at),
+                    expires_at=excluded.expires_at,
+                    last_seen=COALESCE(excluded.last_seen, bcw_watchlist.last_seen),
+                    status=excluded.status
                 """,
-                (node_id, chain_id, address),
+                (
+                    node_id,
+                    chain_id,
+                    address,
+                    token_filter,
+                    requested_by,
+                    correlation_id,
+                    created_at,
+                    expires_at,
+                    last_seen,
+                    status,
+                ),
             )
 
     def remove_watch(self, node_id: str, chain_id: str) -> None:
@@ -188,7 +262,18 @@ class WatchStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT node_id, chain_id, address, last_signature
+                SELECT
+                    node_id,
+                    chain_id,
+                    address,
+                    last_signature,
+                    token_filter,
+                    requested_by,
+                    correlation_id,
+                    created_at,
+                    expires_at,
+                    last_seen,
+                    status
                 FROM bcw_watchlist
                 ORDER BY chain_id, node_id
                 """
@@ -200,13 +285,20 @@ class WatchStore:
 
     def all_addresses(self) -> set[str]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT address FROM bcw_watchlist").fetchall()
+            rows = conn.execute(
+                "SELECT address FROM bcw_watchlist WHERE status = 'watching'"
+            ).fetchall()
         return {row["address"] for row in rows if row["address"]}
 
     def get_node_id_for_address(self, address: str) -> Optional[str]:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT node_id FROM bcw_watchlist WHERE address = ? LIMIT 1",
+                """
+                SELECT node_id
+                FROM bcw_watchlist
+                WHERE address = ? AND status = 'watching'
+                LIMIT 1
+                """,
                 (address,),
             ).fetchone()
         return row["node_id"] if row else None
@@ -216,12 +308,81 @@ class WatchStore:
             row = conn.execute(
                 """
                 SELECT address FROM bcw_watchlist
-                WHERE node_id = ? AND chain_id = ?
+                WHERE node_id = ? AND chain_id = ? AND status = 'watching'
                 LIMIT 1
                 """,
                 (node_id, chain_id),
             ).fetchone()
         return row["address"] if row else None
+
+    def update_status(self, node_id: str, chain_id: str, status: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE bcw_watchlist
+                SET status=?
+                WHERE node_id=? AND chain_id=?
+                """,
+                (status, node_id, chain_id),
+            )
+
+    def get_expired_watches(self, now: float) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    node_id,
+                    chain_id,
+                    address,
+                    last_signature,
+                    token_filter,
+                    requested_by,
+                    correlation_id,
+                    created_at,
+                    expires_at,
+                    last_seen,
+                    status
+                FROM bcw_watchlist
+                WHERE status = 'watching'
+                  AND expires_at IS NOT NULL
+                  AND expires_at < ?
+                ORDER BY expires_at ASC
+                """,
+                (now,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_last_seen(self, node_id: str, chain_id: str, ts: float) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE bcw_watchlist
+                SET last_seen=?
+                WHERE node_id=? AND chain_id=?
+                """,
+                (ts, node_id, chain_id),
+            )
+
+    def activity_seen_since_watch(self, node_id: str, chain_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT created_at, last_seen
+                FROM bcw_watchlist
+                WHERE node_id=? AND chain_id=?
+                LIMIT 1
+                """,
+                (node_id, chain_id),
+            ).fetchone()
+        if not row:
+            return False
+        created_at = row["created_at"]
+        last_seen = row["last_seen"]
+        return bool(
+            created_at is not None
+            and last_seen is not None
+            and float(last_seen) >= float(created_at)
+        )
 
     def mark_seen(self, chain_id: str, tx_hash: str, tx_index: int) -> bool:
         with self._connect() as conn:
@@ -274,12 +435,16 @@ class BCWPlugin(PluginHooks):
         self._enabled = bool(self._config.get("enabled", True))
         self._poll_interval = int(self._config.get("poll_interval_seconds", 10))
         self._meta_published = False
-        self._known_wallet_addresses: set[str] = set()
         self._self_owned_addresses: set[str] = set()
         self._sub = None
-        self._payment_sub = None
         self._last_balance_check = 0.0
         self._balance_check_interval = 300.0
+        self._subscription_managers: dict[str, SolanaSubscriptionManager] = {}
+        self._ws_tasks: list[asyncio.Task] = []
+        self._last_gap_recovery: dict[str, float] = {}
+        self._ws_started = False
+        self._ws_available = False
+        self._signature_watch_requests: dict[tuple[str, str], dict[str, Optional[str]]] = {}
 
         self._store = WatchStore((ctx.state_dir or ctx.plugin_dir) / "bcw.sqlite3")
         self._solana_modules: dict[str, SolanaWatcher] = {}
@@ -311,13 +476,23 @@ class BCWPlugin(PluginHooks):
             self._log_warning("BCW disabled: missing/invalid bcw_master_seed in vault")
 
         if self._enabled:
-            self._bootstrap_watchlist()
+            try:
+                importlib.import_module("websockets")
+                self._ws_available = True
+            except ImportError:
+                self._log_warning("BCW websockets unavailable; HTTP gap recovery only")
+                self._ws_available = False
+            if self._ws_available:
+                for chain_id, watcher in self._solana_modules.items():
+                    manager = SolanaSubscriptionManager(chain_id, _ws_url_from_rpc(watcher.rpc_url))
+                    manager.on_notification = self._on_ws_notification
+                    manager._on_reconnect_callback = self._on_ws_reconnect
+                    self._subscription_managers[chain_id] = manager
 
         subscribe = getattr(ctx, "subscribe_events", None)
         if callable(subscribe):
             try:
                 self._sub = subscribe("bcw.watch_request", "bcw.unwatch", "bcw.poll")
-                self._payment_sub = subscribe("payment.finalized.*")
             except Exception as exc:
                 self._log_warning("BCW event subscription failed: %s", exc)
 
@@ -358,92 +533,83 @@ class BCWPlugin(PluginHooks):
             return None
         return seed
 
-    def _bootstrap_watchlist(self) -> None:
-        if not self._master_seed:
+    def _queue_ws_task(self, coro) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            coro.close()
             return
-        if not hasattr(self._store, "_db_path"):
-            self._log_warning("BCW bootstrap skipped: watch store not initialized")
+        self._ws_tasks = [task for task in self._ws_tasks if not task.done()]
+        self._ws_tasks.append(loop.create_task(coro))
+
+    def _start_ws_managers(self) -> None:
+        if self._ws_started or not self._ws_available:
             return
+        self._ws_started = True
+        for manager in self._subscription_managers.values():
+            self._queue_ws_task(manager._reconnect_loop())
 
-        for chain_id, watcher in self._solana_modules.items():
-            master_addr = _derive_master_address(self._master_seed, chain_id)
-            self._store.upsert_watch("__master__", chain_id, master_addr)
-            self_addr = derive_counterparty_address(self._master_seed, self._ctx.node_id, chain_id)
-            self._store.upsert_watch(self._ctx.node_id, chain_id, self_addr)
-            # BCW-01: watch ATAs for our own addresses so Token-2022 inflows are visible
-            if watcher.token_mints:
-                self._register_ata_watches("__master__", chain_id, master_addr, watcher)
-                self._register_ata_watches(self._ctx.node_id, chain_id, self_addr, watcher)
+    def _selected_token_mints(self, watcher: SolanaWatcher, token_filter: Any) -> dict[str, str]:
+        parsed_filter = _parse_watch_value(token_filter)
+        if parsed_filter in (None, "", [], ()):
+            return dict(watcher.token_mints)
 
-        chain_ids = set(self._solana_modules.keys())
-        for peer in self._safe_get_peers():
-            self._maybe_add_peer_watch(peer, chain_ids)
+        if isinstance(parsed_filter, str):
+            requested = [parsed_filter]
+        elif isinstance(parsed_filter, list):
+            requested = [str(item) for item in parsed_filter]
+        else:
+            requested = [str(parsed_filter)]
 
-        self._self_owned_addresses = self._store.all_addresses()
+        selected: dict[str, str] = {}
+        for item in requested:
+            token_name = item.strip()
+            if not token_name:
+                continue
+            if token_name in watcher.token_mints:
+                selected[token_name] = watcher.token_mints[token_name]
+                continue
+            for symbol, mint in watcher.token_mints.items():
+                if mint == token_name:
+                    selected[symbol] = mint
+        return selected or dict(watcher.token_mints)
 
-    def _safe_get_peers(self) -> list:
-        get_peers = getattr(self._ctx, "get_peers", None)
-        if callable(get_peers):
+    def _register_ata_watches(
+        self,
+        node_id: str,
+        chain_id: str,
+        owner_address: str,
+        watcher,
+        token_filter: Any = None,
+    ) -> list[str]:
+        ata_addresses: list[str] = []
+        for symbol, mint_address in self._selected_token_mints(watcher, token_filter).items():
             try:
-                peers = get_peers()
-                return list(peers or [])
-            except Exception:
-                return []
-        return []
-
-    def _register_ata_watches(self, node_id: str, chain_id: str, owner_address: str, watcher) -> None:
-        """Register ATA watches for all configured token mints on a watched address.
-
-        Uses synthetic ``{node_id}|ata|{symbol}`` keys so payment events can be
-        routed back to the originating counterparty in ``_handle_payment_finalized``.
-        """
-        for symbol, mint_address in watcher.token_mints.items():
-            try:
-                ata_address = derive_ata(owner_address, mint_address)
-                ata_node_id = f"{node_id}|ata|{symbol}"
-                self._store.upsert_watch(ata_node_id, chain_id, ata_address)
+                ata_addresses.append(derive_ata(owner_address, mint_address))
             except Exception as exc:
                 self._log_warning(
                     "BCW: ATA derivation failed node=%s mint=%s: %s",
                     node_id[:8], symbol, exc,
                 )
-
-    def _maybe_add_peer_watch(self, peer: Any, chain_ids: set[str]) -> None:
-        if not self._master_seed:
-            return
-        node_id = str(getattr(peer, "node_id", "") or "")
-        if len(node_id) == 64 and chain_ids:
-            for chain_id in chain_ids:
-                try:
-                    address = derive_counterparty_address(self._master_seed, node_id, chain_id)
-                    self._store.upsert_watch(node_id, chain_id, address)
-                    # BCW-01: also watch ATAs for token mints
-                    if chain_id in self._solana_modules:
-                        watcher = self._solana_modules[chain_id]
-                        if watcher.token_mints:
-                            self._register_ata_watches(node_id, chain_id, address, watcher)
-                except Exception as exc:
-                    self._log_warning("Failed deriving address for peer %s: %s", node_id[:8], exc)
-        wallet = str(getattr(peer, "wallet", "") or "").strip()
-        if wallet:
-            self._known_wallet_addresses.add(wallet)
+        return ata_addresses
 
     def _handle_bus_event(self, event: dict) -> None:
         etype = event.get("event")
         if etype == "bcw.watch_request":
-            node_id = str(event.get("node_id", "") or "")
-            chain_id = str(event.get("chain_id", "solana-mainnet") or "solana-mainnet")
-            self._handle_watch_request(node_id, chain_id)
+            self._handle_watch_request(event)
             return
         if etype == "bcw.unwatch":
             node_id = str(event.get("node_id", "") or "")
             chain_id = str(event.get("chain_id", "solana-mainnet") or "solana-mainnet")
             if node_id:
+                self._signature_watch_requests.pop((node_id, chain_id), None)
+                manager = self._subscription_managers.get(chain_id)
+                if manager is not None:
+                    self._queue_ws_task(manager.unsubscribe_all_for(node_id, chain_id))
                 self._store.remove_watch(node_id, chain_id)
                 self._self_owned_addresses = self._store.all_addresses()
             return
         if etype == "bcw.poll":
-            # Poll is already happening inside this tick.
             return
 
     def _drain_bus_events(self) -> None:
@@ -459,21 +625,30 @@ class BCWPlugin(PluginHooks):
         except Exception as exc:
             self._log_warning("BCW bus poll failed: %s", exc)
 
-    def _drain_payment_events(self) -> None:
-        if not self._payment_sub:
-            return
-        poll = getattr(self._payment_sub, "poll", None)
-        if not callable(poll):
-            return
-        for event in poll() or []:
-            try:
-                if isinstance(event, dict):
-                    self._handle_payment_finalized(event)
-            except Exception as exc:
-                self._log_warning("BCW payment event failed: %s", exc)
-
-    def _handle_watch_request(self, node_id: str, chain_id: str) -> None:
+    def _handle_watch_request(self, watch_request: Any, chain_id: Optional[str] = None) -> None:
         if not self._master_seed:
+            return
+        if isinstance(watch_request, dict):
+            node_id = str(watch_request.get("node_id", "") or "")
+            chain_id = str(watch_request.get("chain_id", "solana-mainnet") or "solana-mainnet")
+            ttl_seconds = watch_request.get("ttl_seconds")
+            correlation_id = watch_request.get("correlation_id")
+            token_filter = watch_request.get("token_filter")
+            tx_hash = str(watch_request.get("tx_hash", "") or "")
+            requested_by = str(
+                watch_request.get("requested_by")
+                or watch_request.get("from_node")
+                or node_id
+            )
+        else:
+            node_id = str(watch_request or "")
+            chain_id = str(chain_id or "solana-mainnet")
+            ttl_seconds = None
+            correlation_id = None
+            token_filter = None
+            tx_hash = ""
+            requested_by = node_id
+        if not node_id:
             return
         if chain_id not in self._solana_modules:
             self._log_warning("Unsupported chain in watch request: %s", chain_id)
@@ -484,40 +659,112 @@ class BCWPlugin(PluginHooks):
             self._log_warning("Invalid watch request node_id=%s: %s", node_id[:8], exc)
             return
 
-        self._store.upsert_watch(node_id, chain_id, address)
+        now = time.time()
+        try:
+            ttl_value = float(ttl_seconds) if ttl_seconds is not None else None
+        except (TypeError, ValueError):
+            ttl_value = None
+        expires_at = now + ttl_value if ttl_value is not None else None
+        correlation_text = None if correlation_id in (None, "") else str(correlation_id)
+        token_filter_text = _serialize_watch_value(token_filter)
+
+        self._store.upsert_watch(
+            node_id,
+            chain_id,
+            address,
+            token_filter=token_filter_text,
+            requested_by=requested_by,
+            correlation_id=correlation_text,
+            created_at=now,
+            expires_at=expires_at,
+            status="watching",
+        )
         self._self_owned_addresses = self._store.all_addresses()
-        self._emit_event("bcw.address_assigned", node_id=node_id, chain_id=chain_id, address=address)
+        if tx_hash:
+            self._signature_watch_requests[(node_id, chain_id)] = {
+                "tx_hash": tx_hash,
+                "correlation_id": correlation_text,
+            }
+        manager = self._subscription_managers.get(chain_id)
+        if manager is not None:
+            self._queue_ws_task(
+                self._subscribe_watch(
+                    node_id,
+                    chain_id,
+                    address,
+                    correlation_text,
+                    token_filter_text,
+                    tx_hash or None,
+                )
+            )
+        self._emit_event(
+            "bcw.address_assigned",
+            node_id=node_id,
+            chain_id=chain_id,
+            address=address,
+            correlation_id=correlation_text,
+        )
 
-    async def on_tick(self, peers: list, health: NodeHealth) -> None:
-        if not self._enabled:
+    async def _subscribe_watch(
+        self,
+        node_id: str,
+        chain_id: str,
+        address: str,
+        correlation_id: Optional[str],
+        token_filter: Any,
+        tx_hash: Optional[str],
+    ) -> None:
+        watcher = self._solana_modules.get(chain_id)
+        manager = self._subscription_managers.get(chain_id)
+        if not watcher or not manager:
             return
+        await manager.subscribe_account(address, node_id, correlation_id)
+        for ata_address in self._register_ata_watches(node_id, chain_id, address, watcher, token_filter):
+            await manager.subscribe_account(ata_address, node_id, correlation_id)
+        if tx_hash:
+            await manager.subscribe_signature(tx_hash, node_id, correlation_id)
 
-        self._drain_bus_events()
-        self._known_wallet_addresses = set()
+    async def _expire_watch(self, entry: dict) -> None:
+        node_id = str(entry.get("node_id", "") or "")
+        chain_id = str(entry.get("chain_id", "") or "")
+        if not node_id or not chain_id:
+            return
+        manager = self._subscription_managers.get(chain_id)
+        if manager is not None:
+            await manager.unsubscribe_all_for(node_id, chain_id)
+        self._signature_watch_requests.pop((node_id, chain_id), None)
+        activity_seen = self._store.activity_seen_since_watch(node_id, chain_id)
+        self._store.update_status(node_id, chain_id, "expired")
+        self._self_owned_addresses = self._store.all_addresses()
+        self._emit_event(
+            "bcw.watch.expired",
+            node_id=node_id,
+            chain_id=chain_id,
+            address=entry.get("address"),
+            activity_seen=activity_seen,
+            correlation_id=entry.get("correlation_id"),
+        )
 
-        chain_ids = set(self._solana_modules.keys())
-        for peer in peers or []:
-            self._maybe_add_peer_watch(peer, chain_ids)
+    async def _poll_gap_recovery(self, chain_id: str) -> None:
+        watcher = self._solana_modules.get(chain_id)
+        if watcher is None:
+            return
+        now = time.time()
+        if now - self._last_gap_recovery.get(chain_id, 0.0) < 30.0:
+            return
+        self._last_gap_recovery[chain_id] = now
 
-        watches = self._store.list_watches()
-        self._self_owned_addresses = {w["address"] for w in watches if w.get("address")}
-        rpc_ok = False
-
-        for item in watches:
-            chain_id = item.get("chain_id")
-            watcher = self._solana_modules.get(chain_id)
-            if not watcher:
+        for item in self._store.list_watches():
+            if item.get("chain_id") != chain_id or item.get("status") != "watching":
                 continue
-
             try:
                 result: PollResult = await watcher.poll_address(
                     item.get("address", ""),
                     item.get("last_signature"),
                 )
-                rpc_ok = rpc_ok or bool(result.rpc_ok)
             except Exception as exc:
                 self._log_warning(
-                    "BCW poll failed chain=%s address=%s: %s",
+                    "BCW gap recovery failed chain=%s address=%s: %s",
                     chain_id,
                     item.get("address", "")[:12],
                     exc,
@@ -526,19 +773,177 @@ class BCWPlugin(PluginHooks):
 
             if result.latest_signature and result.latest_signature != item.get("last_signature"):
                 self._store.update_cursor(item["node_id"], chain_id, result.latest_signature)
+            if result.events:
+                self._store.update_last_seen(item["node_id"], chain_id, now)
 
             for transfer in result.events:
                 if not self._store.mark_seen(transfer.chain_id, transfer.tx_hash, transfer.tx_index):
                     continue
-                self._process_transfer(transfer)
+                self._process_transfer(transfer, correlation_id=item.get("correlation_id"))
 
-        self._drain_payment_events()
+    def _on_ws_notification(self, meta: dict, result: Any) -> None:
+        node_id = str(meta.get("node_id", "") or "")
+        chain_id = str(meta.get("chain_id", "") or "")
+        correlation_id = meta.get("correlation_id")
+        if node_id and chain_id:
+            self._store.update_last_seen(node_id, chain_id, time.time())
+
+        try:
+            if meta.get("type") == "account":
+                task = asyncio.get_running_loop().create_task(
+                    self._process_ws_account_event(node_id, chain_id, correlation_id)
+                )
+                self._ws_tasks = [t for t in self._ws_tasks if not t.done()]
+                self._ws_tasks.append(task)
+            elif meta.get("type") == "signature":
+                task = asyncio.get_running_loop().create_task(
+                    self._process_ws_signature_event(
+                        node_id, chain_id, meta.get("tx_hash"), correlation_id
+                    )
+                )
+                self._ws_tasks = [t for t in self._ws_tasks if not t.done()]
+                self._ws_tasks.append(task)
+        except Exception as exc:
+            self._log_warning("BCW websocket notification failed: %s", exc)
+
+    async def _on_ws_reconnect(self, chain_id: str) -> None:
+        await self._poll_gap_recovery(chain_id)
+        for item in self._store.list_watches():
+            if item.get("chain_id") != chain_id or item.get("status") != "watching":
+                continue
+            sig_watch = self._signature_watch_requests.get((item["node_id"], chain_id), {})
+            await self._subscribe_watch(
+                item["node_id"],
+                chain_id,
+                item.get("address", ""),
+                item.get("correlation_id"),
+                item.get("token_filter"),
+                sig_watch.get("tx_hash"),
+            )
+
+    async def _process_ws_account_event(
+        self,
+        node_id: str,
+        chain_id: str,
+        correlation_id: Optional[str],
+    ) -> None:
+        """BCW-01: Fetch transfers via poll_address and route through _process_transfer."""
+        # Look up watch entry for address and last_signature
+        address = None
+        last_signature = None
+        for entry in self._store.list_watches():
+            if entry.get("node_id") == node_id and entry.get("chain_id") == chain_id:
+                address = entry.get("address")
+                last_signature = entry.get("last_signature")
+                break
+
+        watcher = self._solana_modules.get(chain_id)
+        if watcher is None or not address:
+            return
+
+        try:
+            result: PollResult = await watcher.poll_address(address, last_signature)
+        except Exception as exc:
+            self._log_warning(
+                "BCW01 ws account event poll failed node=%.16s chain=%s: %s",
+                node_id, chain_id, exc,
+            )
+            return
+
+        for transfer in result.events:
+            if not self._store.mark_seen(transfer.chain_id, transfer.tx_hash, transfer.tx_index):
+                continue
+            self._process_transfer(transfer, correlation_id=correlation_id)
+
+        if result.latest_signature and result.latest_signature != last_signature:
+            self._store.update_cursor(node_id, chain_id, result.latest_signature)
+        if result.events:
+            self._store.update_last_seen(node_id, chain_id, time.time())
+
+    async def _process_ws_signature_event(
+        self,
+        node_id: str,
+        chain_id: str,
+        tx_hash: Optional[str],
+        correlation_id: Optional[str],
+    ) -> None:
+        """BCW-01: Fetch confirmed tx details via poll and route through _process_transfer."""
+        watcher = self._solana_modules.get(chain_id)
+        if watcher is None or not tx_hash:
+            return
+
+        address = self._store.get_address(node_id, chain_id)
+        if not address:
+            return
+
+        try:
+            result: PollResult = await watcher.poll_address(address, None)
+        except Exception as exc:
+            self._log_warning(
+                "BCW01 ws signature event poll failed node=%.16s chain=%s tx=%.16s: %s",
+                node_id, chain_id, tx_hash, exc,
+            )
+            return
+
+        matched = False
+        for transfer in result.events:
+            if transfer.tx_hash != tx_hash:
+                continue
+            matched = True
+            if not self._store.mark_seen(transfer.chain_id, transfer.tx_hash, transfer.tx_index):
+                continue
+            self._process_transfer(transfer, correlation_id=correlation_id)
+
+        if not matched:
+            self._log_warning(
+                "BCW01 ws signature event: no matching tx found node=%.16s chain=%s tx=%.16s",
+                node_id, chain_id, tx_hash,
+            )
+
+    # -- Superseded by BCW-01 async task approach (v0.49.0) --
+    # These methods are kept as private stubs; no active call sites remain.
+
+    def _process_account_notification(
+        self,
+        node_id: str,
+        chain_id: str,
+        result: dict,
+        correlation_id: Optional[str],
+    ) -> None:
+        """Superseded by _process_ws_account_event (BCW-01). Retained as stub."""
+        pass
+
+    def _process_signature_notification(
+        self,
+        node_id: str,
+        chain_id: str,
+        result: dict,
+        correlation_id: Optional[str],
+    ) -> None:
+        """Superseded by _process_ws_signature_event (BCW-01). Retained as stub."""
+        pass
+
+    async def on_tick(self, peers: list, health: NodeHealth) -> None:
+        if not self._enabled:
+            return
+        if self._ws_available and not self._ws_started:
+            self._start_ws_managers()
+        self._drain_bus_events()
+        for entry in self._store.get_expired_watches(time.time()):
+            await self._expire_watch(entry)
+        self._self_owned_addresses = self._store.all_addresses()
+        for chain_id in self._solana_modules:
+            manager = self._subscription_managers.get(chain_id)
+            if manager is None or not manager._connected:
+                await self._poll_gap_recovery(chain_id)
         await self._check_sol_balance()
-
-        if rpc_ok:
-            self._publish_meta_once()
+        self._publish_meta_once()
 
     async def on_shutdown(self) -> None:
+        for task in list(self._ws_tasks):
+            task.cancel()
+        for manager in self._subscription_managers.values():
+            await manager.disconnect()
         return None
 
     def _publish_meta_once(self) -> None:
@@ -548,11 +953,11 @@ class BCWPlugin(PluginHooks):
         self._emit_event(
             "bcw.capabilities",
             chains=sorted(self._solana_modules.keys()),
-            poll_only=True,
+            poll_only=not self._ws_available,
             poll_interval_seconds=self._poll_interval,
         )
 
-    def _process_transfer(self, transfer: TransferEvent) -> None:
+    def _process_transfer(self, transfer: TransferEvent, correlation_id: Optional[str] = None) -> None:
         receipt_type = self._classify_transfer(transfer)
         if not receipt_type:
             return
@@ -570,16 +975,21 @@ class BCWPlugin(PluginHooks):
             "decimals": transfer.decimals,
             "mint": transfer.mint_address,
             "dedup_key": dedup_key,
+            "correlation_id": correlation_id,
         }
 
         if receipt_type == "payment_received":
-            received_id = self._write_receipt("payment_received", transfer, {})
+            received_id = self._write_receipt(
+                "payment_received",
+                transfer,
+                {"correlation_id": correlation_id},
+            )
             self._emit_event(f"payment.received.{chain_topic}", receipt_type=receipt_type, **common_fields)
             if transfer.confirmation == ConfirmationStatus.FINALIZED:
                 finalized_id = self._write_receipt(
                     "payment_finalized",
                     transfer,
-                    {"original_receipt_id": received_id},
+                    {"original_receipt_id": received_id, "correlation_id": correlation_id},
                 )
                 self._emit_event(
                     f"payment.finalized.{chain_topic}",
@@ -591,7 +1001,11 @@ class BCWPlugin(PluginHooks):
             return
 
         if receipt_type == "payment_executed":
-            receipt_id = self._write_receipt("payment_executed", transfer, {})
+            receipt_id = self._write_receipt(
+                "payment_executed",
+                transfer,
+                {"correlation_id": correlation_id},
+            )
             self._emit_event(
                 f"payment.sent.{chain_topic}",
                 receipt_type=receipt_type,
@@ -611,7 +1025,7 @@ class BCWPlugin(PluginHooks):
             receipt_id = self._write_receipt(
                 "wallet_transfer",
                 transfer,
-                {"addresses": {"both_self_owned": True}},
+                {"addresses": {"both_self_owned": True}, "correlation_id": correlation_id},
             )
             self._emit_event(
                 f"payment.sent.{chain_topic}",
@@ -623,7 +1037,11 @@ class BCWPlugin(PluginHooks):
             return
 
         if receipt_type == "wallet_withdrawal":
-            receipt_id = self._write_receipt("wallet_withdrawal", transfer, {"counterparty": None})
+            receipt_id = self._write_receipt(
+                "wallet_withdrawal",
+                transfer,
+                {"counterparty": None, "correlation_id": correlation_id},
+            )
             self._emit_event(
                 f"payment.sent.{chain_topic}",
                 receipt_type=receipt_type,
@@ -635,40 +1053,7 @@ class BCWPlugin(PluginHooks):
     def _handle_payment_finalized(self, event: dict) -> None:
         if not str(event.get("event", "")).startswith("payment.finalized."):
             return
-
-        assigned_node_id = self._store.get_node_id_for_address(str(event.get("to_address", "") or ""))
-        if not assigned_node_id:
-            return
-        # BCW-01: strip ATA synthetic suffix "{node_id}|ata|{symbol}" → "{node_id}"
-        real_node_id = assigned_node_id.split("|")[0]
-        if real_node_id in {"__master__", self._ctx.node_id}:
-            return
-
-        peer_public_key = self._resolve_peer_public_key(real_node_id)
-        if not peer_public_key:
-            self._log_warning(
-                "BCW deposit credit skipped: could not resolve public key for node_id=%s",
-                assigned_node_id[:16],
-            )
-            return
-
-        expected_mint = self._knarr_mint()
-        if expected_mint:
-            mint = str(event.get("mint") or event.get("token_mint") or "")
-            if not mint or mint != expected_mint:
-                self._log_warning("BCW deposit credit skipped: wrong mint %s", mint or "<missing>")
-                return
-
-        from knarr.core.constants import KNARR_DECIMALS
-
-        raw_amount = int(event.get("amount", 0))
-        if raw_amount <= 0:
-            self._log_warning("BCW deposit credit skipped: non-positive amount %d", raw_amount)
-            return
-        amount = raw_amount / (10 ** KNARR_DECIMALS)
-        rate = get_conversion_rate({"economy": self._economy_config()})
-        credits = token_to_credits(amount, rate)
-        self._credit_ledger(peer_public_key, credits)
+        return
 
     def _economy_config(self) -> dict[str, Any]:
         # Fix #4: prefer global economy config from PluginContext over plugin-scoped config
@@ -677,58 +1062,6 @@ class BCWPlugin(PluginHooks):
             return ctx_economy
         economy_cfg = self._config.get("economy", {})
         return economy_cfg if isinstance(economy_cfg, dict) else {}
-
-    def _resolve_peer_public_key(self, node_id: str) -> Optional[str]:
-        # TODO: v1.01 — route through Storage API (requires exposing storage on PluginContext)
-        if not self._ctx.storage_path:
-            return None
-        try:
-            conn = sqlite3.connect(self._ctx.storage_path, timeout=5)
-            conn.execute("PRAGMA busy_timeout=5000")
-            rows = conn.execute("SELECT peer_public_key FROM ledger").fetchall()
-            conn.close()
-        except Exception as exc:
-            self._log_warning("BCW ledger scan failed: %s", exc)
-            return None
-
-        for row in rows:
-            peer_public_key = row[0]
-            try:
-                if hashlib.sha256(bytes.fromhex(peer_public_key)).hexdigest() == node_id:
-                    return peer_public_key
-            except Exception:
-                continue
-        return None
-
-    def _credit_ledger(self, peer_public_key: str, amount: float) -> None:
-        # TODO: v1.01 — route through Storage API (requires exposing storage on PluginContext)
-        if not self._ctx.storage_path:
-            return
-        now = time.time()
-        try:
-            conn = sqlite3.connect(self._ctx.storage_path, timeout=5)
-            conn.execute("PRAGMA busy_timeout=5000")
-            cur = conn.execute(
-                """
-                UPDATE ledger
-                SET balance = balance + ?, last_updated = ?
-                WHERE peer_public_key = ?
-                """,
-                (amount, now, peer_public_key),
-            )
-            if cur.rowcount == 0:
-                conn.execute(
-                    """
-                    INSERT INTO ledger
-                    (peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated)
-                    VALUES (?, ?, 0, 0, ?, ?)
-                    """,
-                    (peer_public_key, amount, now, now),
-                )
-            conn.commit()
-            conn.close()
-        except Exception as exc:
-            self._log_warning("BCW ledger credit failed for %s: %s", peer_public_key[:16], exc)
 
     async def _check_sol_balance(self) -> None:
         now = time.time()
@@ -742,9 +1075,9 @@ class BCWPlugin(PluginHooks):
             threshold = 0.01
 
         for chain_id, watcher in self._solana_modules.items():
-            address = self._store.get_address("__master__", chain_id)
-            if not address:
+            if not self._master_seed:
                 continue
+            address = _derive_master_address(self._master_seed, chain_id)
             try:
                 resp = await watcher._call_rpc(
                     "getBalance",
@@ -775,15 +1108,12 @@ class BCWPlugin(PluginHooks):
         self_addresses = self._self_owned_addresses or self._store.all_addresses()
         from_self = transfer.from_address in self_addresses
         to_self = transfer.to_address in self_addresses
-        to_known = transfer.to_address in self._known_wallet_addresses
 
         if not from_self and to_self:
             return "payment_received"
         if from_self and to_self:
             return "wallet_transfer"
-        if from_self and not to_self and to_known:
-            return "payment_executed"
-        if from_self and not to_self and not to_known:
+        if from_self and not to_self:
             return "wallet_withdrawal"
         if to_self:
             return "payment_received"

@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import concurrent.futures
 import hashlib
 import json
@@ -152,12 +153,16 @@ class DHTNode:
         self._sweep_offset: int = 0  # B3: rotating offset for peer sweep batching
         self._peer_last_hb_work: Dict[str, float] = {}  # SA-FW2: throttle HB downstream work
         self._bootstrap_peers: List[str] = []  # stored on join() for re-bootstrap
+        self._initial_bootstrap_peers: List[str] = []
+        self._isolation_rejoin_attempts: int = 0
+        self._isolation_rejoin_last: float = 0.0
+        self._isolation_rejoin_backoff: float = 30.0
         self._heartbeat_silence_threshold = float(network_cfg.get("heartbeat_silence_threshold", HEARTBEAT_SILENCE_THRESHOLD))
         self._peer_dead_timeout = float(network_cfg.get("peer_dead_timeout", PEER_DEAD_TIMEOUT))
         self._version_gated: bool = False  # True = below min_protocol_version, skills suspended
         self._min_protocol_version: str = self._config.get("node", {}).get("min_protocol_version", "")
         self._seen_messages: Set[tuple] = set()
-        self._seen_task_requests: Set[str] = set()  # SA6-02: msg_id dedup for TaskRequests
+        self._seen_task_requests: collections.OrderedDict = collections.OrderedDict()  # SA6-02: msg_id dedup (F-11: ordered for FIFO eviction)
 
         self._task_slots = max(1, min(64, int(self._config.get("node", {}).get("task_slots", 4))))
         # v0.33.0 C-track: configurable max queue depth (floor at 1 to prevent unbounded queue)
@@ -1912,6 +1917,8 @@ class DHTNode:
     async def join(self, bootstrap_peers: List[str], skip_jitter: bool = False):
         """Joins the network and re-announces own skills."""
         self._bootstrap_peers = list(bootstrap_peers)
+        if not self._initial_bootstrap_peers:
+            self._initial_bootstrap_peers = list(bootstrap_peers)
         # B1: startup jitter to prevent bootstrap stampede (P-024)
         # skip_jitter=True for isolation recovery — node already waited 5min, no stampede risk
         startup_jitter = self._config.get("node", {}).get("startup_jitter", True)
@@ -1963,7 +1970,10 @@ class DHTNode:
         
         if joined:
             await self._reannounce_all()
-            
+            self._bootstrap_peers = []
+            logger.info("BOOTSTRAP_JOIN_COMPLETE clearing bootstrap peer list")
+            asyncio.get_running_loop().create_task(self._self_populate_routing_table())
+
         return joined
 
     async def _process_sync_response(self, resp: SyncResponse):
@@ -2645,6 +2655,19 @@ class DHTNode:
             resp = await request_response(provider_host, provider_port, req, timeout=timeout_ms/1000.0)
             
             if isinstance(resp, TaskResult) and verify_message(resp):
+                # F-03: Bind sync response to the expected provider — reject if the
+                # signer does not match provider_node_id to prevent misbilling.
+                resp_node_id = hashlib.sha256(bytes.fromhex(resp.public_key)).hexdigest()
+                if resp_node_id != provider_node_id:
+                    logger.warning(
+                        f"REQUEST_TASK_WRONG_PROVIDER task={task_id[:8]} "
+                        f"expected={provider_node_id[:16]} got={resp_node_id[:16]}"
+                    )
+                    return TaskResult(
+                        task_id=task_id, status="failed",
+                        error={"code": "WRONG_PROVIDER",
+                               "message": "Response signer does not match expected provider"}
+                    )
                 await self._enqueue_write(
                     self.storage.update_task_status,
                     task_id, resp.status,
@@ -3400,10 +3423,12 @@ class DHTNode:
                 task_id=msg.task_id, status="failed",
                 error={"code": "DUPLICATE_REQUEST", "message": "Request already processed"}
             ))
-        self._seen_task_requests.add(msg.msg_id)
+        self._seen_task_requests[msg.msg_id] = None
         if len(self._seen_task_requests) > MAX_TASK_DEDUP_SIZE:
-            # Evict oldest half (set is unordered but this prevents unbounded growth)
-            self._seen_task_requests = set(list(self._seen_task_requests)[MAX_TASK_DEDUP_SIZE // 2:])
+            # Evict oldest half — OrderedDict guarantees insertion-order FIFO eviction. (F-11)
+            evict_count = len(self._seen_task_requests) - (MAX_TASK_DEDUP_SIZE // 2)
+            for _ in range(evict_count):
+                self._seen_task_requests.popitem(last=False)
 
         # Version gating: reject tasks when below minimum protocol version
         if self._version_gated:
@@ -3512,8 +3537,8 @@ class DHTNode:
             skill_name=skill_name,
             base_price=skill_sheet.price if skill_sheet else 1.0,
             balance=entry.balance,
-            soft_limit=min_balance,  # from _resolve_policy
-            hard_limit=min_balance,  # from _resolve_policy
+            soft_limit=initial_credit,  # warning threshold (F-06 fix)
+            hard_limit=min_balance,
             tit_for_tat=self.policy.tit_for_tat,
             peer_node_id=peer_nid,
             peer_groups=set(self._group_engine.get_groups(peer_nid)) if self._group_engine else set(),
@@ -5123,6 +5148,27 @@ class DHTNode:
             raise RuntimeError("Settlement confirmation processing requires a signing key")
 
         prior_balance = float(self.storage.get_ledger_balance(peer_key) or 0.0)
+
+        # F-02: Cross-check amount_settled against outstanding balance before zeroing.
+        # Prevents fraudulent confirmations from erasing arbitrary debt.
+        amount_settled = abs(float(body.get("amount_settled", 0.0)))
+        if prior_balance != 0.0:
+            if amount_settled <= 0:
+                logger.warning(
+                    f"SETTLEMENT_CONFIRM_REJECTED peer={peer_key[:16]} "
+                    f"reason=amount_settled_zero_or_negative"
+                )
+                return
+            tolerance = max(1.0, abs(prior_balance) * 0.01)
+            if abs(amount_settled - abs(prior_balance)) > tolerance:
+                logger.warning(
+                    f"SETTLEMENT_CONFIRM_REJECTED peer={peer_key[:16]} "
+                    f"amount_settled={amount_settled:.4f} "
+                    f"expected_approx={abs(prior_balance):.4f} "
+                    f"tolerance={tolerance:.4f}"
+                )
+                return
+
         if prior_balance > 0:
             await self._enqueue_write(self.storage.update_ledger_provider, peer_key, prior_balance)
         elif prior_balance < 0:
@@ -5214,8 +5260,13 @@ class DHTNode:
             value = body.get(key)
             if isinstance(value, str) and value:
                 return value
-        fallback = item.get("from_node") if isinstance(item, dict) else ""
-        return fallback if isinstance(fallback, str) else ""
+        # F-16: Do not fall back to from_node — it would zero the wrong peer's ledger
+        # if all explicit key fields are absent (malformed or adversarial message).
+        logger.warning(
+            f"SETTLEMENT_PEER_KEY_UNRESOLVED: no peer key field found in body, "
+            f"from_node={str(item.get('from_node', ''))[:16]}"
+        )
+        return ""
 
     def _build_settlement_confirmation_body(
         self,
@@ -5364,6 +5415,60 @@ class DHTNode:
             except Exception as e:
                 logger.warning(f"PULL_FROM_CORRESPONDENTS_FAIL: {e}")
 
+    def _should_attempt_rejoin(self) -> bool:
+        """Return True if enough time has elapsed since last rejoin attempt."""
+        return time.time() - self._isolation_rejoin_last >= self._isolation_rejoin_backoff
+
+    def _record_rejoin_attempt(self) -> None:
+        """Record that a rejoin was attempted; increment counter and double backoff (capped at 300s)."""
+        self._isolation_rejoin_last = time.time()
+        self._isolation_rejoin_attempts += 1
+        self._isolation_rejoin_backoff = min(self._isolation_rejoin_backoff * 2, 300.0)
+
+    def _reset_rejoin_backoff(self) -> None:
+        """Reset rejoin state after healthy peer count is observed."""
+        self._isolation_rejoin_attempts = 0
+        self._isolation_rejoin_last = 0.0
+        self._isolation_rejoin_backoff = 30.0
+
+    async def _self_populate_routing_table(self) -> None:
+        """After successful join, populate kademlia routing table by looking up our own node id."""
+        await asyncio.sleep(2.0)
+        kad_plugin = getattr(getattr(self, "_plugins", None), "get_plugin_by_name", lambda _name: None)("knarr-kademlia")
+        if kad_plugin and hasattr(kad_plugin, "iterative_find_node"):
+            try:
+                await kad_plugin.iterative_find_node(self.node_info.node_id)
+            except Exception as exc:
+                logger.debug("SELF_POPULATE_ROUTING_TABLE_FAIL %r", exc)
+        await self._evict_bootstrap_peers()
+
+    async def _evict_bootstrap_peers(self) -> None:
+        """KAD-02: Remove bootstrap peer entries from routing table after self-population."""
+        if not self._initial_bootstrap_peers:
+            return
+
+        bootstrap_addrs: set[tuple[str, int]] = set()
+        for peer_addr in self._initial_bootstrap_peers:
+            try:
+                host, port_text = str(peer_addr).rsplit(":", 1)
+                bootstrap_addrs.add((host.lower(), int(port_text)))
+            except (TypeError, ValueError):
+                continue
+
+        if not bootstrap_addrs:
+            return
+
+        for peer in self.storage.get_peers():
+            if (peer.host, peer.port) not in bootstrap_addrs:
+                continue
+            await self._enqueue_write(self.storage.remove_peer, peer.node_id)
+            logger.debug(
+                "KAD02_EVICT_BOOTSTRAP node_id=%.16s addr=%s:%d",
+                peer.node_id,
+                peer.host,
+                peer.port,
+            )
+
     async def _peer_heartbeat_sweep_loop(self):
         """Independent background loop for peer heartbeat sweep."""
         interval = max(1.0, float(self._config.get("node", {}).get("sweep_interval", 10)))
@@ -5373,22 +5478,24 @@ class DHTNode:
             try:
                 effective_bootstrap_peers = list(dict.fromkeys(
                     list(self._config.get("network", {}).get("bootstrap", []))
-                    + list(self._bootstrap_peers)
+                    + list(self._initial_bootstrap_peers or self._bootstrap_peers)
                 ))
                 peers = self.storage.get_peers()
                 if not peers:
                     # Clear isolation tracking — no peers triggers immediate re-bootstrap
                     self._isolation_since = None
-                    if effective_bootstrap_peers:
+                    if effective_bootstrap_peers and self._should_attempt_rejoin():
                         logger.warning("No peers — attempting re-bootstrap")
                         if self.bus:
                             self.bus.emit("node.rebootstrap", reason="no_peers", identity=self.node_info.node_id)
+                        recovery_bootstrap = self._initial_bootstrap_peers or effective_bootstrap_peers
                         try:
-                            await self.join(effective_bootstrap_peers, skip_jitter=True)
+                            await self.join(recovery_bootstrap, skip_jitter=False)
                         except Exception as e:
                             logger.warning(f"Re-bootstrap failed: {e}")
                             if self.bus:
                                 self.bus.emit("node.rebootstrap_failed", error=str(e), identity=self.node_info.node_id)
+                        self._record_rejoin_attempt()
                     continue
 
                 # B2: isolation detection — peer_count <= 1 for >5min triggers re-bootstrap (P-023)
@@ -5398,13 +5505,15 @@ class DHTNode:
                     elif time.monotonic() - self._isolation_since > _isolation_timeout:
                         isolated_for = time.monotonic() - self._isolation_since
                         self._isolation_since = None
-                        if effective_bootstrap_peers:
+                        if effective_bootstrap_peers and self._should_attempt_rejoin():
                             if self.bus:
                                 self.bus.emit("node.rebootstrap", reason="isolation", identity=self.node_info.node_id)
+                            recovery_bootstrap = self._initial_bootstrap_peers or effective_bootstrap_peers
                             try:
-                                await self.join(effective_bootstrap_peers, skip_jitter=True)
+                                await self.join(recovery_bootstrap, skip_jitter=False)
                             except Exception as e:
                                 logger.warning(f"Re-bootstrap (isolation) failed: {e}")
+                            self._record_rejoin_attempt()
                         else:
                             logger.warning(
                                 "ISOLATION_DETECTED peer_count=%d isolated_for=%.0fs — no bootstrap peers configured",
@@ -5412,19 +5521,10 @@ class DHTNode:
                             )
                         continue
                 else:
-                    # Healthy peer count — clear isolation tracking
+                    # Healthy peer count — clear isolation tracking and backoff
                     self._isolation_since = None
+                    self._reset_rejoin_backoff()
 
-                now = time.monotonic()
-                await asyncio.wait_for(
-                    self._peer_heartbeat_sweep(peers, now),
-                    timeout=PEER_HEARTBEAT_SWEEP_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "PEER_SWEEP_TIMEOUT peer heartbeat sweep exceeded %.1fs",
-                    PEER_HEARTBEAT_SWEEP_TIMEOUT,
-                )
             except Exception as e:
                 logger.warning(f"PEER_HEARTBEAT_SWEEP_FAIL: {e}")
 
