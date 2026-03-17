@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import concurrent.futures
 import hashlib
 import json
@@ -161,7 +162,7 @@ class DHTNode:
         self._version_gated: bool = False  # True = below min_protocol_version, skills suspended
         self._min_protocol_version: str = self._config.get("node", {}).get("min_protocol_version", "")
         self._seen_messages: Set[tuple] = set()
-        self._seen_task_requests: Set[str] = set()  # SA6-02: msg_id dedup for TaskRequests
+        self._seen_task_requests: collections.OrderedDict = collections.OrderedDict()  # SA6-02: msg_id dedup (F-11: ordered for FIFO eviction)
 
         self._task_slots = max(1, min(64, int(self._config.get("node", {}).get("task_slots", 4))))
         # v0.33.0 C-track: configurable max queue depth (floor at 1 to prevent unbounded queue)
@@ -2654,6 +2655,19 @@ class DHTNode:
             resp = await request_response(provider_host, provider_port, req, timeout=timeout_ms/1000.0)
             
             if isinstance(resp, TaskResult) and verify_message(resp):
+                # F-03: Bind sync response to the expected provider — reject if the
+                # signer does not match provider_node_id to prevent misbilling.
+                resp_node_id = hashlib.sha256(bytes.fromhex(resp.public_key)).hexdigest()
+                if resp_node_id != provider_node_id:
+                    logger.warning(
+                        f"REQUEST_TASK_WRONG_PROVIDER task={task_id[:8]} "
+                        f"expected={provider_node_id[:16]} got={resp_node_id[:16]}"
+                    )
+                    return TaskResult(
+                        task_id=task_id, status="failed",
+                        error={"code": "WRONG_PROVIDER",
+                               "message": "Response signer does not match expected provider"}
+                    )
                 await self._enqueue_write(
                     self.storage.update_task_status,
                     task_id, resp.status,
@@ -3409,10 +3423,12 @@ class DHTNode:
                 task_id=msg.task_id, status="failed",
                 error={"code": "DUPLICATE_REQUEST", "message": "Request already processed"}
             ))
-        self._seen_task_requests.add(msg.msg_id)
+        self._seen_task_requests[msg.msg_id] = None
         if len(self._seen_task_requests) > MAX_TASK_DEDUP_SIZE:
-            # Evict oldest half (set is unordered but this prevents unbounded growth)
-            self._seen_task_requests = set(list(self._seen_task_requests)[MAX_TASK_DEDUP_SIZE // 2:])
+            # Evict oldest half — OrderedDict guarantees insertion-order FIFO eviction. (F-11)
+            evict_count = len(self._seen_task_requests) - (MAX_TASK_DEDUP_SIZE // 2)
+            for _ in range(evict_count):
+                self._seen_task_requests.popitem(last=False)
 
         # Version gating: reject tasks when below minimum protocol version
         if self._version_gated:
@@ -3521,8 +3537,8 @@ class DHTNode:
             skill_name=skill_name,
             base_price=skill_sheet.price if skill_sheet else 1.0,
             balance=entry.balance,
-            soft_limit=min_balance,  # from _resolve_policy
-            hard_limit=min_balance,  # from _resolve_policy
+            soft_limit=initial_credit,  # warning threshold (F-06 fix)
+            hard_limit=min_balance,
             tit_for_tat=self.policy.tit_for_tat,
             peer_node_id=peer_nid,
             peer_groups=set(self._group_engine.get_groups(peer_nid)) if self._group_engine else set(),
@@ -5132,6 +5148,27 @@ class DHTNode:
             raise RuntimeError("Settlement confirmation processing requires a signing key")
 
         prior_balance = float(self.storage.get_ledger_balance(peer_key) or 0.0)
+
+        # F-02: Cross-check amount_settled against outstanding balance before zeroing.
+        # Prevents fraudulent confirmations from erasing arbitrary debt.
+        amount_settled = abs(float(body.get("amount_settled", 0.0)))
+        if prior_balance != 0.0:
+            if amount_settled <= 0:
+                logger.warning(
+                    f"SETTLEMENT_CONFIRM_REJECTED peer={peer_key[:16]} "
+                    f"reason=amount_settled_zero_or_negative"
+                )
+                return
+            tolerance = max(1.0, abs(prior_balance) * 0.01)
+            if abs(amount_settled - abs(prior_balance)) > tolerance:
+                logger.warning(
+                    f"SETTLEMENT_CONFIRM_REJECTED peer={peer_key[:16]} "
+                    f"amount_settled={amount_settled:.4f} "
+                    f"expected_approx={abs(prior_balance):.4f} "
+                    f"tolerance={tolerance:.4f}"
+                )
+                return
+
         if prior_balance > 0:
             await self._enqueue_write(self.storage.update_ledger_provider, peer_key, prior_balance)
         elif prior_balance < 0:
@@ -5223,8 +5260,13 @@ class DHTNode:
             value = body.get(key)
             if isinstance(value, str) and value:
                 return value
-        fallback = item.get("from_node") if isinstance(item, dict) else ""
-        return fallback if isinstance(fallback, str) else ""
+        # F-16: Do not fall back to from_node — it would zero the wrong peer's ledger
+        # if all explicit key fields are absent (malformed or adversarial message).
+        logger.warning(
+            f"SETTLEMENT_PEER_KEY_UNRESOLVED: no peer key field found in body, "
+            f"from_node={str(item.get('from_node', ''))[:16]}"
+        )
+        return ""
 
     def _build_settlement_confirmation_body(
         self,
@@ -5398,6 +5440,34 @@ class DHTNode:
                 await kad_plugin.iterative_find_node(self.node_info.node_id)
             except Exception as exc:
                 logger.debug("SELF_POPULATE_ROUTING_TABLE_FAIL %r", exc)
+        await self._evict_bootstrap_peers()
+
+    async def _evict_bootstrap_peers(self) -> None:
+        """KAD-02: Remove bootstrap peer entries from routing table after self-population."""
+        if not self._initial_bootstrap_peers:
+            return
+
+        bootstrap_addrs: set[tuple[str, int]] = set()
+        for peer_addr in self._initial_bootstrap_peers:
+            try:
+                host, port_text = str(peer_addr).rsplit(":", 1)
+                bootstrap_addrs.add((host.lower(), int(port_text)))
+            except (TypeError, ValueError):
+                continue
+
+        if not bootstrap_addrs:
+            return
+
+        for peer in self.storage.get_peers():
+            if (peer.host, peer.port) not in bootstrap_addrs:
+                continue
+            await self._enqueue_write(self.storage.remove_peer, peer.node_id)
+            logger.debug(
+                "KAD02_EVICT_BOOTSTRAP node_id=%.16s addr=%s:%d",
+                peer.node_id,
+                peer.host,
+                peer.port,
+            )
 
     async def _peer_heartbeat_sweep_loop(self):
         """Independent background loop for peer heartbeat sweep."""

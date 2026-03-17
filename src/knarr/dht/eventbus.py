@@ -204,7 +204,10 @@ class EventBus:
                     # Ready to fire — collect in order (list is sorted by valid_from)
                     ready.append(entry)
                 else:
-                    # List is sorted ascending; all subsequent entries are also future
+                    # Do NOT break — check every entry regardless of position.
+                    # Deferred entries are inserted in sorted order but may have
+                    # sub-millisecond timestamp ties or floating-point edge cases.
+                    # Checking all entries avoids events being permanently stuck. (F-13)
                     remaining.append(entry)
 
             self._deferred = remaining

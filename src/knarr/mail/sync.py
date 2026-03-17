@@ -102,7 +102,7 @@ class SyncEngine:
             skill_name=skill_name,
             base_price=skill_sheet.price if skill_sheet else float(self._node._config.get("mail", {}).get("price", 1.0)),
             balance=entry.balance,
-            soft_limit=min_balance,
+            soft_limit=initial_credit,  # warning threshold (F-10 fix)
             hard_limit=min_balance,
             tit_for_tat=self._node.policy.tit_for_tat,
             peer_node_id=peer_nid,

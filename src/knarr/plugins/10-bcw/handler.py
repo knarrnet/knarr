@@ -789,15 +789,20 @@ class BCWPlugin(PluginHooks):
             self._store.update_last_seen(node_id, chain_id, time.time())
 
         try:
-            payload = result if isinstance(result, dict) else {"value": result}
             if meta.get("type") == "account":
-                if isinstance(payload, dict) and "address" not in payload:
-                    payload = {**payload, "address": meta.get("address")}
-                self._process_account_notification(node_id, chain_id, payload, correlation_id)
+                task = asyncio.get_running_loop().create_task(
+                    self._process_ws_account_event(node_id, chain_id, correlation_id)
+                )
+                self._ws_tasks = [t for t in self._ws_tasks if not t.done()]
+                self._ws_tasks.append(task)
             elif meta.get("type") == "signature":
-                if isinstance(payload, dict) and "tx_hash" not in payload:
-                    payload = {**payload, "tx_hash": meta.get("tx_hash")}
-                self._process_signature_notification(node_id, chain_id, payload, correlation_id)
+                task = asyncio.get_running_loop().create_task(
+                    self._process_ws_signature_event(
+                        node_id, chain_id, meta.get("tx_hash"), correlation_id
+                    )
+                )
+                self._ws_tasks = [t for t in self._ws_tasks if not t.done()]
+                self._ws_tasks.append(task)
         except Exception as exc:
             self._log_warning("BCW websocket notification failed: %s", exc)
 
@@ -816,6 +821,88 @@ class BCWPlugin(PluginHooks):
                 sig_watch.get("tx_hash"),
             )
 
+    async def _process_ws_account_event(
+        self,
+        node_id: str,
+        chain_id: str,
+        correlation_id: Optional[str],
+    ) -> None:
+        """BCW-01: Fetch transfers via poll_address and route through _process_transfer."""
+        # Look up watch entry for address and last_signature
+        address = None
+        last_signature = None
+        for entry in self._store.list_watches():
+            if entry.get("node_id") == node_id and entry.get("chain_id") == chain_id:
+                address = entry.get("address")
+                last_signature = entry.get("last_signature")
+                break
+
+        watcher = self._solana_modules.get(chain_id)
+        if watcher is None or not address:
+            return
+
+        try:
+            result: PollResult = await watcher.poll_address(address, last_signature)
+        except Exception as exc:
+            self._log_warning(
+                "BCW01 ws account event poll failed node=%.16s chain=%s: %s",
+                node_id, chain_id, exc,
+            )
+            return
+
+        for transfer in result.events:
+            if not self._store.mark_seen(transfer.chain_id, transfer.tx_hash, transfer.tx_index):
+                continue
+            self._process_transfer(transfer, correlation_id=correlation_id)
+
+        if result.latest_signature and result.latest_signature != last_signature:
+            self._store.update_cursor(node_id, chain_id, result.latest_signature)
+        if result.events:
+            self._store.update_last_seen(node_id, chain_id, time.time())
+
+    async def _process_ws_signature_event(
+        self,
+        node_id: str,
+        chain_id: str,
+        tx_hash: Optional[str],
+        correlation_id: Optional[str],
+    ) -> None:
+        """BCW-01: Fetch confirmed tx details via poll and route through _process_transfer."""
+        watcher = self._solana_modules.get(chain_id)
+        if watcher is None or not tx_hash:
+            return
+
+        address = self._store.get_address(node_id, chain_id)
+        if not address:
+            return
+
+        try:
+            result: PollResult = await watcher.poll_address(address, None)
+        except Exception as exc:
+            self._log_warning(
+                "BCW01 ws signature event poll failed node=%.16s chain=%s tx=%.16s: %s",
+                node_id, chain_id, tx_hash, exc,
+            )
+            return
+
+        matched = False
+        for transfer in result.events:
+            if transfer.tx_hash != tx_hash:
+                continue
+            matched = True
+            if not self._store.mark_seen(transfer.chain_id, transfer.tx_hash, transfer.tx_index):
+                continue
+            self._process_transfer(transfer, correlation_id=correlation_id)
+
+        if not matched:
+            self._log_warning(
+                "BCW01 ws signature event: no matching tx found node=%.16s chain=%s tx=%.16s",
+                node_id, chain_id, tx_hash,
+            )
+
+    # -- Superseded by BCW-01 async task approach (v0.49.0) --
+    # These methods are kept as private stubs; no active call sites remain.
+
     def _process_account_notification(
         self,
         node_id: str,
@@ -823,15 +910,8 @@ class BCWPlugin(PluginHooks):
         result: dict,
         correlation_id: Optional[str],
     ) -> None:
-        self._emit_event(
-            f"payment.received.{chain_id}",
-            receipt_type="payment_received",
-            node_id=node_id,
-            chain_id=chain_id,
-            address=result.get("address") or self._store.get_address(node_id, chain_id),
-            correlation_id=correlation_id,
-            result=result,
-        )
+        """Superseded by _process_ws_account_event (BCW-01). Retained as stub."""
+        pass
 
     def _process_signature_notification(
         self,
@@ -840,15 +920,8 @@ class BCWPlugin(PluginHooks):
         result: dict,
         correlation_id: Optional[str],
     ) -> None:
-        self._emit_event(
-            f"payment.finalized.{chain_id}",
-            receipt_type="payment_finalized",
-            node_id=node_id,
-            chain_id=chain_id,
-            tx_hash=result.get("tx_hash"),
-            correlation_id=correlation_id,
-            result=result,
-        )
+        """Superseded by _process_ws_signature_event (BCW-01). Retained as stub."""
+        pass
 
     async def on_tick(self, peers: list, health: NodeHealth) -> None:
         if not self._enabled:

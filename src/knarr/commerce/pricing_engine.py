@@ -178,13 +178,23 @@ def resolve_price(req: PricingRequest, config: PricingConfig) -> PricingResult:
                 "factor": round(factor, 6),
             })
 
-    # Apply discount cap
+    # Apply discount cap — enforced symmetrically for positive and negative prices.
+    # For positive prices: cap limits the discount (price reduction).
+    # For negative prices (bounties): cap limits the amplification (payout growth). (F-12)
     cap_applied = False
     if base_price >= 0:
         max_discount = base_price * (effective_cap_pct / 100.0)
         actual_discount = base_price - price
         if actual_discount > max_discount:
             price = base_price - max_discount
+            cap_applied = True
+    else:
+        # Negative base (bounty): cap limits how much the payout can be reduced
+        # (brought toward zero) by stacked discounts.
+        # e.g. base=-10, cap=50%: price cannot exceed -10 + 5 = -5.0
+        max_reduction = abs(base_price) * (effective_cap_pct / 100.0)
+        if price > base_price + max_reduction:
+            price = base_price + max_reduction
             cap_applied = True
 
     return _apply_floor(price, req, config, rules_applied, cap_applied)

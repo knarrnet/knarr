@@ -105,6 +105,17 @@ def make_commerce_handlers(node) -> dict:
             return
 
         from_node_id = item.get("from_node")
+
+        # F-07: Verify that the sender is the original provider — not just any peer
+        # who knows the task_id. provider_node_id is stored in the execution log.
+        provider_node_id = original.get("provider_node_id")
+        if provider_node_id and from_node_id != provider_node_id:
+            logger.warning(
+                f"Credit note rejected: sender {str(from_node_id)[:16]} "
+                f"!= provider {str(provider_node_id)[:16]} for task_id={task_id[:16]}"
+            )
+            return
+
         target_pubkey = _resolve_public_key(node, from_node_id)
 
         if target_pubkey:
@@ -196,8 +207,10 @@ def make_commerce_handlers(node) -> dict:
 
     # FIX-004/005/006: Netting session store — tracks active proposals by netting_id.
     # Keyed by netting_id; value is from_node and proposal details.
+    # F-09: Lock is created lazily inside handlers to avoid binding to the wrong
+    # event loop when make_commerce_handlers() is called before a loop is running.
     _netting_sessions: dict = {}
-    _netting_lock = asyncio.Lock()
+    _netting_lock: asyncio.Lock | None = None
 
     async def handle_netting_proposal(item: dict) -> None:
         """Process knarr/commerce/netting_proposal mail.
@@ -222,6 +235,10 @@ def make_commerce_handlers(node) -> dict:
         if not netting_id:
             logger.warning("NETTING_PROPOSAL rejected: missing netting_id")
             return
+
+        nonlocal _netting_lock
+        if _netting_lock is None:
+            _netting_lock = asyncio.Lock()
 
         now = time.time()
         async with _netting_lock:
@@ -252,6 +269,13 @@ def make_commerce_handlers(node) -> dict:
             logger.warning("NETTING_ACCEPTANCE rejected: missing netting_id")
             return
 
+        nonlocal _netting_lock
+        if _netting_lock is None:
+            _netting_lock = asyncio.Lock()
+
+        # F-08: Verify sender BEFORE popping the session.
+        # Popping before the check permanently burns the session, letting any peer
+        # who guesses a netting_id DoS legitimate settlements.
         async with _netting_lock:
             if netting_id not in _netting_sessions:
                 logger.warning(
@@ -259,17 +283,17 @@ def make_commerce_handlers(node) -> dict:
                     f"netting_id={netting_id[:16]} (replay or forgery)"
                 )
                 return
+            session = _netting_sessions[netting_id]  # peek — do not pop yet
+            if item.get("from_node") != session.get("from_node"):
+                logger.warning(
+                    f"NETTING_ACCEPTANCE rejected: sender mismatch "
+                    f"netting_id={netting_id[:16]} "
+                    f"expected={str(session.get('from_node', ''))[:16]} "
+                    f"got={str(item.get('from_node', ''))[:16]}"
+                )
+                return
+            # Sender verified — now consume the session
             session = _netting_sessions.pop(netting_id)
-
-        # Sender check after lock (pop already consumed the session — no retries)
-        if item.get("from_node") != session.get("from_node"):
-            logger.warning(
-                f"NETTING_ACCEPTANCE rejected: sender mismatch "
-                f"netting_id={netting_id[:16]} "
-                f"expected={str(session.get('from_node', ''))[:16]} "
-                f"got={str(item.get('from_node', ''))[:16]}"
-            )
-            return
 
         logger.info(
             f"NETTING_ACCEPTANCE accepted netting_id={netting_id[:16]} "
