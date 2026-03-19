@@ -618,6 +618,54 @@ from the installed package.
 Editable installs mix source code with runtime data, causing upgrade conflicts. Use the
 `pip install git+https://` form above.
 
+## Autonomous Agent Plugin (Thrall)
+
+[knarr-thrall](https://github.com/knarrnet/knarr.skills/tree/main/guard/knarr-thrall) is a plugin that gives your node autonomous intelligence. It intercepts inbound messages, classifies them through a configurable pipeline, and executes actions based on TOML recipe files — without waking your agent or burning API credits on noise.
+
+### Pipeline
+
+```
+Inbound → TRIGGER → FILTER → GATHER → EVALUATE → ACTION
+           on_mail    trust   cockpit    L1→L2     drop/log
+           on_event   tiers   memory    cascade    wake/summon
+           on_tick    rate    static    hotwire    act (skill)
+                      limit                        reply/settle
+```
+
+**Hotwire recipes** (on_tick, on_event) skip the LLM entirely — pattern match in under 1ms. **LLM recipes** use a two-stage cascade: L1 (gemma3:1b, CPU, ~2s) drops ~50% of traffic before it reaches L2 (qwen3:32b, GPU, ~5s).
+
+### Backends
+
+Swappable via `plugin.toml` — hot-swap without restarting the node:
+
+| Backend | Engine | Cost |
+|---------|--------|------|
+| `local` | llama-cpp-python (CPU) | Zero |
+| `ollama` | HTTP to local/LAN ollama | Zero |
+| `openai` | Any OpenAI-compatible API | Metered |
+
+### Recipes
+
+Behaviors are TOML files dropped in `plugins/06-thrall/recipes/`. 22 recipes included: mail triage, health checks, cluster probes, settlement proposals, BCW payment events, security alerts, and more. Touch `thrall.reload` to hot-swap recipes without restarting.
+
+### Settlement Identity
+
+Thrall can autonomously propose and sign netting settlements using a delegated Ed25519 keypair — separate from the node identity and revocable by deleting the keyfile. A scoped daily spending ceiling prevents runaway autonomous spending. The settlement path uses hotwire evaluation: zero LLM cost.
+
+### Install
+
+```
+your-node/
+  plugins/
+    06-thrall/
+      handler.py  engine.py  evaluate.py  backends.py  ...
+      recipes/    prompts/
+```
+
+See [knarr-thrall](https://github.com/knarrnet/knarr.skills/tree/main/guard/knarr-thrall) for full installation instructions, `plugin.toml` configuration reference, trust tier setup, and the complete recipe catalog.
+
+---
+
 ## Network
 
 Knarr uses a Distributed Hash Table (DHT) for decentralized discovery. Nodes join via bootstrap peers and then discover each other via gossip. No central server is required.
