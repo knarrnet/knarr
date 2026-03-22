@@ -183,6 +183,7 @@ async def execute_settlement(
     send_mail_fn: Callable,
     bus=None,
     config: Optional[dict] = None,
+    provider_wallet: str = "",
 ) -> str:
     """Validate dual signatures, write accepted receipt, send settle_request mail.
 
@@ -277,7 +278,19 @@ async def execute_settlement(
         )
 
     # Send settle_request mail to counterparty
-    # The countersigned_doc carries both proofs; we package it as the settlement body
+    # Resolve peer_key (public key hex) → node_id for mail routing
+    to_node = storage.get_node_id_by_pubkey(peer_key)
+    if not to_node:
+        raise ValueError(
+            f"execute_settlement: cannot resolve peer_key to node_id — "
+            f"peer_key={peer_key[:16]} not in peer_keys table"
+        )
+
+    # Resolve balance and credit_limit for settle_request body
+    current_balance = storage.get_ledger_balance(peer_key) or 0.0
+    ledger_entry = storage.get_or_create_ledger_entry(peer_key)
+    credit_limit = ledger_entry.hard_limit
+
     settle_body = {
         "type": "knarr/commerce/settle_request",
         "document": countersigned_doc,
@@ -286,13 +299,16 @@ async def execute_settlement(
         "peer_key": peer_key,
         "amount": token_amount,
         "accepted_receipt_id": receipt_id,
+        "current_balance": current_balance,
+        "credit_limit": credit_limit,
+        "provider_wallet": provider_wallet,
         "schema_version": "1.0",
         "timestamp": time.time(),
     }
 
     try:
         await send_mail_fn(
-            to_node=peer_key,
+            to_node=to_node,
             msg_type="knarr/commerce/settle_request",
             body=settle_body,
             system=True,

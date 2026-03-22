@@ -83,7 +83,7 @@ class ProviderCache:
             query_val_lower = query_value.lower()
             for providers in self.cache.values():
                 for record in providers.values():
-                    if query_val_lower in record["skill_key"].lower():
+                    if record["skill_key"].lower() == query_val_lower:
                         if now - record["stored_at"] <= record["ttl"]:
                             results.append(record)
                             

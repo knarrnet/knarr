@@ -5,7 +5,7 @@ description = "Kademlia DHT — passive cache + active routing via PluginMessage
 
 [config]
 mode = "passive"
-k = 20
+k = 8
 alpha = 3
 max_provider_records = 50000
 evict_interval_seconds = 60

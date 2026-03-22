@@ -600,6 +600,10 @@ class CockpitServer:
                         self._respond_json(writer, {"results": results, "count": len(results)})
                     elif path == "/api/logs":
                         self._handle_logs(writer, query)
+                    elif path == "/api/demand":
+                        # CR-05: expose demand table via cockpit
+                        demands = self._node.get_demand_summary()
+                        self._respond_json(writer, {"demands": demands, "total": len(demands)})
                     elif path == "/api/reputation":
                         self._respond_json(writer, self._node.get_reputation_summary())
                     elif path == "/api/secrets":
@@ -2736,11 +2740,10 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
             authority_signing_key = getattr(self._node, "_cockpit_signing_key", None)
             if authority_vm.endswith("#thrall-1"):
                 authority_signing_key = getattr(self._node, "_thrall_signing_key", authority_signing_key)
-            authority_verify_key = (
-                authority_signing_key.verify_key
-                if authority_signing_key is not None
-                else self._node._signing_key.verify_key
-            )
+            if authority_signing_key is None:
+                self._respond_error(writer, 400, "No authority key configured — cockpit or thrall key required")
+                return
+            authority_verify_key = authority_signing_key.verify_key
 
             receipt_id = await execute_settlement(
                 prepared_doc=prepared_doc,
@@ -2754,6 +2757,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
                 send_mail_fn=self._node._sync.enqueue,
                 bus=getattr(self._node, "bus", None),
                 config=getattr(self._node, '_config', None) or {},
+                provider_wallet=getattr(self._node, '_wallet', '') or '',
             )
         except ValueError as exc:
             self._respond_error(writer, 400, str(exc))

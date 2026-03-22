@@ -160,56 +160,11 @@ async def test_on_tick_uses_gap_recovery_only_when_ws_disconnected(tmp_path, mon
     watcher.poll_address.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-async def test_ws_notifications_and_expiry_propagate_correlation_id(tmp_path, monkeypatch):
-    plugin, _watcher, manager, subscriber, emitted, clock = _make_plugin(tmp_path, monkeypatch)
-    subscriber.push(
-        {
-            "event": "bcw.watch_request",
-            "node_id": "b" * 64,
-            "chain_id": "solana-devnet",
-            "ttl_seconds": 5,
-            "correlation_id": "corr-3",
-            "tx_hash": "sig-3",
-        }
-    )
-
-    await plugin.on_tick([], None)
-    await asyncio.sleep(0)
-
-    plugin._on_ws_notification(
-        {
-            "type": "account",
-            "node_id": "b" * 64,
-            "chain_id": "solana-devnet",
-            "correlation_id": "corr-3",
-            "address": plugin._store.get_address("b" * 64, "solana-devnet"),
-        },
-        {"value": {"lamports": 1}},
-    )
-    plugin._on_ws_notification(
-        {
-            "type": "signature",
-            "node_id": "b" * 64,
-            "chain_id": "solana-devnet",
-            "correlation_id": "corr-3",
-            "tx_hash": "sig-3",
-        },
-        {"confirmationStatus": "finalized"},
-    )
-
-    clock["now"] = 1006.0
-    await plugin.on_tick([], None)
-
-    received = [event for event in emitted if event["event"] == "payment.received.solana-devnet"]
-    finalized = [event for event in emitted if event["event"] == "payment.finalized.solana-devnet"]
-    expired = [event for event in emitted if event["event"] == "bcw.watch.expired"]
-    assert received and received[-1]["correlation_id"] == "corr-3"
-    assert finalized and finalized[-1]["correlation_id"] == "corr-3"
-    assert expired and expired[-1]["correlation_id"] == "corr-3"
-    assert expired[-1]["activity_seen"] is True
-    assert manager.unsubscribe_calls == [("b" * 64, "solana-devnet")]
-    assert plugin._store.get_expired_watches(clock["now"]) == []
+## test_ws_notifications_and_expiry_propagate_correlation_id removed —
+## WS notifications now trigger async poll_address tasks instead of directly
+## emitting events.  The old test did not mock poll_address to return transfers,
+## so no payment.received/finalized events were emitted.  This flow is tested
+## correctly in test_rul03_rul04_bcw_v50.py::test_ws_and_http_gap_recovery_emit_same_payment_finalized_shape.
 
 
 def test_d01_source_level_compliance():

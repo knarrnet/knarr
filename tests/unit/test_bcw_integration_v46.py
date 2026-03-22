@@ -86,36 +86,9 @@ def _read_balance(ledger_db: str) -> float:
     return row[0]
 
 
-def test_finalized_payment_credits_ledger(tmp_path):
-    """FINALIZED payment_received TransferEvent → counterparty ledger balance > 0."""
-    ledger_db = str(tmp_path / "ledger.db")
-    _make_ledger(ledger_db)
-    emitted = []
-    plugin = _make_plugin(tmp_path, ledger_db, emitted)
-
-    transfer = TransferEvent(
-        chain_id="solana-devnet",
-        tx_hash="aa" * 32,
-        tx_index=0,
-        from_address="ExternalSender1111111111111111111111111111111",
-        to_address=_PEER_ADDR,
-        amount=1_000_000_000,    # 1.0 $KNARR (KNARR_DECIMALS = 9)
-        denom="KNARR",
-        decimals=9,
-        confirmation=ConfirmationStatus.FINALIZED,
-    )
-
-    # Step 1: classify and emit payment.finalized.* event
-    plugin._process_transfer(transfer)
-    finalized = [e for e in emitted if e["event"].startswith("payment.finalized.")]
-    assert finalized, "Expected payment.finalized.* event after FINALIZED transfer"
-
-    # Step 2: credit path — resolve node_id, look up public_key, credit ledger
-    plugin._handle_payment_finalized(finalized[0])
-
-    # Step 3: balance must be positive (1.0 credit at default rate 1.0)
-    balance = _read_balance(ledger_db)
-    assert balance > 0.0, f"Expected positive balance after BCW credit, got {balance}"
+## test_finalized_payment_credits_ledger removed — _handle_payment_finalized on
+## BCWPlugin is now a stub (credit logic moved to bcw_credit.py in v49).
+## The end-to-end credit path is tested in test_cr01_bcw_credit_v50.py.
 
 
 def test_included_transfer_does_not_credit(tmp_path):

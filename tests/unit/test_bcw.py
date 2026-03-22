@@ -80,7 +80,18 @@ def mock_ctx(tmp_path):
 
 @pytest.fixture
 def plugin(mock_ctx, config):
-    return handler.BCWPlugin(mock_ctx, config)
+    p = handler.BCWPlugin(mock_ctx, config)
+    # Seed watches for two distinct node_ids so classification tests have
+    # self-owned addresses.  The old init used to bootstrap from get_peers();
+    # post-v49 watches are created only via watch_request events.
+    _node_id_1 = "d" * 64
+    _node_id_2 = "e" * 64
+    addr1 = handler.derive_counterparty_address(p._master_seed, _node_id_1, "solana-mainnet")
+    addr2 = handler.derive_counterparty_address(p._master_seed, _node_id_2, "solana-mainnet")
+    p._store.upsert_watch(_node_id_1, "solana-mainnet", addr1)
+    p._store.upsert_watch(_node_id_2, "solana-mainnet", addr2)
+    p._self_owned_addresses = p._store.all_addresses()
+    return p
 
 
 def _self_addresses(plugin_obj) -> list[str]:
@@ -140,10 +151,11 @@ def test_classification_self_to_self_to_wallet_transfer(plugin):
     assert plugin._classify_transfer(event) == "wallet_transfer"
 
 
-def test_classification_outbound_known_to_payment_executed(plugin):
+def test_classification_outbound_known_to_wallet_withdrawal(plugin):
+    # _known_wallet_addresses was removed in v49; all outbound-to-non-self
+    # is now classified as wallet_withdrawal (no payment_executed distinction).
     self_addr = _self_addresses(plugin)[0]
     known_wallet = "KnownWallet11111111111111111111111111111111"
-    plugin._known_wallet_addresses = {known_wallet}
     event = TransferEvent(
         chain_id="solana-mainnet",
         tx_hash="tx-known",
@@ -155,7 +167,7 @@ def test_classification_outbound_known_to_payment_executed(plugin):
         decimals=9,
         confirmation=ConfirmationStatus.FINALIZED,
     )
-    assert plugin._classify_transfer(event) == "payment_executed"
+    assert plugin._classify_transfer(event) == "wallet_withdrawal"
 
 
 def test_classification_outbound_unknown_to_wallet_withdrawal(plugin):
@@ -278,6 +290,7 @@ async def test_watch_request_emits_address_assigned(plugin, mock_ctx):
         node_id="b" * 64,
         chain_id="solana-mainnet",
         address=ANY,
+        correlation_id=None,
     )
 
 

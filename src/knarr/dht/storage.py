@@ -2,6 +2,7 @@ import json
 import sqlite3
 import time
 import logging
+import hashlib
 from typing import List, Dict, Any, Optional
 from ..core import rfc8785
 from ..core.models import NodeInfo, SkillSheet, Task, LedgerEntry
@@ -62,6 +63,12 @@ class Storage:
                 PRIMARY KEY (skill_key, provider_node_id)
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS peer_keys (
+                node_id TEXT PRIMARY KEY,
+                public_key TEXT NOT NULL
+            )
+        """)
         # Node identity table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS node_identity (
@@ -106,6 +113,7 @@ class Storage:
                 except sqlite3.OperationalError:
                     pass
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_skills_uri ON skills(uri)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_peer_keys_public_key ON peer_keys(public_key)")
 
         # Phase 6a + Phase 7: Tasks table columns (pre-migration-era)
         task_columns = {row[1] for row in cursor.execute("PRAGMA table_info(tasks)").fetchall()}
@@ -134,6 +142,7 @@ class Storage:
                     cursor.execute(f"ALTER TABLE peers ADD COLUMN {col} {col_type} {default}")
                 except sqlite3.OperationalError:
                     pass
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_peers_wallet ON peers(wallet)")
 
         # Ledger table (Phase 5b)
         cursor.execute("""
@@ -429,6 +438,31 @@ class Storage:
         conn.execute("UPDATE peers SET load = ? WHERE node_id = ?", (load, node_id))
         conn.commit()
 
+    def get_node_by_wallet(self, wallet_address: str) -> Optional[str]:
+        """Return node_id for the peer with the given wallet address, or None.
+
+        CR-01: BCW on-chain payment credit path — maps from_address to node_id.
+        """
+        if not wallet_address:
+            return None
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT node_id FROM peers WHERE wallet = ? LIMIT 1",
+            (wallet_address,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def get_peer_node_id_by_address(self, host: str, port: int) -> Optional[str]:
+        """Return node_id for the peer at the given host:port, or None. CARVE-01."""
+        if not host or not port:
+            return None
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT node_id FROM peers WHERE host = ? AND port = ? LIMIT 1",
+            (host, int(port))
+        ).fetchone()
+        return row[0] if row else None
+
     def update_peer_wallet(self, node_id: str, wallet: str):
         """Updates the wallet address for a peer."""
         conn = self._get_conn()
@@ -492,6 +526,12 @@ class Storage:
               time.time(), ttl, 1 if is_own else 0,
               provider_public_key, announce_signature, provider_msg_id, sidecar_port, uri,
               provider_host, provider_port))
+        if provider_node_id and provider_public_key:
+            conn.execute("""
+                INSERT INTO peer_keys (node_id, public_key)
+                VALUES (?, ?)
+                ON CONFLICT(node_id) DO UPDATE SET public_key=excluded.public_key
+            """, (provider_node_id, provider_public_key))
         conn.commit()
 
     def get_own_skills(self) -> List[SkillSheet]:
@@ -1128,6 +1168,17 @@ class Storage:
         )
         row = cursor.fetchone()
         if row:
+            if peer_public_key:
+                try:
+                    node_id = hashlib.sha256(bytes.fromhex(peer_public_key)).hexdigest()
+                    conn.execute("""
+                        INSERT INTO peer_keys (node_id, public_key)
+                        VALUES (?, ?)
+                        ON CONFLICT(node_id) DO UPDATE SET public_key=excluded.public_key
+                    """, (node_id, peer_public_key))
+                    conn.commit()
+                except Exception:
+                    pass
             return LedgerEntry(
                 peer_public_key=row[0], balance=row[1],
                 tasks_provided=row[2], tasks_consumed=row[3],
@@ -1165,6 +1216,16 @@ class Storage:
                 "VALUES (?, 0.0, 0, 0, ?, ?, ?, ?)",
                 (peer_public_key, now, now, initial_trust, 0.0)
             )
+        if peer_public_key:
+            try:
+                node_id = hashlib.sha256(bytes.fromhex(peer_public_key)).hexdigest()
+                conn.execute("""
+                    INSERT INTO peer_keys (node_id, public_key)
+                    VALUES (?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET public_key=excluded.public_key
+                """, (node_id, peer_public_key))
+            except Exception:
+                pass
         conn.commit()
         return LedgerEntry(
             peer_public_key=peer_public_key, balance=0.0,  # TEST-03: always 0.0 — matches DB INSERT
@@ -2024,6 +2085,27 @@ class Storage:
         """, (amount, now, peer_public_key))
         conn.commit()
 
+    def credit_ledger(self, peer_public_key: str, amount: float):
+        """Apply a positive credit balance adjustment without task counters.
+
+        Uses UPSERT so new peers (no prior ledger row) receive the credit.
+        Rejects non-finite or non-positive amounts.
+        """
+        import math as _math
+        if not _math.isfinite(amount) or amount <= 0:
+            raise ValueError(f"credit_ledger: invalid amount {amount!r}")
+        conn = self._get_conn()
+        now = time.time()
+        conn.execute("""
+            INSERT INTO ledger (peer_public_key, balance, tasks_provided, tasks_consumed,
+                                first_seen, last_updated)
+            VALUES (?, ?, 0, 0, ?, ?)
+            ON CONFLICT(peer_public_key) DO UPDATE SET
+                balance = balance + excluded.balance,
+                last_updated = excluded.last_updated
+        """, (peer_public_key, amount, now, now))
+        conn.commit()
+
     def should_send_tab_reminder(self, peer_public_key: str, cooldown: float = 3600) -> bool:
         """Check if enough time has passed since last tab reminder to this peer."""
         import time
@@ -2051,6 +2133,33 @@ class Storage:
             return node_id
         except Exception:
             return None
+
+    def get_pubkey_by_node_id(self, node_id: str) -> Optional[str]:
+        """Indexed reverse lookup for node_id -> public_key."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT public_key FROM peer_keys WHERE node_id = ?",
+            (node_id,),
+        ).fetchone()
+        return row[0] if row and row[0] else None
+
+    def get_node_id_by_pubkey(self, public_key: str) -> Optional[str]:
+        """Reverse lookup: public_key -> node_id via peer_keys table."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT node_id FROM peer_keys WHERE public_key = ?",
+            (public_key,),
+        ).fetchone()
+        return row[0] if row and row[0] else None
+
+    def get_node_id_by_wallet(self, wallet: str) -> Optional[str]:
+        """Indexed reverse lookup for wallet address -> node_id."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT node_id FROM peers WHERE wallet = ? LIMIT 1",
+            (wallet,),
+        ).fetchone()
+        return row[0] if row and row[0] else None
 
     def get_average_quality_rating(self, provider_node_id: str) -> Optional[float]:
         """Get average quality rating from commerce receipts for a provider."""

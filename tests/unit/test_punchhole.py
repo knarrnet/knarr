@@ -46,8 +46,8 @@ from nacl.signing import SigningKey, VerifyKey
 import sys, importlib, os
 
 def _load_plugin(plugin_dir_name: str, module_name: str, class_name: str):
-    """Dynamically load a plugin handler class from proposed-c."""
-    base = Path(__file__).parent.parent.parent  # proposed-c/
+    """Dynamically load a plugin handler class."""
+    base = Path(__file__).parent.parent.parent
     plugin_path = base / "src" / "knarr" / "plugins" / plugin_dir_name
     sys.path.insert(0, str(plugin_path))
     try:
@@ -187,6 +187,14 @@ def make_db(tmp_path: Path) -> str:
             ttl INTEGER DEFAULT 3600
         )
     """)
+    conn.execute("""
+        CREATE TABLE peer_keys (
+            node_id TEXT PRIMARY KEY,
+            public_key TEXT NOT NULL,
+            first_seen REAL,
+            last_updated REAL
+        )
+    """)
     conn.commit()
     conn.close()
     return db_path
@@ -310,13 +318,13 @@ class TestACLResolution:
         assert tier == "known_hosts"
 
     def test_peer_only_ledger_nodes(self, tmp_path):
-        """Test 10: peer -> only nodes with ledger entries."""
+        """Test 10: peer -> only nodes in peer_keys table."""
         db_path = make_db(tmp_path)
         _, _, peer_nid = make_keypair()
         conn = sqlite3.connect(db_path)
         conn.execute(
-            "INSERT INTO ledger (peer_public_key, balance, first_seen, last_updated) VALUES (?, ?, ?, ?)",
-            (peer_nid, 5.0, time.time(), time.time()),
+            "INSERT INTO peer_keys (node_id, public_key, first_seen, last_updated) VALUES (?, ?, ?, ?)",
+            (peer_nid, peer_nid, time.time(), time.time()),
         )
         conn.commit()
         conn.close()
@@ -338,8 +346,8 @@ class TestACLResolution:
         _, _, nid = make_keypair()
         conn = sqlite3.connect(db_path)
         conn.execute(
-            "INSERT INTO ledger (peer_public_key, balance, first_seen, last_updated) VALUES (?, ?, ?, ?)",
-            (nid, 2.0, time.time(), time.time()),
+            "INSERT INTO peer_keys (node_id, public_key, first_seen, last_updated) VALUES (?, ?, ?, ?)",
+            (nid, nid, time.time(), time.time()),
         )
         conn.execute(
             "INSERT INTO address_book (node_id, tier, created_at) VALUES (?, 'explicit', ?)",
@@ -411,8 +419,8 @@ class TestCardGeneration:
         _, _, peer_nid = make_keypair()
         conn = sqlite3.connect(db_path)
         conn.execute(
-            "INSERT INTO ledger (peer_public_key, balance, first_seen, last_updated) VALUES (?, ?, ?, ?)",
-            (peer_nid, 1.0, time.time(), time.time()),
+            "INSERT INTO peer_keys (node_id, public_key, first_seen, last_updated) VALUES (?, ?, ?, ?)",
+            (peer_nid, peer_nid, time.time(), time.time()),
         )
         conn.commit()
         conn.close()

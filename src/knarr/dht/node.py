@@ -1821,6 +1821,10 @@ class DHTNode:
             self.background_tasks.append(asyncio.create_task(self._bus_broadcast_loop()))
             logger.info("BUS01_SUBSCRIBED topics=%s", sorted(BUS_BROADCAST_TOPICS))
 
+        # CR-01: Subscribe to payment.finalized.* events from BCW plugin for on-chain credit
+        if self.bus:
+            self.background_tasks.append(asyncio.create_task(self._bcw_credit_loop()))
+
     async def stop(self):
         """Stops the server, MCP bridges, and background tasks."""
         self._running = False
@@ -1897,6 +1901,8 @@ class DHTNode:
                             await self._process_sync_response(sync_resp)
                     except Exception as e:
                         logger.warning(f"PEER_CACHE startup sync failed: {e}")
+                    # CR-03: populate routing table to trigger bootstrap eviction
+                    asyncio.get_running_loop().create_task(self._self_populate_routing_table())
                     return True
             except Exception:
                 continue
@@ -1963,11 +1969,22 @@ class DHTNode:
                             await self._process_sync_response(sync_resp)
                     except Exception as e:
                         logger.warning(f"Startup sync failed: {e}")
-                    
+
+                    # CARVE-01: Close pool connection for this bootstrap peer — transient contact only.
+                    for peer in self.storage.get_peers():
+                        if peer.host == host and peer.port == port:
+                            await self._pool.remove(peer.node_id)
+                            logger.debug(
+                                "BOOTSTRAP_POOL_RELEASE node_id=%.16s host=%s port=%d",
+                                peer.node_id,
+                                peer.host,
+                                peer.port,
+                            )
+
                     break
             except Exception as e:
                 logger.warning(f"Failed to join via {peer_addr}: {e}")
-        
+
         if joined:
             await self._reannounce_all()
             self._bootstrap_peers = []
@@ -2056,11 +2073,12 @@ class DHTNode:
                 provider_port=self.node_info.port,
                 jurisdiction=self._node_jurisdiction_wire,
             ))
-            targets = random.sample(peers, min(self._gossip_fanout, len(peers)))
-            for peer in targets:
+            # BUG-01: scheduled republish sends to ALL peers, not a fanout sample.
+            # Hot-path announce() still uses fanout=3 for low-overhead initial announce.
+            for peer in peers:
                 asyncio.create_task(self._send_to_peer(peer, msg))
             announced += 1
-        logger.info(f"REPUBLISH_CYCLE skills={announced} peers={len(peers)} fanout={self._gossip_fanout}")
+        logger.info(f"REPUBLISH_CYCLE skills={announced} peers={len(peers)}")
 
     async def announce(self, skill_sheet_data: Dict[str, Any]):
         """Validates, stores, and announces a skill."""
@@ -2132,6 +2150,9 @@ class DHTNode:
                 asyncio.create_task(self._send_to_peer(peer, msg))
 
             logger.info(f"Announced skill '{skill_sheet.name}' to {len(targets)} peers")
+            # BUG-04: emit skill.registered bus event for punchhole cache invalidation
+            if self.bus:
+                self.bus.emit("skill.registered", skill=skill_sheet.name, identity=self.node_info.node_id)
             return skill_sheet.name
         except ValidationError as e:
             logger.error(f"Skill validation failed: {e}")
@@ -2228,6 +2249,18 @@ class DHTNode:
         else:
             return []
 
+        # CR-02: Short-circuit — if local storage already has results, skip network fan-out.
+        if results:
+            seen: Set[tuple] = set()
+            unique_results = []
+            for r in results:
+                key = (r["node_id"], r["skill_sheet"]["name"].lower())
+                if key not in seen:
+                    seen.add(key)
+                    unique_results.append(r)
+            unique_results = self._rank_results(unique_results)
+            return self._filter_providers_by_group(unique_results)
+
         # KAD-assisted: ask plugins for additional providers
         try:
             plugin_results = await self._plugins.on_query(query_type, value_norm)
@@ -2264,6 +2297,37 @@ class DHTNode:
                 seen.add(key)
                 unique_results.append(r)
         
+        # CR-02: Cache network-discovered results in local skill store (warm cache).
+        # Skip self-node results and results from local source — only cache remote discoveries.
+        for r in unique_results:
+            if r.get("node_id") == self.node_info.node_id:
+                continue
+            if r.get("_source") == "local":
+                continue
+            skill_sheet_data = r.get("skill_sheet", {})
+            skill_name_r = skill_sheet_data.get("name", "")
+            if not skill_name_r:
+                continue
+            try:
+                from ..core.models import SkillSheet as _SkillSheet
+                ss = _SkillSheet.from_dict(skill_sheet_data)
+                await self._enqueue_write(
+                    self.storage.upsert_skill,
+                    skill_name_r, r["node_id"], ss,
+                    self._get_skill_ttl(),
+                    False,   # is_own
+                    r.get("_provider_public_key", ""),
+                    "",      # no signature for query-cached entries
+                    "",      # no msg_id
+                    int(r.get("sidecar_port", 0)),
+                    str(r.get("host", "")),
+                    int(r.get("port", 0)),
+                )
+                if self._debug:
+                    logger.info(f"CR02_CACHE skill={skill_name_r} node={r['node_id'][:16]}")
+            except Exception as e:
+                logger.debug(f"CR02_CACHE_SKIP skill={skill_name_r} err={e}")
+
         # Rank results
         unique_results = self._rank_results(unique_results)
 
@@ -2426,6 +2490,9 @@ class DHTNode:
                 asyncio.create_task(self._send_to_peer(peer, msg))
             
             logger.info(f"Deregistered skill '{skill_name}'")
+            # BUG-04: emit skill.removed bus event for punchhole cache invalidation
+            if self.bus:
+                self.bus.emit("skill.removed", skill=skill_name, identity=self.node_info.node_id)
 
     def _get_skill_max_concurrent(self, skill_name: str) -> int:
         """Return the max_concurrent setting for a skill (default 1)."""
@@ -2924,7 +2991,13 @@ class DHTNode:
             # HTTP GET/POST etc. to protocol port (9030) would be parsed as massive length prefix,
             # triggering OOM-scale buffer allocation. Check before receive_message() reads 4-byte length.
             http_verbs = (b'GET ', b'POST', b'PUT ', b'DELE', b'HEAD', b'OPTI', b'PATC')
-            peek_bytes = await asyncio.wait_for(reader.read(4), timeout=2.0)  # L-03: reduced from 5s
+            try:
+                peek_bytes = await asyncio.wait_for(reader.read(4), timeout=2.0)  # L-03
+            except asyncio.TimeoutError:
+                logger.debug("CONNECTION_PEEK_TIMEOUT peer_ip=%s", peer_ip)
+                writer.close()
+                await writer.wait_closed()
+                return
             if peek_bytes and peek_bytes[:4].upper() in http_verbs:
                 logger.warning(f"HTTP_REJECTED: peer_ip={peer_ip} attempted HTTP to protocol port")
                 if self.bus:
@@ -3007,7 +3080,13 @@ class DHTNode:
                     if response:
                         await send_message(writer, response)
                 except asyncio.TimeoutError:
+                    # BUG-03: idle timeout / health probe — log at DEBUG, not ERROR
+                    logger.debug("CONNECTION_IDLE_TIMEOUT peer_ip=%s", peer_ip)
                     break  # Idle timeout — close connection
+                except asyncio.CancelledError:
+                    # BUG-03: task cancellation — log at DEBUG, not ERROR
+                    logger.debug("CONNECTION_CANCELLED peer_ip=%s", peer_ip)
+                    break
                 except ProtocolError as e:
                     # v0.29.1: Log peer IP for oversized/malformed messages
                     logger.warning(f"PROTOCOL_ERR from={peer_ip}: {e}")
@@ -4001,6 +4080,31 @@ class DHTNode:
                 continue  # keep loop alive, check _running
             except Exception as e:
                 logger.warning("BUS01_LOOP_ERR err=%s", e)
+
+    async def _bcw_credit_loop(self) -> None:
+        """CR-01: Subscribe to payment.finalized.* bus events and apply on-chain ledger credit.
+
+        When the BCW plugin confirms an on-chain payment, this loop picks up the event,
+        resolves wallet→node_id→peer_key, and credits the bilateral ledger.
+        """
+        if not self.bus:
+            return
+        from ..commerce.bcw_credit import make_payment_finalized_handler
+        handler = make_payment_finalized_handler(self)
+        sub = self.bus.subscribe("payment.finalized.*")
+        logger.info("BCW_CREDIT_LOOP_START subscribed to payment.finalized.*")
+        while self._running:
+            try:
+                event = await asyncio.wait_for(sub.next(), timeout=5.0)
+                if not event.get("event", "").startswith("payment.finalized."):
+                    continue
+                await handler(event)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("BCW_CREDIT_LOOP_ERR err=%s", e)
 
     async def _handle_event_notify(self, msg: "EventNotify", peer_ip: str = "") -> None:
         """BUS-01: Handle an incoming EventNotify cross-node bus event.
@@ -5097,6 +5201,11 @@ class DHTNode:
             )
             return
 
+        # CR-04: capture debt/target breakdown from the inbound settle_request body
+        _request_current_balance = float(body.get("current_balance", 0.0))
+        _request_amount = abs(float(body.get("amount", 0.0)))
+        _target_balance_component = max(0.0, _request_amount - abs(_request_current_balance))
+
         async def _send_confirmation_mail(to_node: str, msg_type: str, body: dict, system: bool = True):
             await self._sync.enqueue(
                 to_node=item.get("from_node") or to_node,
@@ -5106,6 +5215,8 @@ class DHTNode:
                     amount=body.get("amount", 0.0),
                     accepted_receipt_id=body.get("accepted_receipt_id", ""),
                     settle_request_ref=prepared_doc.get("receipt_id", ""),
+                    debt_component=_request_current_balance,
+                    target_balance_component=_target_balance_component,
                 ),
                 system=system,
                 ttl_hours=24,
@@ -5149,8 +5260,11 @@ class DHTNode:
 
         prior_balance = float(self.storage.get_ledger_balance(peer_key) or 0.0)
 
-        # F-02: Cross-check amount_settled against outstanding balance before zeroing.
-        # Prevents fraudulent confirmations from erasing arbitrary debt.
+        # F-02: Reject fraudulent confirmations that understate the settlement amount.
+        # Overpayment is legitimate: netting trigger sends settle_amount = debt + target_balance
+        # to pre-load credit float, so amount_settled > prior_balance is expected and correct.
+        # Credit applied is always abs(prior_balance) regardless of amount_settled, so overcharge
+        # cannot inflate credits. Only reject zero/negative or underpayment.
         amount_settled = abs(float(body.get("amount_settled", 0.0)))
         if prior_balance != 0.0:
             if amount_settled <= 0:
@@ -5160,12 +5274,12 @@ class DHTNode:
                 )
                 return
             tolerance = max(1.0, abs(prior_balance) * 0.01)
-            if abs(amount_settled - abs(prior_balance)) > tolerance:
+            if amount_settled < abs(prior_balance) - tolerance:
                 logger.warning(
                     f"SETTLEMENT_CONFIRM_REJECTED peer={peer_key[:16]} "
+                    f"reason=underpayment "
                     f"amount_settled={amount_settled:.4f} "
-                    f"expected_approx={abs(prior_balance):.4f} "
-                    f"tolerance={tolerance:.4f}"
+                    f"expected_min={abs(prior_balance) - tolerance:.4f}"
                 )
                 return
 
@@ -5173,7 +5287,9 @@ class DHTNode:
             await self._enqueue_write(self.storage.update_ledger_provider, peer_key, prior_balance)
         elif prior_balance < 0:
             await self._enqueue_write(self.storage.update_ledger_consumer, peer_key, abs(prior_balance))
-        final_balance = float(self.storage.get_ledger_balance(peer_key) or 0.0)
+        # SEC-04: The ledger write is enqueued (async). Reading balance here returns pre-zero value.
+        # Pass 0.0 directly — the settlement has zeroed the ledger as far as the receipt is concerned.
+        final_balance = 0.0
 
         receipt_id = await write_settlement_processed(
             node_id=self.node_info.node_id,
@@ -5274,12 +5390,18 @@ class DHTNode:
         amount: float,
         accepted_receipt_id: str,
         settle_request_ref: str,
+        debt_component: float = 0.0,
+        target_balance_component: float = 0.0,
     ) -> Dict[str, Any]:
         """Build and sign a settlement_confirmation message body.
 
         The WM applies gates [1,2,3,4,5] to settlement_confirmation, including
         Gate 1 (Ed25519 signature verification).  The body must carry a proof
         field or the receiver's WM will quarantine it.
+
+        CR-04: debt_component and target_balance_component are additive wire
+        protocol fields — backwards compatible (receivers that don't know them
+        simply ignore them).
         """
         from ..core.proof import sign_document
         seed = hashlib.sha256(
@@ -5295,6 +5417,9 @@ class DHTNode:
             "counterparty_key": getattr(self, "_public_key_hex", ""),  # confirmor's pubkey for ledger reset
             "accepted_receipt_id": accepted_receipt_id,
             "settle_request_ref": settle_request_ref,
+            # CR-04: settlement breakdown for payee validation
+            "debt_component": float(debt_component),
+            "target_balance_component": float(target_balance_component),
         }
         verification_method = f"did:knarr:{self.node_info.node_id}#key-1"
         return sign_document(body, self._signing_key, verification_method)

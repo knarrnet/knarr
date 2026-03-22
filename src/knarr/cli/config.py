@@ -80,6 +80,7 @@ def load_config(path: Path, explicit: bool = False) -> dict:
         with open(path, "rb") as f:
             raw = tomllib.load(f)
         _warn_unknown_keys(raw, path)
+        _warn_invalid_types(raw, path)
     except tomllib.TOMLDecodeError as e:
         print(f"Error: Invalid TOML in {path}: {e}", file=sys.stderr)
         sys.exit(1)
@@ -110,6 +111,7 @@ def load_config(path: Path, explicit: bool = False) -> dict:
                     del tier_raw[section]
             # Validate keys within tier sections against known keys
             _warn_unknown_keys(tier_raw, tier_path)
+            _warn_invalid_types(tier_raw, tier_path)
             # Log any keys that override the base config
             for section in tier_raw:
                 if section in raw and isinstance(raw.get(section), dict) and isinstance(tier_raw[section], dict):
@@ -149,7 +151,7 @@ _KNOWN_KEYS = {
              "startup_jitter", "sweep_interval"},
     "economy": {"default_soft_limit", "default_hard_limit", "settlement_min_interval_seconds"},
     "skills": {"minimum_price", "default_timeout"},
-    "settlement": {"tab_reminder_threshold", "netting_interval", "consumer_interval"},
+    "settlement": {"tab_reminder_auto_netting", "tab_reminder_threshold", "netting_interval", "consumer_interval"},
     "network": {"bootstrap", "upnp", "tls_cert", "tls_key", "max_connections", "connection_idle_timeout", "gossip_fanout", "heartbeat_silence_threshold", "peer_dead_timeout", "min_peers"},
     "sidecar": {"asset_dir"},
     "policy": {"initial_credit", "min_balance", "tit_for_tat", "group", "skill"},
@@ -171,6 +173,26 @@ def _warn_unknown_keys(raw: dict, path: Path):
                     continue
                 if key not in known:
                     print(f"Warning: Unknown key '{key}' in [{section}] in {path}", file=sys.stderr)
+
+
+def _warn_invalid_types(raw: dict, path: Path):
+    """Warn about known keys whose types are invalid in the loaded TOML."""
+    settlement = raw.get("settlement")
+    if isinstance(settlement, dict):
+        auto_netting = settlement.get("tab_reminder_auto_netting")
+        if auto_netting is not None and not isinstance(auto_netting, bool):
+            print(
+                f"Warning: Invalid type for 'tab_reminder_auto_netting' in [settlement] in {path} "
+                f"(expected bool, got {type(auto_netting).__name__})",
+                file=sys.stderr,
+            )
+        threshold = settlement.get("tab_reminder_threshold")
+        if threshold is not None and not isinstance(threshold, (int, float)):
+            print(
+                f"Warning: Invalid type for 'tab_reminder_threshold' in [settlement] in {path} "
+                f"(expected float, got {type(threshold).__name__})",
+                file=sys.stderr,
+            )
 
 
 def _warn_unknown_keys_tier(raw: dict, path: Path, valid_sections: set):

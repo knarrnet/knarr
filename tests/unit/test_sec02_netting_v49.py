@@ -146,8 +146,12 @@ async def test_acceptance_rejects_unknown_netting_id(caplog):
 # ── 6. Session consumed even on sender mismatch ──────────────────────────────
 
 @pytest.mark.asyncio
-async def test_session_consumed_on_sender_mismatch(caplog):
-    """Pop happens inside lock before sender check — rejected acceptance consumes session."""
+async def test_session_preserved_on_sender_mismatch(caplog):
+    """F-08: Sender verified before pop — mismatch does NOT consume session.
+
+    The handler peeks the session, checks the sender, and returns without
+    popping on mismatch.  The legitimate sender can still accept afterward.
+    """
     import logging
     from knarr.commerce.handlers import make_commerce_handlers
     node = _make_node()
@@ -155,23 +159,23 @@ async def test_session_consumed_on_sender_mismatch(caplog):
     proposal_h = handlers["knarr/commerce/netting_proposal"]
     acceptance_h = handlers["knarr/commerce/netting_acceptance"]
 
-    nid = "mismatch-consume-001"
+    nid = "mismatch-preserve-001"
     await proposal_h(_proposal_item(nid, from_node="node-X"))
 
-    # Acceptance from wrong node
+    # Acceptance from wrong node — should be rejected but NOT consume session
     with caplog.at_level(logging.WARNING, logger="knarr.commerce"):
         await acceptance_h(_acceptance_item(nid, from_node="node-Y"))
 
     assert any("mismatch" in r.message.lower() or "sender" in r.message.lower()
                for r in caplog.records), "Should log sender mismatch warning"
 
-    # Retry from correct node — should be rejected (session consumed)
+    # Retry from correct node — should succeed (session NOT consumed by attacker)
     caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="knarr.commerce"):
+    with caplog.at_level(logging.INFO, logger="knarr.commerce"):
         await acceptance_h(_acceptance_item(nid, from_node="node-X"))
 
-    assert any("no active session" in r.message for r in caplog.records), \
-        "Session must be consumed — retry from correct node should be rejected"
+    assert any("accepted" in r.message.lower() for r in caplog.records), \
+        "Session must be preserved — correct sender should still be able to accept"
 
 
 # ── 7. Acceptance rejects sender mismatch ────────────────────────────────────

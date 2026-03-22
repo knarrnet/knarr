@@ -53,23 +53,26 @@ async def test_silent_peer_gets_heartbeat():
     node._running = True
     node._pool = AsyncMock()
     node._enqueue_write = AsyncMock()
-    
+    node._enqueue_write_proto = AsyncMock()
+    node._sweep_offset = 0
+
     peer = NodeInfo(node_id="peer_s", host="1.1.1.1", port=9000)
-    node.storage.get_peers = MagicMock(return_value=[peer])
-    
+
     # Silence for 100s
-    node._peer_last_activity["peer_s"] = time.monotonic() - 100
+    now = time.monotonic()
+    node._peer_last_activity["peer_s"] = now - 100
     node._heartbeat_silence_threshold = 90
-    
-    # Run one iteration of the loop logic (refactored)
-    # We'll just call the logic block if we can, or mock sleep and run loop once.
-    # For unit test, we can just trigger the loop once.
-    with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-        try:
-            await node._peer_heartbeat_sweep_loop()
-        except asyncio.CancelledError:
-            pass
-            
+    node._peer_dead_timeout = 300
+
+    # _peer_heartbeat_sweep handles actual per-peer logic
+    with patch("knarr.dht.node.verify_message", return_value=True):
+        with patch("knarr.dht.node.verify_node_id", return_value=True):
+            # pool.send returns a Heartbeat response
+            node._pool.send.return_value = Heartbeat(
+                node_id="peer_s", timestamp=time.time(), version="0.0.0"
+            )
+            await node._peer_heartbeat_sweep([peer], now)
+
     # Verify pool.send called with Heartbeat
     node._pool.send.assert_called()
     args, kwargs = node._pool.send.call_args
@@ -107,20 +110,19 @@ async def test_dead_peer_removed_after_timeout():  # SENTINEL
     node._running = True
     node._pool = AsyncMock()
     node._enqueue_write = AsyncMock()
-    
+    node._enqueue_write_proto = AsyncMock()
+    node._sweep_offset = 0
+
     peer = NodeInfo(node_id="peer_d", host="1.1.1.1", port=9000)
-    node.storage.get_peers = MagicMock(return_value=[peer])
-    
+
     # Silence for 400s
-    node._peer_last_activity["peer_d"] = time.monotonic() - 400
+    now = time.monotonic()
+    node._peer_last_activity["peer_d"] = now - 400
     node._peer_dead_timeout = 300
-    
-    with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-        try:
-            await node._peer_heartbeat_sweep_loop()
-        except asyncio.CancelledError:
-            pass
-            
+    node._heartbeat_silence_threshold = 90
+
+    await node._peer_heartbeat_sweep([peer], now)
+
     # Verify storage.remove_peer called
     node._enqueue_write.assert_any_call(node.storage.remove_peer, "peer_d")
     assert "peer_d" not in node._peer_last_activity
@@ -133,16 +135,23 @@ async def test_rebootstrap_when_no_peers():
     node._pool = AsyncMock()
     node._enqueue_write = AsyncMock()
     node._bootstrap_peers = ["1.1.1.1:9000"]
+    node._initial_bootstrap_peers = ["1.1.1.1:9000"]
+    node._isolation_since = None
+    node._config = {}
 
     node.storage.get_peers = MagicMock(return_value=[])
 
-    with patch.object(node, "join", new_callable=AsyncMock) as mock_join:
-        with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            try:
-                await node._peer_heartbeat_sweep_loop()
-            except asyncio.CancelledError:
-                pass
+    # _should_attempt_rejoin must return True for re-bootstrap to trigger
+    with patch.object(node, "_should_attempt_rejoin", return_value=True):
+        with patch.object(node, "_record_rejoin_attempt"):
+            with patch.object(node, "join", new_callable=AsyncMock) as mock_join:
+                with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
+                    try:
+                        await node._peer_heartbeat_sweep_loop()
+                    except asyncio.CancelledError:
+                        pass
 
-    # _peer_heartbeat_sweep_loop calls join(..., skip_jitter=True) to avoid the
-    # exponential startup delay when re-bootstrapping from isolation.
-    mock_join.assert_called_once_with(["1.1.1.1:9000"], skip_jitter=True)
+    # _peer_heartbeat_sweep_loop calls join with skip_jitter=False
+    mock_join.assert_called_once()
+    call_args = mock_join.call_args
+    assert call_args[0][0] == ["1.1.1.1:9000"]

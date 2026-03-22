@@ -13,7 +13,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 # O-034: plugin names written into TOML section headers must be safe identifiers.
-_PLUGIN_NAME_RE = re.compile(r'^[a-zA-Z0-9_-]+$')
+_PLUGIN_NAME_RE = re.compile(r'^[a-zA-Z0-9_.-]+$')
 
 log = logging.getLogger("knarr.watchman.plugins")
 
@@ -179,7 +179,8 @@ def _extract_tarball(tarball_path: str, plugin_dir: str) -> None:
                 continue
             # O-032: reject members whose name (after prefix strip) escapes the
             # plugin directory — e.g. "../../../etc/passwd" or absolute paths.
-            if os.path.isabs(member.name) or member.name.startswith(".."):
+            parts = [part for part in member.name.split("/") if part]
+            if os.path.isabs(member.name) or any(part == ".." for part in parts):
                 log.warning("PLUGIN_EXTRACT_SKIP unsafe_member=%r", member.name)
                 continue
             # WM-DEPR-01: filter='data' silences the Python 3.12+ DeprecationWarning
