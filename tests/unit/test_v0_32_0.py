@@ -876,10 +876,12 @@ class TestMailBuckets(unittest.TestCase):
 class TestPluginContextEventFields(unittest.TestCase):
     def test_plugin_context_has_event_fields(self):
         from knarr.dht.plugins import PluginContext
-        import dataclasses
-        fields = {f.name for f in dataclasses.fields(PluginContext)}
-        self.assertIn("subscribe_events", fields)
-        self.assertIn("emit_event", fields)
+        # PluginContext is now a regular class (not a dataclass) — check __init__ params
+        import inspect
+        sig = inspect.signature(PluginContext.__init__)
+        params = set(sig.parameters.keys())
+        self.assertIn("subscribe_events", params)
+        self.assertIn("emit_event", params)
 
     def test_plugin_context_defaults_to_none(self):
         from knarr.dht.plugins import PluginContext

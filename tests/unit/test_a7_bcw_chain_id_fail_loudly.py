@@ -110,9 +110,13 @@ def test_valid_chain_id_keeps_bcw_enabled():
         "chains": [{"chain_id": "solana-devnet"}],
     }
 
+    def _fake_watcher_init(self, *a, **kw):
+        self.rpc_url = "https://api.devnet.solana.com"
+
     with patch("handler.WatchStore.__init__", lambda self, *a, **kw: None), \
          patch("handler.WatchStore.get_all_watches", return_value=[]), \
-         patch("handler.SolanaWatcher.__init__", lambda self, *a, **kw: None):
+         patch("handler.SolanaWatcher.__init__", _fake_watcher_init), \
+         patch("handler.importlib.import_module", side_effect=ImportError("no websockets")):
         handler = BCWHandler.__new__(BCWHandler)
         BCWHandler.__init__(handler, ctx, config)
 

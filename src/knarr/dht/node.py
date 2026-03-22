@@ -2991,7 +2991,13 @@ class DHTNode:
             # HTTP GET/POST etc. to protocol port (9030) would be parsed as massive length prefix,
             # triggering OOM-scale buffer allocation. Check before receive_message() reads 4-byte length.
             http_verbs = (b'GET ', b'POST', b'PUT ', b'DELE', b'HEAD', b'OPTI', b'PATC')
-            peek_bytes = await asyncio.wait_for(reader.read(4), timeout=2.0)  # L-03: reduced from 5s
+            try:
+                peek_bytes = await asyncio.wait_for(reader.read(4), timeout=2.0)  # L-03
+            except asyncio.TimeoutError:
+                logger.debug("CONNECTION_PEEK_TIMEOUT peer_ip=%s", peer_ip)
+                writer.close()
+                await writer.wait_closed()
+                return
             if peek_bytes and peek_bytes[:4].upper() in http_verbs:
                 logger.warning(f"HTTP_REJECTED: peer_ip={peer_ip} attempted HTTP to protocol port")
                 if self.bus:

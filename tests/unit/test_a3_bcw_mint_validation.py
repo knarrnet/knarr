@@ -103,14 +103,9 @@ def test_missing_mint_does_not_credit(bcw):
     )
 
 
-def test_correct_mint_credits_ledger(bcw):
-    """Payment with correct KNARR mint must credit the ledger."""
-    event = _payment_event(mint=KNARR_MINT)
-    bcw._handle_payment_finalized(event)
-    bcw._credit_ledger.assert_called_once(), (
-        "BCW did not credit ledger for valid KNARR mint payment. "
-        "Fix must not block legitimate payments."
-    )
+## test_correct_mint_credits_ledger removed — _handle_payment_finalized is now a stub
+## (credit logic moved to bcw_credit.py).  Positive-path credit is tested in
+## test_cr01_bcw_credit_v50.py::test_valid_payment_credits_ledger.
 
 
 def test_empty_string_mint_does_not_credit(bcw):

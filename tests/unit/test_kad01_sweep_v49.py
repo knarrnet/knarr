@@ -1,9 +1,31 @@
+import importlib.util
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import handler as kad_handler
+_PLUGIN_DIR = Path(__file__).parent.parent.parent / "plugins/00-kademlia"
+
+
+def _load_module(name, path):
+    """Load a module from a specific file path, bypassing sys.modules cache."""
+    plugin_dir = str(_PLUGIN_DIR)
+    added = plugin_dir not in sys.path
+    if added:
+        sys.path.insert(0, plugin_dir)
+    try:
+        spec = importlib.util.spec_from_file_location(f"_kad_{name}", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        if added and plugin_dir in sys.path:
+            sys.path.remove(plugin_dir)
+
+
+kad_handler = _load_module("handler", _PLUGIN_DIR / "handler.py")
 
 
 def _make_plugin():
