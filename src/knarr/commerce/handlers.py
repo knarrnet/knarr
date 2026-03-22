@@ -116,9 +116,30 @@ def make_commerce_handlers(node) -> dict:
             )
             return
 
+        # Dedup: reject if this task_id has already been refunded
+        refund_receipt_id = f"credit_note_refund:{task_id}"
+        if node.storage.get_receipt(refund_receipt_id) is not None:
+            logger.warning(
+                f"Credit note rejected: duplicate refund for task_id={task_id[:16]} — already applied"
+            )
+            return
+
         target_pubkey = _resolve_public_key(node, from_node_id)
 
         if target_pubkey:
+            # Write dedup receipt before applying to prevent replay
+            import time as _time
+            node.storage.write_receipt(
+                receipt_id=refund_receipt_id,
+                document_type="credit_note_refund",
+                timestamp=str(_time.time()),
+                identity=node.node_info.node_id,
+                counterparty=target_pubkey,
+                order_ref=task_id,
+                proof_purpose="refundApplied",
+                payload_json=f'{{"task_id":"{task_id}","amount":{amount}}}',
+                signature=None,
+            )
             await node._enqueue_write(node.storage.update_ledger_refund, target_pubkey, amount)
             logger.info(f"CREDIT_NOTE task={body.get('references', {}).get('task_id', 'N/A')[:8]} "
                         f"amount={amount} token={token} reason={body.get('reason')}")
@@ -166,15 +187,31 @@ def make_commerce_handlers(node) -> dict:
             logger.warning(f"Invalid settlement_confirmation: {err}")
             return
 
+        from_node = item.get("from_node")
+        tx_hash = body.get("tx_hash", "")
+
+        # Verify this confirmation matches a settlement we initiated with this peer.
+        # Look for a settlement_accepted receipt with order_ref matching tx_hash,
+        # or at minimum that we have a ledger entry for this peer.
+        accepted_receipt_id = body.get("accepted_receipt_id") or tx_hash
+        if accepted_receipt_id:
+            existing = node.storage.get_receipt(accepted_receipt_id)
+            if existing is None:
+                logger.warning(
+                    f"SETTLEMENT_CONFIRM rejected: no matching pending settlement "
+                    f"accepted_receipt_id={accepted_receipt_id[:16]} from={str(from_node)[:16]}"
+                )
+                return
+
         await node._enqueue_write(
             node.storage.queue_settlement,
             "settlement_confirmation",
-            item.get("from_node"),
+            from_node,
             body,
             0,  # priority
         )
-        logger.info(f"SETTLEMENT_CONFIRM from={item.get('from_node', '?')[:16]} "
-                    f"tx={body['tx_hash'][:16]} amount={body['amount_settled']} "
+        logger.info(f"SETTLEMENT_CONFIRM from={str(from_node)[:16]} "
+                    f"tx={tx_hash[:16]} amount={body['amount_settled']} "
                     f"token={body.get('token', 'KNARR')}")
 
     async def handle_tab_reminder(item: dict) -> None:
@@ -245,6 +282,13 @@ def make_commerce_handlers(node) -> dict:
             # Clean up expired entries
             expired_keys = [k for k, v in _netting_sessions.items() if v.get("expires_at", 0) < now]
             for k in expired_keys:
+                # RUL-01: debug log expired netting sessions for convergence diagnosis
+                sess = _netting_sessions[k]
+                age = now - (sess.get("expires_at", now) - 300)
+                logger.debug(
+                    "NETTING_SESSION_EXPIRED session_id=%s peer=%s age=%.1fs",
+                    k[:16], str(sess.get("from_node", ""))[:16], age,
+                )
                 del _netting_sessions[k]
             _netting_sessions[netting_id] = {
                 "from_node": item.get("from_node"),
@@ -326,20 +370,11 @@ def _parse_body(item: dict) -> dict | None:
 
 
 def _resolve_public_key(node, node_id: str) -> str | None:
-    """Reverse-lookup: node_id → peer_public_key via ledger entries.
+    """Reverse-lookup: node_id → peer_public_key via indexed storage lookup.
 
-    Uses SHA-256(public_key) == node_id to find the match.
-    Falls back to O(n) scan of ledger entries since there's no reverse index.
+    SEC-01: Uses get_pubkey_by_node_id() for O(1) indexed lookup instead of
+    O(n) SHA-256 scan of all ledger entries.
     """
     if not node_id:
         return None
-    entries = node.storage.get_all_ledger_entries()
-    for entry in entries:
-        pk = entry["peer_public_key"]
-        try:
-            computed_nid = hashlib.sha256(bytes.fromhex(pk)).hexdigest()
-            if computed_nid == node_id:
-                return pk
-        except Exception:
-            continue
-    return None
+    return node.storage.get_pubkey_by_node_id(node_id)

@@ -14,6 +14,8 @@ def mock_node():
     node._sync = MagicMock()
     node._sync.enqueue = AsyncMock()
     node.storage = MagicMock()
+    node.storage.get_receipt.return_value = None  # default: no existing receipt
+    node.storage.get_pubkey_by_node_id.return_value = None  # default: unknown node
     return node
 
 
@@ -72,12 +74,11 @@ class TestHandleReceipt:
 
 class TestHandleCreditNote:
     def test_applies_refund(self, handlers, mock_node):
-        mock_node.storage.get_all_ledger_entries.return_value = [
-            {"peer_public_key": "ab" * 32, "balance": -50.0}
-        ]
-        mock_node.storage.get_execution_log_entry.return_value = {"price": 20.0}
+        peer_pubkey = "ab" * 32
         import hashlib
-        node_id = hashlib.sha256(bytes.fromhex("ab" * 32)).hexdigest()
+        node_id = hashlib.sha256(bytes.fromhex(peer_pubkey)).hexdigest()
+        mock_node.storage.get_pubkey_by_node_id.return_value = peer_pubkey
+        mock_node.storage.get_execution_log_entry.return_value = {"price": 20.0}
         item = {"from_node": node_id, "body": {
             "type": "knarr/commerce/credit_note", "amount": 10.0,
             "reason": "other", "timestamp": 0,
@@ -87,7 +88,7 @@ class TestHandleCreditNote:
         mock_node._enqueue_write.assert_called_once()
         args = mock_node._enqueue_write.call_args[0]
         assert args[0] == mock_node.storage.update_ledger_refund
-        assert args[1] == "ab" * 32
+        assert args[1] == peer_pubkey
         assert args[2] == 10.0
 
     def test_inflation_guard_rejects(self, handlers, mock_node):
@@ -111,7 +112,7 @@ class TestHandleCreditNote:
         mock_node._enqueue_write.assert_not_called()
 
     def test_unknown_node_drops(self, handlers, mock_node):
-        mock_node.storage.get_all_ledger_entries.return_value = []
+        # get_pubkey_by_node_id returns None by default (unknown node) — no setup needed
         mock_node.storage.get_execution_log_entry.return_value = {"price": 10.0}
         item = {"from_node": "unknown_node_id", "body": {
             "type": "knarr/commerce/credit_note", "amount": 5.0,
@@ -143,9 +144,12 @@ class TestHandleSettleRequest:
 
 class TestHandleSettlementConfirmation:
     def test_queues_confirmation(self, handlers, mock_node):
+        tx_hash = "A" * 88
+        # Simulate a matching pending settlement receipt (required by #12 fix)
+        mock_node.storage.get_receipt.return_value = {"id": tx_hash, "document_type": "settlement_accepted"}
         item = {"body": {
             "type": "knarr/commerce/settlement_confirmation",
-            "tx_hash": "A" * 88, "amount_settled": 50.0, "timestamp": 0
+            "tx_hash": tx_hash, "amount_settled": 50.0, "timestamp": 0
         }, "from_node": "peer123"}
         _run(handlers["knarr/commerce/settlement_confirmation"](item))
         mock_node._enqueue_write.assert_called_once()

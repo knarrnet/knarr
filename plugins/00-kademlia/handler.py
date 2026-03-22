@@ -15,6 +15,20 @@ from kbuckets import KBucketTable
 from providers import ProviderCache
 from lookup import IterativeLookup
 
+# KAD-01: Maximum single provider record payload size (4KB)
+_MAX_PROVIDER_RECORD_SIZE = 4096
+# KAD-01: Maximum providers per skill key
+_MAX_PROVIDERS_PER_KEY = 100
+
+
+def default_key_function(skill_name: str, canonical_path: str) -> bytes:
+    """KAD-01: Pluggable key function. Returns SHA-256 of canonical_path.
+
+    The canonical_path is the leaf-level classification path (e.g. "knowledge/translate").
+    A future nomenclature standard can swap the hash input without touching STORE/FIND_VALUE logic.
+    """
+    return hashlib.sha256(canonical_path.encode()).digest()
+
 
 class KademliaPlugin(PluginHooks):
     """Kademlia DHT passive cache plugin.
@@ -37,7 +51,7 @@ class KademliaPlugin(PluginHooks):
         self._debug = config.get("debug", False)
         self._sweep_bucket_idx: int = 0
 
-        self.k = max(1, int(config.get("k", 20)))
+        self.k = max(1, int(config.get("k", 8)))
         self.max_provider_records = max(1, int(config.get("max_provider_records", 50000)))
         self.evict_interval = float(config.get("evict_interval_seconds", 60))
 
@@ -115,17 +129,23 @@ class KademliaPlugin(PluginHooks):
         except (json.JSONDecodeError, TypeError):
             return
 
-        if action in ("FIND_NODE_RESP", "GET_PROVIDERS_RESP"):
+        if action in ("FIND_NODE_RESP", "GET_PROVIDERS_RESP", "FIND_VALUE_RESP"):
             request_id = payload.get("_request_id", "")
             if self._lookup and request_id:
                 self._lookup.resolve_response(request_id, payload)
             return
 
+        # Rate limit by peer_ip to prevent Sybil bypass via identity rotation
+        if action in ("FIND_NODE", "PUT_PROVIDER", "STORE", "GET_PROVIDERS", "FIND_VALUE"):
+            rate_key = peer_ip or sender_id
+            if not self._check_rate_limit(rate_key):
+                return
+
         if action == "FIND_NODE":
             await self._handle_find_node(msg, payload, peers)
-        elif action == "PUT_PROVIDER":
+        elif action in ("PUT_PROVIDER", "STORE"):
             await self._handle_put_provider(msg, payload, peers)
-        elif action == "GET_PROVIDERS":
+        elif action in ("GET_PROVIDERS", "FIND_VALUE"):
             await self._handle_get_providers(msg, payload, peers)
         else:
             if self._debug:
@@ -134,8 +154,6 @@ class KademliaPlugin(PluginHooks):
     async def _handle_find_node(self, msg: PluginMessage, payload: dict, peers: list):
         """Respond to FIND_NODE with k closest peers."""
         sender_id = msg.node_id
-        if not self._check_rate_limit(sender_id):
-            return
 
         target = payload.get("target", "")
         if not self._is_valid_hex_id(target):
@@ -163,17 +181,22 @@ class KademliaPlugin(PluginHooks):
 
     async def _handle_put_provider(self, msg: PluginMessage, payload: dict, peers: list):
         """Store a provider record from a remote PUT_PROVIDER.
-        V19-003: Bind identity to authenticated sender, resolve endpoint from peer table."""
+        V19-003: Bind identity to authenticated sender, resolve endpoint from peer table.
+        KAD-01: 4KB record limit, max providers per key, dedup by node_id."""
         if self.mode != "full":
             return
 
-        # V19-005: Rate limit PUT_PROVIDER
         sender_id = msg.node_id
-        if not self._check_rate_limit(sender_id):
-            return
 
         skill_key = payload.get("skill_key", "")
         if not skill_key or not self._is_valid_hex_id(sender_id):
+            return
+
+        # KAD-01: Validate record size (4KB max)
+        record_size = len(json.dumps(payload).encode("utf-8"))
+        if record_size > _MAX_PROVIDER_RECORD_SIZE:
+            if self._debug:
+                self._log.info(f"KAD_PUT_REJECTED_SIZE skill={skill_key} size={record_size} max={_MAX_PROVIDER_RECORD_SIZE}")
             return
 
         # V19-003: Use authenticated sender identity (msg.node_id from signed envelope),
@@ -181,17 +204,32 @@ class KademliaPlugin(PluginHooks):
         peer_info = self._resolve_peer(sender_id, peers)
         host = peer_info.host if peer_info else ""
         port = peer_info.port if peer_info else 0
-        sidecar_port = int(payload.get("sidecar_port", 0))
+        raw_sidecar_port = int(payload.get("sidecar_port", 0) or 0)
+        sidecar_port = raw_sidecar_port if 1024 <= raw_sidecar_port <= 65535 else 0
 
-        self.providers.store(skill_key, sender_id, host, port, sidecar_port)
+        # KAD-01: Build provider record with skill-record semantics
+        canonical_path = payload.get("canonical_path", skill_key)
+        ttl = min(int(payload.get("ttl", 3600)), 7200)  # cap at 2h
+
+        # KAD-01: Enforce max providers per key — dedup by node_id (latest wins),
+        # evict oldest on overflow
+        hashed_key = self.providers._get_key(skill_key)
+        existing = self.providers.cache.get(hashed_key, {})
+        if sender_id not in existing and len(existing) >= _MAX_PROVIDERS_PER_KEY:
+            # Evict oldest provider for this key
+            oldest_nid = min(existing, key=lambda nid: existing[nid].get("stored_at", 0))
+            self.providers.remove(skill_key, oldest_nid)
+            if self._debug:
+                self._log.info(f"KAD_EVICT_OLDEST skill={skill_key} evicted={oldest_nid[:16]}")
+
+        self.providers.store(skill_key, sender_id, host, port, sidecar_port, ttl=ttl)
         if self._debug:
-            self._log.info(f"KAD_PUT_PROVIDER skill={skill_key} provider={sender_id[:16]}")
+            self._log.info(f"KAD_PUT_PROVIDER skill={skill_key} provider={sender_id[:16]} path={canonical_path}")
 
     async def _handle_get_providers(self, msg: PluginMessage, payload: dict, peers: list):
-        """Respond to GET_PROVIDERS with cached providers + closer peers."""
+        """Respond to GET_PROVIDERS/FIND_VALUE with cached providers + closest nodes.
+        KAD-01: Canonical response shape — providers populated if found, closest_nodes as fallback."""
         sender_id = msg.node_id
-        if not self._check_rate_limit(sender_id):
-            return
 
         skill_key = payload.get("skill_key", "")
         if not skill_key:
@@ -203,9 +241,11 @@ class KademliaPlugin(PluginHooks):
         closer_peers = [{"node_id": p["node_id"], "host": p["host"], "port": p["port"]} for p in closest]
 
         request_id = payload.get("_request_id", "")
+        # KAD-01: Canonical response shape
         resp_data = {
             "providers": providers,
-            "closer_peers": closer_peers
+            "closest_nodes": closer_peers if not providers else [],
+            "closer_peers": closer_peers,  # backward compat
         }
         if request_id:
             resp_data["_request_id"] = request_id
@@ -224,25 +264,28 @@ class KademliaPlugin(PluginHooks):
 
     _RATE_LIMIT_MAX_PEERS = 1000  # V19-005: Cap to prevent memory exhaustion under identity churn
 
-    def _check_rate_limit(self, node_id: str) -> bool:
-        """Rate limit FIND_NODE/GET_PROVIDERS/PUT_PROVIDER: max N per minute per peer."""
+    def _check_rate_limit(self, rate_key: str) -> bool:
+        """Rate limit FIND_NODE/GET_PROVIDERS/PUT_PROVIDER: max N per minute per peer IP.
+
+        Keyed by peer_ip to prevent Sybil bypass via identity rotation.
+        """
         now = time.monotonic()
         window = 60.0
 
         # V19-005: Evict oldest entry if at capacity
-        if node_id not in self._find_node_log and len(self._find_node_log) >= self._RATE_LIMIT_MAX_PEERS:
+        if rate_key not in self._find_node_log and len(self._find_node_log) >= self._RATE_LIMIT_MAX_PEERS:
             oldest_key = min(self._find_node_log, key=lambda k: max(self._find_node_log[k]) if self._find_node_log[k] else 0)
             del self._find_node_log[oldest_key]
 
-        if node_id not in self._find_node_log:
-            self._find_node_log[node_id] = []
+        if rate_key not in self._find_node_log:
+            self._find_node_log[rate_key] = []
 
-        self._find_node_log[node_id] = [t for t in self._find_node_log[node_id] if now - t < window]
+        self._find_node_log[rate_key] = [t for t in self._find_node_log[rate_key] if now - t < window]
 
-        if len(self._find_node_log[node_id]) >= self.max_find_node_per_minute:
+        if len(self._find_node_log[rate_key]) >= self.max_find_node_per_minute:
             return False
 
-        self._find_node_log[node_id].append(now)
+        self._find_node_log[rate_key].append(now)
         return True
 
     async def on_inbound(self, msg: Message, peer_ip: str) -> bool:
@@ -369,7 +412,9 @@ class KademliaPlugin(PluginHooks):
                     skill_sheet = getattr(msg, "skill_sheet", {}) or {}
                     visibility = skill_sheet.get("visibility", "public")
                     if self._lookup and self.mode == "full" and visibility == "public":
-                        task = asyncio.create_task(self._put_provider_to_closest(skill_key))
+                        # KAD-01: Extract canonical_path from skill_sheet if available
+                        canonical_path = skill_sheet.get("canonical_path", skill_key)
+                        task = asyncio.create_task(self._put_provider_to_closest(skill_key, canonical_path))
                         # B4: D-007 Phase C — suppress gossip, KAD handles distribution
                         # If last PUT for this skill failed, allow gossip fallback this cycle
                         put_failures = getattr(self, '_kad_put_failed', {})
@@ -391,18 +436,25 @@ class KademliaPlugin(PluginHooks):
 
         return True
 
-    async def _put_provider_to_closest(self, skill_key: str):
-        """Actively place provider record at k-closest nodes to skill hash."""
+    async def _put_provider_to_closest(self, skill_key: str, canonical_path: str = ""):
+        """Actively place provider record at k-closest nodes to skill hash.
+        KAD-01: Uses pluggable key function, includes canonical_path in payload."""
         try:
-            target = hashlib.sha256(skill_key.encode()).hexdigest()
+            # KAD-01: Use pluggable key function
+            path = canonical_path or skill_key
+            key_bytes = default_key_function(skill_key, path)
+            target = key_bytes.hex()
             closest = await self._lookup.find_nodes(target)
 
             payload = {
                 "skill_key": skill_key,
+                "canonical_path": path,
                 "node_id": self._ctx.node_id,
                 "host": "",  # recipient fills from message metadata
                 "port": 0,
-                "sidecar_port": getattr(self._ctx, 'sidecar_port', 0) # simplified
+                "sidecar_port": getattr(self._ctx, 'sidecar_port', 0),
+                "ttl": 3600,
+                "published_at": time.time(),
             }
 
             for peer in closest[:self.k]:
@@ -412,7 +464,7 @@ class KademliaPlugin(PluginHooks):
                 )
 
             if self._debug:
-                self._log.info(f"KAD_PUT_BROADCAST skill={skill_key} targets={len(closest[:self.k])}")
+                self._log.info(f"KAD_PUT_BROADCAST skill={skill_key} path={path} targets={len(closest[:self.k])}")
         except Exception as e:
             self._log.warning(f"KAD_PUT_ERR skill={skill_key} err={e}")
             self._kad_put_failed[skill_key] = True

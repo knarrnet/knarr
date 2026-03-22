@@ -77,6 +77,7 @@ class Heartbeat(Message):
     timestamp: float = 0.0
     version: str = ""  # sender's knarr version (e.g. "0.6.0")
     min_protocol_version: str = ""  # minimum version to participate (set by bootstrap)
+    punchhole_epoch: int = 0  # PREREQ-01: increments when punchhole cache objects are staled
     type: str = "HEARTBEAT"
 
 @dataclass(frozen=True)

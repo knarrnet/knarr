@@ -196,6 +196,16 @@ class PunchholeBackendPlugin(PluginHooks):
         self._ctx = ctx
         self._config = config
         self._debug = config.get("debug", False)
+        # PREREQ-01: punchhole_epoch — increments each time any cache object is staled.
+        # Enables event-driven indexer re-crawl in future sprints.
+        self._punchhole_epoch: int = 0
+
+        # PREREQ-03: indexer shorthand — maps indexer name -> node_id hex.
+        # Populated from config section [exposure.indexers] or config key "indexers".
+        self._indexers: Dict[str, str] = {}
+        raw_indexers = config.get("indexers", {})
+        if isinstance(raw_indexers, dict):
+            self._indexers = {k: str(v) for k, v in raw_indexers.items()}
 
         # Load schema
         schema_file = config.get("schema_file", "exposure_schema.toml")
@@ -306,35 +316,34 @@ class PunchholeBackendPlugin(PluginHooks):
             return False
 
     def _is_peer(self, node_id: str) -> bool:
-        """Check bilateral ledger for entries with this node."""
+        """Check peer_keys table — if the node is known, it's a peer."""
         if not self._ctx.storage_path:
             return False
         try:
             conn = sqlite3.connect(self._ctx.storage_path, timeout=5)
-            # node_id in ledger is stored as peer_public_key (hex)
             cur = conn.execute(
-                "SELECT 1 FROM ledger WHERE peer_public_key = ? LIMIT 1",
+                "SELECT 1 FROM peer_keys WHERE node_id = ? LIMIT 1",
                 (node_id,),
             )
             result = cur.fetchone() is not None
             conn.close()
             return result
         except Exception as exc:
-            log.warning(f"punchhole-backend: ledger query failed: {exc}")
+            log.warning(f"punchhole-backend: peer_keys query failed: {exc}")
             return False
 
     def _get_all_peer_node_ids(self) -> Set[str]:
-        """Return set of all node_ids with ledger entries."""
+        """Return set of all known peer node_ids from peer_keys table."""
         if not self._ctx.storage_path:
             return set()
         try:
             conn = sqlite3.connect(self._ctx.storage_path, timeout=5)
-            cur = conn.execute("SELECT peer_public_key FROM ledger")
+            cur = conn.execute("SELECT node_id FROM peer_keys")
             result = {row[0] for row in cur.fetchall()}
             conn.close()
             return result
         except Exception as exc:
-            log.warning(f"punchhole-backend: ledger scan failed: {exc}")
+            log.warning(f"punchhole-backend: peer_keys scan failed: {exc}")
             return set()
 
     def _get_all_known_host_node_ids(self) -> Set[str]:
@@ -350,6 +359,34 @@ class PunchholeBackendPlugin(PluginHooks):
         except Exception as exc:
             log.warning(f"punchhole-backend: address_book scan failed: {exc}")
             return set()
+
+    def _check_access(self, requester_node_id: str, required: str) -> bool:
+        """
+        Check if requester_node_id satisfies the required access entry.
+
+        Handles both tier strings (all_signed, trusted, known_hosts, peer) and
+        ACL shorthands:
+          group:<name>   — PREREQ-02: member of named group via GroupEngine
+          indexer:<name> — PREREQ-03: registered as named indexer in config
+        """
+        if required.startswith("group:"):
+            # PREREQ-02: group membership check via GroupEngine
+            group_name = required[len("group:"):]
+            ge = getattr(self._ctx, "group_engine", None)
+            if ge is None:
+                log.warning("punchhole-backend: group_engine not available on ctx")
+                return False
+            return bool(ge.is_member(requester_node_id, group_name))
+
+        if required.startswith("indexer:"):
+            # PREREQ-03: registered indexer check
+            indexer_name = required[len("indexer:"):]
+            registered_node_id = self._indexers.get(indexer_name, "")
+            return bool(registered_node_id and requester_node_id == registered_node_id)
+
+        # Standard tier-based check
+        requester_tier = self._resolve_acl_group(requester_node_id)
+        return _tier_has_access(requester_tier, required)
 
     def _push_acl_config(self):
         """Build ACL map for all known nodes and push to frontend via bus."""
@@ -827,7 +864,7 @@ class PunchholeBackendPlugin(PluginHooks):
 
         for key, obj_config in self._objects.items():
             required = obj_config.get("access", "all_signed")
-            if _tier_has_access(requester_tier, required):
+            if self._check_access(requester_node_id, required):
                 available.append({
                     "key": key,
                     "description": obj_config.get("description", ""),
@@ -888,9 +925,9 @@ class PunchholeBackendPlugin(PluginHooks):
                     # Build on demand per requester, use exact requester tier
                     acl_group = self._resolve_acl_group(requester_node_id) \
                         if requester_node_id else requester_tier
-                    # Verify peer access for bilateral
+                    # Verify peer access for bilateral (supports group:/indexer: shorthands)
                     required = obj_config.get("access", "all_signed")
-                    if not _tier_has_access(acl_group, required):
+                    if not self._check_access(requester_node_id or "", required):
                         if self._debug:
                             log.debug(
                                 f"punchhole-backend: {requester_node_id} lacks access "
@@ -938,6 +975,10 @@ class PunchholeBackendPlugin(PluginHooks):
                     stale_keys = list(self._objects.keys())
                     if self._debug:
                         log.debug("punchhole-backend: config order received — staling all objects")
+
+                if stale_keys:
+                    # PREREQ-01: increment epoch whenever any cache object is staled
+                    self._punchhole_epoch += 1
 
                 for key in stale_keys:
                     if self._ctx.emit_event:

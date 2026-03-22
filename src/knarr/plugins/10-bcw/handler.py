@@ -492,7 +492,7 @@ class BCWPlugin(PluginHooks):
         subscribe = getattr(ctx, "subscribe_events", None)
         if callable(subscribe):
             try:
-                self._sub = subscribe("bcw.watch_request", "bcw.unwatch", "bcw.poll")
+                self._sub = subscribe("bcw.watch_request", "bcw.unwatch", "bcw.poll", "peer.removed")
             except Exception as exc:
                 self._log_warning("BCW event subscription failed: %s", exc)
 
@@ -607,6 +607,38 @@ class BCWPlugin(PluginHooks):
                 if manager is not None:
                     self._queue_ws_task(manager.unsubscribe_all_for(node_id, chain_id))
                 self._store.remove_watch(node_id, chain_id)
+                self._self_owned_addresses = self._store.all_addresses()
+            return
+        if etype == "peer.removed":
+            node_id = str(event.get("node_id", "") or "")
+            if node_id and node_id != "batch":
+                for watch in self._store.list_watches():
+                    if watch.get("node_id") != node_id or watch.get("status") != "watching":
+                        continue
+                    chain_id = str(watch.get("chain_id", "") or "")
+                    self._signature_watch_requests.pop((node_id, chain_id), None)
+                    manager = self._subscription_managers.get(chain_id)
+                    if manager is not None:
+                        self._queue_ws_task(manager.unsubscribe_all_for(node_id, chain_id))
+                    self._store.remove_watch(node_id, chain_id)
+                self._self_owned_addresses = self._store.all_addresses()
+            elif node_id == "batch":
+                # Bulk prune — cross-reference active watches against current peer table
+                try:
+                    current_peers = {p.node_id for p in (self._ctx.get_peers() or [])}
+                except Exception:
+                    current_peers = set()
+                for watch in self._store.list_watches():
+                    if watch.get("status") != "watching":
+                        continue
+                    wnode_id = str(watch.get("node_id", "") or "")
+                    if wnode_id and wnode_id not in current_peers:
+                        chain_id = str(watch.get("chain_id", "") or "")
+                        self._signature_watch_requests.pop((wnode_id, chain_id), None)
+                        manager = self._subscription_managers.get(chain_id)
+                        if manager is not None:
+                            self._queue_ws_task(manager.unsubscribe_all_for(wnode_id, chain_id))
+                        self._store.remove_watch(wnode_id, chain_id)
                 self._self_owned_addresses = self._store.all_addresses()
             return
         if etype == "bcw.poll":
@@ -986,18 +1018,20 @@ class BCWPlugin(PluginHooks):
             )
             self._emit_event(f"payment.received.{chain_topic}", receipt_type=receipt_type, **common_fields)
             if transfer.confirmation == ConfirmationStatus.FINALIZED:
+                _finalized_is_new = self._store.latest_receipt_for(dedup_key, "payment_finalized") is None
                 finalized_id = self._write_receipt(
                     "payment_finalized",
                     transfer,
                     {"original_receipt_id": received_id, "correlation_id": correlation_id},
                 )
-                self._emit_event(
-                    f"payment.finalized.{chain_topic}",
-                    receipt_type="payment_finalized",
-                    original_receipt_id=received_id,
-                    receipt_id=finalized_id,
-                    **common_fields,
-                )
+                if _finalized_is_new:
+                    self._emit_event(
+                        f"payment.finalized.{chain_topic}",
+                        receipt_type="payment_finalized",
+                        original_receipt_id=received_id,
+                        receipt_id=finalized_id,
+                        **common_fields,
+                    )
             return
 
         if receipt_type == "payment_executed":
