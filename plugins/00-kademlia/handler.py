@@ -647,22 +647,12 @@ class KademliaPlugin(PluginHooks):
                     if self._lookup and self.mode == "full" and visibility == "public":
                         # KAD-01: Extract canonical_path from skill_sheet if available
                         canonical_path = skill_sheet.get("canonical_path", skill_key)
-                        task = asyncio.create_task(self._put_provider_to_closest(skill_key, canonical_path))
-                        # B4: D-007 Phase C — suppress gossip, KAD handles distribution
-                        # If last PUT for this skill failed, allow gossip fallback this cycle
-                        put_failures = getattr(self, '_kad_put_failed', {})
-                        last_failed = put_failures.pop(skill_key, False)
-                        def _on_put_done(t, sk=skill_key):
-                            if not t.cancelled() and t.exception():
-                                getattr(self, '_kad_put_failed', {})[sk] = True
-                        task.add_done_callback(_on_put_done)
-                        if last_failed:
-                            if self._debug:
-                                self._log.info(f"KAD_GOSSIP_FALLBACK skill={skill_key} (prev PUT failed)")
-                            return True  # allow gossip this cycle as fallback
-                        if self._debug:
-                            self._log.info(f"KAD_GOSSIP_SUPPRESS skill={skill_key}")
-                        return False
+                        asyncio.create_task(self._put_provider_to_closest(skill_key, canonical_path))
+                        # KAD PUT runs in background for DHT discovery.
+                        # Gossip NOT suppressed — KAD PUT targets K-closest only;
+                        # nodes outside that set never learn the skill. Both channels
+                        # coexist; gossip dedup handles redundancy.
+                        # (D-007 Phase C suppression removed: BR-gossip-suppress-kad-discovery-gap)
 
         except Exception as e:
             self._log.warning(f"KAD_OUTBOUND_ERR {type(e).__name__}: {e}")
