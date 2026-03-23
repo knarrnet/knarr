@@ -102,8 +102,8 @@ def validate_skill_sheet(data: Dict[str, Any]) -> SkillSheet:
             raise ValidationError("Field 'price' must be a number")
         if math.isnan(price) or math.isinf(price):
             raise ValidationError("Field 'price' must be a finite number")
-        if price > 1000.0:
-            raise ValidationError("Field 'price' must not exceed 1000.0")
+        # Hardcoded price ceiling removed (ESC-02). Operator-configurable
+        # dynamic_price_ceiling in [policy] config handles this at runtime.
 
     # max_input_size validation
     if "max_input_size" in data:
