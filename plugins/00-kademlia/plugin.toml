@@ -1,9 +1,14 @@
 name = "knarr-kademlia"
-version = "0.2.0"
+version = "0.3.0"
 handler = "handler:KademliaPlugin"
 description = "Kademlia DHT — passive cache + active routing via PluginMessage"
 
 [config]
+# mode: "passive" | "full" | "backbone" | "passive_locked"
+#   passive        — observe-only; auto-promotes to full when conditions met (default)
+#   full           — active routing: FIND_NODE, PUT_PROVIDER, GET_PROVIDERS, lookups
+#   backbone       — alias for full with expanded max_provider_records (500K)
+#   passive_locked — permanently passive; disables auto-promotion (monitoring nodes)
 mode = "passive"
 k = 8
 alpha = 3
@@ -11,4 +16,11 @@ max_provider_records = 50000
 evict_interval_seconds = 60
 lookup_timeout_seconds = 5.0
 max_find_node_per_minute = 10
+# KAD-02: republish own provider records every N seconds (default half of default TTL)
+republish_interval_seconds = 900
+# KAD-03: auto-promotion thresholds (passive → full)
+auto_promote_min_uptime_seconds = 60
+auto_promote_min_peers = 5
+# KAD-14: max iterative lookups triggered by on_query cache miss per minute
+max_lookups_per_minute = 5
 debug = false

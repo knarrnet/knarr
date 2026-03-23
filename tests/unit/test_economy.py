@@ -94,16 +94,19 @@ def test_price_validation_zero_allowed():
     assert result.price == 0.0
 
 def test_price_validation_negative():
+    """ESC-02: Negative prices are now valid (bounty/escrow pattern)."""
     sheet = {"name": "s", "version": "1.0.0", "description": "d", "tags": ["t"],
              "input_schema": {}, "output_schema": {}, "price": -1.0}
-    with pytest.raises(ValidationError, match="not be negative"):
-        validate_skill_sheet(sheet)
+    result = validate_skill_sheet(sheet)
+    assert result.price == -1.0
 
-def test_price_validation_too_high():
-    sheet = {"name": "s", "version": "1.0.0", "description": "d", "tags": ["t"], 
+def test_price_validation_high_accepted():
+    """ESC-02: Hardcoded price ceiling removed. dynamic_price_ceiling in [policy] config
+    handles this at runtime. Wire-level validation only guards finite numbers."""
+    sheet = {"name": "s", "version": "1.0.0", "description": "d", "tags": ["t"],
              "input_schema": {}, "output_schema": {}, "price": 1001.0}
-    with pytest.raises(ValidationError, match="not exceed 1000.0"):
-        validate_skill_sheet(sheet)
+    result = validate_skill_sheet(sheet)
+    assert result.price == 1001.0
 
 def test_price_validation_default():
     sheet = {"name": "s", "version": "1.0.0", "description": "d", "tags": ["t"], 

@@ -216,6 +216,10 @@ class PluginContext:
             self.remove_peer = remove_peer                     # v0.48.0 D-007
             self.upsert_address = upsert_address               # v0.48.0 D-007
             self.push_to_peer = push_to_peer                   # v0.48.0 D-007
+        # KAD-06: sign_bytes — raw bytes signing for KAD record signatures.
+        # Set to None here; wired in node.py after plugin load.
+        if not hasattr(self, "sign_bytes"):
+            self.sign_bytes = None  # Callable: (bytes) -> (signature_bytes, pubkey_hex)
 
 
 class PluginLoader:

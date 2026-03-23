@@ -67,6 +67,32 @@ class _QueryCallback:
         )
 
 
+class _SignBytesCallback:
+    """KAD-06: Callable for raw-bytes signing for KAD provider record signatures.
+
+    Distinct from sign_document (which uses JCS-2022 proof envelopes) —
+    KAD records sign raw byte payloads for compactness.
+    """
+
+    __slots__ = ("_key",)
+
+    def __init__(self, signing_key: "SigningKey") -> None:
+        self._key = signing_key
+
+    def __call__(self, data: bytes) -> "tuple[bytes, str]":
+        sig = self._key.sign(data).signature
+        pubkey_hex = self._key.verify_key.encode().hex()
+        return (sig, pubkey_hex)
+
+
+def make_sign_bytes_callback(signing_key: "SigningKey") -> Callable:
+    """KAD-06: Create a sign_bytes callback for PluginContext.
+
+    Plugins call: sig_bytes, pubkey_hex = ctx.sign_bytes(data: bytes)
+    """
+    return _SignBytesCallback(signing_key)
+
+
 def make_sign_callback(
     signing_key: "SigningKey",
     node_id: str,

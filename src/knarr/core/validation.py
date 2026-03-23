@@ -1,4 +1,5 @@
 import json
+import math
 import re
 from typing import Dict, Any, List, Optional
 from .models import SkillSheet
@@ -93,15 +94,16 @@ def validate_skill_sheet(data: Dict[str, Any]) -> SkillSheet:
             if not isinstance(v, str):
                 raise ValidationError(f"Schema value for '{k}' in {schema_name} must be a string type name")
 
-    # Price validation [M-02]
+    # Price validation [M-02] — ESC-02: allow negative prices (bounties).
+    # Guard: must be a finite real number. Operator's dynamic_price_floor provides runtime guardrails.
     if "price" in data:
         price = data["price"]
         if not isinstance(price, (int, float)):
             raise ValidationError("Field 'price' must be a number")
-        if price < 0:
-            raise ValidationError("Field 'price' must not be negative")
-        if price > 1000.0:
-            raise ValidationError("Field 'price' must not exceed 1000.0")
+        if math.isnan(price) or math.isinf(price):
+            raise ValidationError("Field 'price' must be a finite number")
+        # Hardcoded price ceiling removed (ESC-02). Operator-configurable
+        # dynamic_price_ceiling in [policy] config handles this at runtime.
 
     # max_input_size validation
     if "max_input_size" in data:
