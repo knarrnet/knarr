@@ -1715,6 +1715,7 @@ class DHTNode:
             _sign_cb = make_sign_callback(self._signing_key, self.node_info.node_id)
             _query_cb = make_query_receipts_callback(self.storage)
             _sign_bytes_cb = make_sign_bytes_callback(self._signing_key)  # KAD-06
+        self.sign_bytes = _sign_bytes_cb  # CR-051-01: expose to skill handlers via set_node()
         for plugin in self._plugins.plugins:
             ctx = plugin._ctx if hasattr(plugin, '_ctx') else None
             if ctx is not None:
