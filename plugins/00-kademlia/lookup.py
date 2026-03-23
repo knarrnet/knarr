@@ -5,6 +5,16 @@ import logging
 import uuid
 from typing import List, Dict, Set, Optional, Callable
 
+
+def _canonicalize_path(path: str) -> str:
+    """KAD-07: Normalize a canonical_path before hashing (mirrors handler.py)."""
+    return path.strip().lower().rstrip("/")
+
+
+def _default_key_function(skill_name: str, canonical_path: str) -> bytes:
+    """TP-1: Mirrors handler.default_key_function to avoid circular import."""
+    return hashlib.sha256(_canonicalize_path(canonical_path).encode()).digest()
+
 logger = logging.getLogger("knarr.plugin.kademlia.lookup")
 
 class IterativeLookup:
@@ -125,9 +135,94 @@ class IterativeLookup:
 
         return [found[nid] for nid in sorted(found.keys(), key=lambda nid: found[nid]["distance"])[:self.k]]
 
+    async def find_providers_disjoint(self, skill_key: str, d: int = 2) -> List[Dict]:
+        """KAD-13: Disjoint lookup paths for eclipse resistance.
+
+        Split initial K-closest candidates into D independent groups, run D parallel
+        lookups with disjoint contacted sets, merge and deduplicate results.
+
+        Args:
+            skill_key: The skill key to look up providers for
+            d: Number of disjoint lookup paths (default 2)
+        """
+        # TP-1: Use _default_key_function for key-space consistency with PUT path
+        target_id = _default_key_function(skill_key, skill_key).hex()
+        initial_candidates = self.kbuckets.get_closest(target_id, count=self.k)
+
+        # Split initial candidates into D disjoint groups
+        d = max(1, d)
+        groups: list = [[] for _ in range(d)]
+        for i, candidate in enumerate(initial_candidates):
+            groups[i % d].append(candidate)
+
+        # Run D parallel lookups with disjoint contacted sets
+        async def _run_lookup(initial: list) -> List[Dict]:
+            """Run a single lookup seeded with a subset of initial candidates."""
+            found: dict = {}
+            for p in initial:
+                found[p["node_id"]] = {
+                    "node_id": p["node_id"],
+                    "host": p["host"],
+                    "port": p["port"],
+                    "distance": self._get_distance(target_id, p["node_id"])
+                }
+
+            queried: set = {self.local_id}
+            providers_found: dict = {}
+
+            for _ in range(20):
+                unqueried = [
+                    nid for nid in sorted(found.keys(), key=lambda nid: found[nid]["distance"])
+                    if nid not in queried
+                ]
+                targets = unqueried[:self.alpha]
+                if not targets:
+                    break
+
+                for tid in targets:
+                    queried.add(tid)
+
+                tasks = [
+                    self._send_and_wait(
+                        found[tid]["node_id"], found[tid]["host"], found[tid]["port"],
+                        "GET_PROVIDERS", {"skill_key": skill_key}
+                    )
+                    for tid in targets
+                ]
+                results = await asyncio.gather(*tasks)
+
+                for res in results:
+                    if not res:
+                        continue
+                    for p in res.get("providers", []):
+                        providers_found[p["node_id"]] = p
+                    for p in res.get("closer_peers", []):
+                        nid = p.get("node_id")
+                        if nid and nid != self.local_id and self._is_valid_hex_id(nid) and nid not in found:
+                            found[nid] = {
+                                "node_id": nid,
+                                "host": p["host"],
+                                "port": p["port"],
+                                "distance": self._get_distance(target_id, nid)
+                            }
+
+            return list(providers_found.values())
+
+        group_tasks = [_run_lookup(g) for g in groups]
+        group_results = await asyncio.gather(*group_tasks)
+
+        # Merge and deduplicate by node_id
+        merged: dict = {}
+        for group_providers in group_results:
+            for p in group_providers:
+                merged[p["node_id"]] = p
+
+        return list(merged.values())
+
     async def find_providers(self, skill_key: str) -> List[Dict]:
         """Find providers for skill_key."""
-        target_id = hashlib.sha256(skill_key.encode()).hexdigest()
+        # TP-1: Use _default_key_function for key-space consistency with PUT path
+        target_id = _default_key_function(skill_key, skill_key).hex()
         
         initial_candidates = self.kbuckets.get_closest(target_id, count=self.k)
         found: Dict[str, Dict] = {}

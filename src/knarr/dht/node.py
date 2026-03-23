@@ -1707,10 +1707,14 @@ class DHTNode:
         # v0.35.0: Create commerce bridge callbacks
         _sign_cb = None
         _query_cb = None
+        _sign_bytes_cb = None
         if self._signing_key:
-            from knarr.commerce.plugin_bridge import make_sign_callback, make_query_receipts_callback
+            from knarr.commerce.plugin_bridge import (
+                make_sign_callback, make_query_receipts_callback, make_sign_bytes_callback
+            )
             _sign_cb = make_sign_callback(self._signing_key, self.node_info.node_id)
             _query_cb = make_query_receipts_callback(self.storage)
+            _sign_bytes_cb = make_sign_bytes_callback(self._signing_key)  # KAD-06
         for plugin in self._plugins.plugins:
             ctx = plugin._ctx if hasattr(plugin, '_ctx') else None
             if ctx is not None:
@@ -1721,6 +1725,7 @@ class DHTNode:
                     ctx.send_mail = self._sync.enqueue
                 ctx.sign_document = _sign_cb       # v0.35.0
                 ctx.query_receipts = _query_cb     # v0.35.0
+                ctx.sign_bytes = _sign_bytes_cb    # KAD-06
                 ctx.economy_config = dict(self._config.get("economy", {}))  # v0.42.0
                 ctx.get_plugin = self._plugins.get_plugin_by_name  # v0.46.0
                 # D-007 Phase D: peer-management callbacks for KAD structured sweep
@@ -2089,6 +2094,20 @@ class DHTNode:
                 if node_jurisdiction:
                     skill_sheet_data = dict(skill_sheet_data)
                     skill_sheet_data["jurisdiction"] = node_jurisdiction
+
+            # ESC-01: Populate _own_skills from raw data before validation so the
+            # skill is directly callable even if validation fails (e.g. negative price
+            # before ESC-02 ships).  Validation result overwrites if successful.
+            _raw_name = str(skill_sheet_data.get("name", "")).strip().lower()
+            if _raw_name:
+                try:
+                    self._own_skills[_raw_name] = SkillSheet.from_dict({
+                        **skill_sheet_data,
+                        "name": _raw_name,
+                    })
+                except Exception:
+                    pass  # Best effort — validation below will handle errors
+
             skill_sheet = validate_skill_sheet(skill_sheet_data)
             self._own_skills[skill_sheet.name] = skill_sheet
             

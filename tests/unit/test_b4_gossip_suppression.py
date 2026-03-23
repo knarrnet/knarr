@@ -65,6 +65,8 @@ def _make_kad(mode="full", our_node_id="aa" * 32):
     plugin.providers = MagicMock()
     plugin._lookup = MagicMock() if mode == "full" else None
     plugin._is_valid_hex_id = lambda x: len(x) == 64 and all(c in "0123456789abcdef" for c in x)
+    plugin._own_skills = {}
+    plugin._kad_put_failed = {}
     return plugin
 
 

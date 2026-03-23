@@ -1,10 +1,15 @@
 import json
 import asyncio
 import inspect
+import os
 import random
 import logging
 import time
 import hashlib
+import hmac
+import secrets
+import uuid
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 from knarr.core.messages import Message, Announce, Deregister, Query, PluginMessage
@@ -21,13 +26,23 @@ _MAX_PROVIDER_RECORD_SIZE = 4096
 _MAX_PROVIDERS_PER_KEY = 100
 
 
+def _canonicalize_path(path: str) -> str:
+    """KAD-07: Normalize a canonical_path before hashing.
+
+    Rules: strip surrounding whitespace, lowercase, strip trailing slash.
+    "Knowledge/Translate" == "knowledge/translate" == "knowledge/translate/".
+    """
+    return path.strip().lower().rstrip("/")
+
+
 def default_key_function(skill_name: str, canonical_path: str) -> bytes:
-    """KAD-01: Pluggable key function. Returns SHA-256 of canonical_path.
+    """KAD-01/KAD-07: Pluggable key function. Returns SHA-256 of normalized canonical_path.
 
     The canonical_path is the leaf-level classification path (e.g. "knowledge/translate").
-    A future nomenclature standard can swap the hash input without touching STORE/FIND_VALUE logic.
+    KAD-07: Path is canonicalized (lowercase, stripped) before hashing so that
+    "Knowledge/Translate" and "knowledge/translate/" produce the same DHT key.
     """
-    return hashlib.sha256(canonical_path.encode()).digest()
+    return hashlib.sha256(_canonicalize_path(canonical_path).encode()).digest()
 
 
 class KademliaPlugin(PluginHooks):
@@ -56,7 +71,8 @@ class KademliaPlugin(PluginHooks):
         self.evict_interval = float(config.get("evict_interval_seconds", 60))
 
         # Phase B config
-        self.mode = config.get("mode", "passive")  # "passive", "full", or "backbone"
+        # KAD-03: passive_locked disables auto-promotion; backbone = full with larger cache
+        self.mode = config.get("mode", "passive")  # "passive", "full", "backbone", "passive_locked"
         if self.mode == "backbone":
             self.mode = "full"
             self.max_provider_records = max(self.max_provider_records, 500000)
@@ -66,8 +82,21 @@ class KademliaPlugin(PluginHooks):
         self.max_find_node_per_minute = int(config.get("max_find_node_per_minute", 10))
         self._find_node_log: Dict[str, List[float]] = {}  # node_id -> [timestamps]
 
-        self.kbuckets = KBucketTable(ctx.node_id, k=self.k)
-        self.providers = ProviderCache(max_records=self.max_provider_records)
+        # KAD-04: Determine DB path following the thrall.db / punchhole-frontend pattern.
+        # ctx.state_dir / ctx.plugin_dir must be a real filesystem path (str or Path).
+        # In tests ctx is a MagicMock so we check isinstance before using.
+        _kad_db = config.get("db_path", None)
+        if _kad_db is None:
+            _state_dir = getattr(ctx, "state_dir", None) or getattr(ctx, "plugin_dir", None)
+            if _state_dir is not None and isinstance(_state_dir, (str, Path)):
+                try:
+                    _kad_db = str(Path(_state_dir) / "kademlia.db")
+                except (TypeError, ValueError):
+                    _kad_db = None
+        self._kad_db_path = _kad_db
+
+        self.kbuckets = KBucketTable(ctx.node_id, k=self.k, db_path=self._kad_db_path)
+        self.providers = ProviderCache(max_records=self.max_provider_records, db_path=self._kad_db_path)
 
         if self.mode == "full":
             self._lookup = IterativeLookup(
@@ -87,6 +116,27 @@ class KademliaPlugin(PluginHooks):
 
         self._last_evict = time.monotonic()
         self._kad_put_failed: Dict[str, bool] = {}  # B4: per-skill PUT failure flag for gossip fallback
+        # KAD-10: track nodes that responded to PING with PONG
+        self._pong_received: Dict[str, float] = {}  # node_id -> timestamp
+        # KAD-09: Track when PINGs were sent for pending eviction resolution
+        self._ping_sent_at: Dict[str, float] = {}  # oldest_node_id -> monotonic timestamp
+        self._ping_timeout = float(config.get("ping_timeout_seconds", 10.0))
+        # KAD-11: BEP-5 token model — HMAC token in GET_PROVIDERS responses
+        self._token_secret: bytes = secrets.token_bytes(32)
+        # KAD-11: Pending RPC requests for GET-before-STORE token acquisition
+        self._pending_requests: Dict[str, asyncio.Future] = {}
+        # KAD-13: Disjoint lookup paths config
+        self.disjoint_lookup_paths = max(1, int(config.get("disjoint_lookup_paths", 2)))
+        # KAD-02: Track own skills for republish and last republish timestamp
+        self._own_skills: Dict[str, str] = {}  # skill_key -> canonical_path
+        self._last_republish: float = time.monotonic()
+        self._republish_interval: float = float(config.get("republish_interval_seconds", 900.0))
+        # KAD-14: on_query fan-out rate limiting
+        self._query_lookup_rate_limit = int(config.get("max_lookups_per_minute", 5))
+        self._query_lookup_log: List[float] = []  # timestamps of recent lookups
+        # KAD-03: Auto-promotion config
+        self._auto_promote_min_uptime = float(config.get("auto_promote_min_uptime_seconds", 60.0))
+        self._auto_promote_min_peers = int(config.get("auto_promote_min_peers", 5))
         if self._debug:
             self._log.info(f"KAD_INIT mode={self.mode} k={self.k} max_records={self.max_provider_records}")
 
@@ -119,6 +169,28 @@ class KademliaPlugin(PluginHooks):
         )
         await self._ctx.send_fire_forget(target_info, msg)
 
+    async def _send_rpc(self, node_id: str, host: str, port: int,
+                        action: str, payload: dict,
+                        timeout: Optional[float] = None) -> Optional[dict]:
+        """KAD-11: Send an RPC and wait for the response (request/response pattern).
+
+        Used by _put_provider_to_closest to obtain a token via GET_PROVIDERS
+        before sending PUT_PROVIDER (BEP-5 GET-before-STORE).
+        """
+        request_id = str(uuid.uuid4())
+        request_payload = dict(payload)
+        request_payload["_request_id"] = request_id
+        future = asyncio.get_running_loop().create_future()
+        self._pending_requests[request_id] = future
+
+        try:
+            await self._send_plugin_message(node_id, host, port, action, request_payload)
+            return await asyncio.wait_for(future, timeout=timeout or self.lookup_timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            self._pending_requests.pop(request_id, None)
+
     async def _handle_plugin_message(self, msg: PluginMessage, peer_ip: str, peers: list):
         """Handle incoming PluginMessage actions."""
         action = getattr(msg, "action", "")
@@ -129,10 +201,24 @@ class KademliaPlugin(PluginHooks):
         except (json.JSONDecodeError, TypeError):
             return
 
-        if action in ("FIND_NODE_RESP", "GET_PROVIDERS_RESP", "FIND_VALUE_RESP"):
+        if action in ("FIND_NODE_RESP", "GET_PROVIDERS_RESP", "FIND_VALUE_RESP", "PONG"):
             request_id = payload.get("_request_id", "")
-            if self._lookup and request_id:
-                self._lookup.resolve_response(request_id, payload)
+            if request_id:
+                # KAD-11: Resolve pending RPC requests (GET-before-STORE token acquisition)
+                pending_future = self._pending_requests.get(request_id)
+                if pending_future is not None and not pending_future.done():
+                    pending_future.set_result(payload)
+                # Also route to IterativeLookup for find_nodes/find_providers
+                if self._lookup:
+                    self._lookup.resolve_response(request_id, payload)
+            # KAD-10: PONG — record liveness confirmation
+            if action == "PONG":
+                self._record_pong(sender_id)
+            return
+
+        # KAD-10: PING — respond with PONG
+        if action == "PING":
+            await self._handle_ping(msg, payload, peers)
             return
 
         # Rate limit by peer_ip to prevent Sybil bypass via identity rotation
@@ -179,10 +265,35 @@ class KademliaPlugin(PluginHooks):
             if self._debug:
                 self._log.info(f"KAD_FIND_NODE target={target[:16]} closest={len(peer_list)} requester={sender_id[:16]}")
 
+    def _is_proximity_valid(self, sender_id: str, skill_key: str, canonical_path: str = "") -> bool:
+        """KAD-05: Check if sender is close enough to the skill key to be allowed to store.
+
+        Uses default_key_function() for the proximity check — consistent with DHT routing
+        and KAD-07 normalization (not raw hashlib.sha256 which operates in a different key space).
+        Reject if sender is farther than 2x the K-th closest when table has >= K entries.
+        Accept all PUTs when fewer than K peers known (bootstrap phase).
+        """
+        target_hex = default_key_function(skill_key, canonical_path or skill_key).hex()
+        closest = self.kbuckets.get_closest(target_hex, count=self.k)
+
+        if len(closest) < self.k:
+            # Bootstrap phase — accept all
+            return True
+
+        # TP-17: Defensive int() — malformed sender_id should not raise
+        try:
+            sender_dist = int(sender_id, 16) ^ int(target_hex, 16)
+        except ValueError:
+            return False
+        kth_dist = closest[-1]["distance"]
+
+        return sender_dist <= kth_dist * 2
+
     async def _handle_put_provider(self, msg: PluginMessage, payload: dict, peers: list):
         """Store a provider record from a remote PUT_PROVIDER.
         V19-003: Bind identity to authenticated sender, resolve endpoint from peer table.
-        KAD-01: 4KB record limit, max providers per key, dedup by node_id."""
+        KAD-01: 4KB record limit, max providers per key, dedup by node_id.
+        KAD-05: Proximity check — reject from far senders when K peers known."""
         if self.mode != "full":
             return
 
@@ -199,6 +310,47 @@ class KademliaPlugin(PluginHooks):
                 self._log.info(f"KAD_PUT_REJECTED_SIZE skill={skill_key} size={record_size} max={_MAX_PROVIDER_RECORD_SIZE}")
             return
 
+        # KAD-11: Token validation — reject PUT without valid GET-before-STORE token
+        token = payload.get("_token", "")
+        if not self._is_valid_token(sender_id, token):
+            if self._debug:
+                self._log.info(f"KAD_PUT_REJECTED_TOKEN skill={skill_key} sender={sender_id[:16]}")
+            return
+
+        # KAD-06: Signature verification — TP-5: verify whenever payload has sig+pubkey
+        # (receiver's sign_bytes is for OUTBOUND signing, not verification)
+        if "_sig" in payload and "_pubkey" in payload:
+            sig_hex = payload.get("_sig", "")
+            pubkey_hex = payload.get("_pubkey", "")
+            if not sig_hex or not pubkey_hex:
+                if self._debug:
+                    self._log.info(f"KAD_PUT_REJECTED_NO_SIG skill={skill_key} sender={sender_id[:16]}")
+                return
+            try:
+                from nacl.signing import VerifyKey
+                from nacl.exceptions import BadSignatureError
+                # Reconstruct the payload that was signed (exclude _sig and _pubkey)
+                verify_payload = {k: v for k, v in payload.items() if k not in ("_sig", "_pubkey")}
+                verify_bytes = json.dumps(verify_payload, sort_keys=True, separators=(",", ":")).encode()
+                vk = VerifyKey(bytes.fromhex(pubkey_hex))
+                vk.verify(verify_bytes, bytes.fromhex(sig_hex))
+            except Exception as verify_err:
+                if self._debug:
+                    self._log.info(f"KAD_PUT_REJECTED_BAD_SIG skill={skill_key} err={verify_err}")
+                return
+            # TP-2: Bind pubkey to sender identity — node_id must be SHA-256 of verify key
+            if hashlib.sha256(bytes.fromhex(pubkey_hex)).hexdigest() != sender_id:
+                if self._debug:
+                    self._log.info(f"KAD_PUT_REJECTED_IDENTITY skill={skill_key} sender={sender_id[:16]}")
+                return
+
+        # KAD-05: Proximity check (uses default_key_function for key-space consistency)
+        canonical_path = payload.get("canonical_path", skill_key)
+        if not self._is_proximity_valid(sender_id, skill_key, canonical_path):
+            if self._debug:
+                self._log.info(f"KAD_PUT_REJECTED_PROXIMITY skill={skill_key} sender={sender_id[:16]}")
+            return
+
         # V19-003: Use authenticated sender identity (msg.node_id from signed envelope),
         # NOT self-asserted payload.node_id. Resolve endpoint from peer table.
         peer_info = self._resolve_peer(sender_id, peers)
@@ -208,7 +360,6 @@ class KademliaPlugin(PluginHooks):
         sidecar_port = raw_sidecar_port if 1024 <= raw_sidecar_port <= 65535 else 0
 
         # KAD-01: Build provider record with skill-record semantics
-        canonical_path = payload.get("canonical_path", skill_key)
         ttl = min(int(payload.get("ttl", 3600)), 7200)  # cap at 2h
 
         # KAD-01: Enforce max providers per key — dedup by node_id (latest wins),
@@ -236,16 +387,19 @@ class KademliaPlugin(PluginHooks):
             return
 
         providers = self.providers.get_providers(skill_key)
-        target = hashlib.sha256(skill_key.encode()).hexdigest()
+        # TP-1: Use default_key_function for key-space consistency with PUT path
+        target = default_key_function(skill_key, skill_key).hex()
         closest = self.kbuckets.get_closest(target, count=self.k)
         closer_peers = [{"node_id": p["node_id"], "host": p["host"], "port": p["port"]} for p in closest]
 
         request_id = payload.get("_request_id", "")
         # KAD-01: Canonical response shape
+        # KAD-11: Include HMAC token so requester can PUT_PROVIDER back
         resp_data = {
             "providers": providers,
             "closest_nodes": closer_peers if not providers else [],
             "closer_peers": closer_peers,  # backward compat
+            "_token": self._generate_token(sender_id),  # KAD-11
         }
         if request_id:
             resp_data["_request_id"] = request_id
@@ -261,6 +415,58 @@ class KademliaPlugin(PluginHooks):
             await self._ctx.send_fire_forget(sender_info, resp)
             if self._debug:
                 self._log.info(f"KAD_GET_PROVIDERS skill={skill_key} results={len(providers)} requester={sender_id[:16]}")
+
+    def _generate_token(self, sender_id: str) -> str:
+        """KAD-11: Generate a BEP-5-style token for sender.
+
+        Token = sha256(sender_id + time_window + session_secret)[:16 hex chars].
+        time_window = int(time.time() // 300) — rotates every 5 minutes.
+        """
+        window = int(time.time() // 300)
+        h = hashlib.sha256(
+            sender_id.encode() + str(window).encode() + self._token_secret
+        ).hexdigest()
+        return h[:16]
+
+    def _is_valid_token(self, sender_id: str, token: str) -> bool:
+        """KAD-11: Validate token — accept current window or previous window (clock skew)."""
+        if not token:
+            return False
+        window = int(time.time() // 300)
+        for w in (window, window - 1):
+            h = hashlib.sha256(
+                sender_id.encode() + str(w).encode() + self._token_secret
+            ).hexdigest()
+            if h[:16] == token:
+                return True
+        return False
+
+    async def _handle_ping(self, msg: PluginMessage, payload: dict, peers: list):
+        """KAD-10: Respond to PING with PONG containing the request_id."""
+        sender_id = msg.node_id
+        request_id = payload.get("_request_id", "")
+        resp_data = {}
+        if request_id:
+            resp_data["_request_id"] = request_id
+
+        resp = PluginMessage(
+            node_id=self._ctx.node_id,
+            plugin_name="knarr-kademlia",
+            action="PONG",
+            payload=json.dumps(resp_data)
+        )
+        sender_info = self._resolve_peer(sender_id, peers)
+        if sender_info:
+            await self._ctx.send_fire_forget(sender_info, resp)
+            if self._debug:
+                self._log.info(f"KAD_PONG sent to={sender_id[:16]} request_id={request_id}")
+
+    def _record_pong(self, node_id: str):
+        """KAD-10: Record that a PONG was received from node_id."""
+        if node_id:
+            self._pong_received[node_id] = time.monotonic()
+            if self._debug:
+                self._log.info(f"KAD_PONG_RECV from={node_id[:16]}")
 
     _RATE_LIMIT_MAX_PEERS = 1000  # V19-005: Cap to prevent memory exhaustion under identity churn
 
@@ -355,21 +561,44 @@ class KademliaPlugin(PluginHooks):
 
             # Active lookup on cache miss (full mode, name queries only)
             if not results and self._lookup and query_type == "name":
-                try:
-                    remote = await self._lookup.find_providers(value)
-                    for p in remote:
-                        nid = p.get("node_id", "")
-                        if nid and self._is_valid_hex_id(nid):
-                            self.providers.store(
-                                p.get("skill_key", value), nid,
-                                p.get("host", ""), int(p.get("port", 0)),
-                                int(p.get("sidecar_port", 0))
-                            )
-                            results.append(p)
+                # KAD-14: Rate limit iterative lookups to max N per minute
+                now_t = time.monotonic()
+                self._query_lookup_log = [
+                    t for t in self._query_lookup_log if now_t - t < 60.0
+                ]
+                if len(self._query_lookup_log) >= self._query_lookup_rate_limit:
                     if self._debug:
-                        self._log.info(f"KAD_LOOKUP type={query_type} value={value} found={len(remote)}")
-                except Exception as e:
-                    self._log.warning(f"KAD_LOOKUP_ERR {type(e).__name__}: {e}")
+                        self._log.info(
+                            f"KAD_LOOKUP_RATE_LIMITED value={value}"
+                            f" count={len(self._query_lookup_log)}"
+                            f" limit={self._query_lookup_rate_limit}"
+                        )
+                    # Return empty — gossip will eventually fill the cache
+                else:
+                    self._query_lookup_log.append(now_t)
+                    try:
+                        # KAD-13: Use disjoint lookup paths when configured
+                        if self.disjoint_lookup_paths > 1:
+                            remote = await self._lookup.find_providers_disjoint(
+                                value, d=self.disjoint_lookup_paths
+                            )
+                        else:
+                            remote = await self._lookup.find_providers(value)
+                        for p in remote:
+                            nid = p.get("node_id", "")
+                            if nid and self._is_valid_hex_id(nid):
+                                self.providers.store(
+                                    p.get("skill_key", value), nid,
+                                    p.get("host", ""), int(p.get("port", 0)),
+                                    int(p.get("sidecar_port", 0))
+                                )
+                                results.append(p)
+                        if self._debug:
+                            self._log.info(
+                                f"KAD_LOOKUP type={query_type} value={value} found={len(remote)}"
+                            )
+                    except Exception as e:
+                        self._log.warning(f"KAD_LOOKUP_ERR {type(e).__name__}: {e}")
 
             query_results = []
             for record in results:
@@ -405,6 +634,10 @@ class KademliaPlugin(PluginHooks):
                         skill_key, msg.node_id, "",  # host unknown for self
                         0, getattr(msg, "sidecar_port", 0)
                     )
+                    # KAD-02: Track own skills for republish
+                    skill_sheet = getattr(msg, "skill_sheet", {}) or {}
+                    canonical_path = skill_sheet.get("canonical_path", skill_key)
+                    self._own_skills[skill_key] = canonical_path
                     if self._debug:
                         self._log.info(f"KAD_LEARN_SELF skill={skill_key}")
 
@@ -438,7 +671,13 @@ class KademliaPlugin(PluginHooks):
 
     async def _put_provider_to_closest(self, skill_key: str, canonical_path: str = ""):
         """Actively place provider record at k-closest nodes to skill hash.
-        KAD-01: Uses pluggable key function, includes canonical_path in payload."""
+        KAD-01: Uses pluggable key function, includes canonical_path in payload.
+        KAD-06: Signs the payload before broadcasting.
+        KAD-11: GET-before-STORE — obtains a token via GET_PROVIDERS per target
+        peer before sending PUT_PROVIDER (BEP-5 token model)."""
+        if not self._lookup:
+            return
+
         try:
             # KAD-01: Use pluggable key function
             path = canonical_path or skill_key
@@ -446,7 +685,7 @@ class KademliaPlugin(PluginHooks):
             target = key_bytes.hex()
             closest = await self._lookup.find_nodes(target)
 
-            payload = {
+            base_payload = {
                 "skill_key": skill_key,
                 "canonical_path": path,
                 "node_id": self._ctx.node_id,
@@ -457,14 +696,60 @@ class KademliaPlugin(PluginHooks):
                 "published_at": time.time(),
             }
 
+            async def _put_to_peer(peer):
+                """GET token from peer, then PUT with that token."""
+                try:
+                    # KAD-11: GET_PROVIDERS to obtain announce token
+                    token_response = await self._send_rpc(
+                        peer["node_id"], peer["host"], peer["port"],
+                        "GET_PROVIDERS", {"skill_key": skill_key},
+                    )
+                    token = token_response.get("_token") if token_response else None
+                    if not token:
+                        return False
+
+                    payload = dict(base_payload)
+                    payload["_token"] = token
+
+                    # KAD-06: Sign the canonical payload bytes
+                    sign_bytes = getattr(self._ctx, "sign_bytes", None)
+                    if sign_bytes is not None:
+                        try:
+                            payload_bytes = json.dumps(
+                                payload, sort_keys=True, separators=(",", ":")
+                            ).encode()
+                            sig_bytes, pubkey_hex = sign_bytes(payload_bytes)
+                            payload["_sig"] = sig_bytes.hex()
+                            payload["_pubkey"] = pubkey_hex
+                        except Exception as sign_err:
+                            self._log.warning(f"KAD_SIGN_ERR {sign_err}")
+                            return False  # TP-6: skip PUT on signing failure
+
+                    await self._send_plugin_message(
+                        peer["node_id"], peer["host"], peer["port"],
+                        "PUT_PROVIDER", payload
+                    )
+                    return True
+                except Exception:
+                    return False
+
+            # KAD-02: Use create_task for parallel republish (not blocking await)
+            tasks = []
             for peer in closest[:self.k]:
-                await self._send_plugin_message(
-                    peer["node_id"], peer["host"], peer["port"],
-                    "PUT_PROVIDER", payload
-                )
+                tasks.append(asyncio.create_task(_put_to_peer(peer)))
+
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                sent = sum(1 for r in results if r is True)
+            else:
+                sent = 0
+
+            # TP-4: Flag failure when no PUTs succeeded so gossip fallback is allowed
+            if sent == 0:
+                self._kad_put_failed[skill_key] = True
 
             if self._debug:
-                self._log.info(f"KAD_PUT_BROADCAST skill={skill_key} path={path} targets={len(closest[:self.k])}")
+                self._log.info(f"KAD_PUT_BROADCAST skill={skill_key} path={path} targets={sent}")
         except Exception as e:
             self._log.warning(f"KAD_PUT_ERR skill={skill_key} err={e}")
             self._kad_put_failed[skill_key] = True
@@ -508,6 +793,47 @@ class KademliaPlugin(PluginHooks):
             (peers_in_table >= 10 and filled_buckets >= 5)
             or getattr(health, "peer_count", 0) >= 10
         )
+
+    async def _resolve_pending_evictions(self, peers: list) -> None:
+        """KAD-09: Issue PINGs for newly pending evictions; resolve timed-out ones.
+
+        For each pending eviction:
+        - If no PING sent yet: send PING to oldest, record timestamp.
+        - If PONG received since PING: keep oldest (move to tail), drop candidate.
+        - If timeout elapsed without PONG: evict oldest, add candidate.
+        """
+        pending = self.kbuckets.get_pending_evictions()
+        now = time.monotonic()
+
+        for oldest_id, (candidate_id, c_host, c_port, _) in list(pending.items()):
+            ping_sent = self._ping_sent_at.get(oldest_id)
+
+            if ping_sent is None:
+                # Send PING to oldest node
+                peer_info = self._resolve_peer(oldest_id, peers)
+                if peer_info:
+                    await self._send_plugin_message(
+                        oldest_id, peer_info.host, peer_info.port,
+                        "PING", {"_request_id": f"evict-{oldest_id[:16]}"}
+                    )
+                    self._ping_sent_at[oldest_id] = now
+                    if self._debug:
+                        self._log.info(f"KAD_PING_EVICT target={oldest_id[:16]}")
+            else:
+                # Check if PONG was received after the PING
+                pong_ts = self._pong_received.get(oldest_id, 0)
+                if pong_ts >= ping_sent:
+                    # Oldest is alive — keep it, drop candidate
+                    self.kbuckets.resolve_keep_oldest(oldest_id)
+                    self._ping_sent_at.pop(oldest_id, None)
+                    if self._debug:
+                        self._log.info(f"KAD_EVICT_KEPT oldest={oldest_id[:16]} (responded)")
+                elif now - ping_sent >= self._ping_timeout:
+                    # Timeout — evict oldest, add candidate
+                    self.kbuckets.resolve_evict_oldest(oldest_id)
+                    self._ping_sent_at.pop(oldest_id, None)
+                    if self._debug:
+                        self._log.info(f"KAD_EVICTED oldest={oldest_id[:16]} candidate={candidate_id[:16]}")
 
     async def _sweep_k_buckets(self, health: NodeHealth) -> None:
         bucket_count = len(self.kbuckets.buckets)
@@ -553,9 +879,40 @@ class KademliaPlugin(PluginHooks):
             for peer in peers:
                 self.kbuckets.add_peer(peer.node_id, peer.host, peer.port)
 
+            # KAD-03: Auto-promote passive → full when conditions are met.
+            # passive_locked disables auto-promotion for monitoring-only nodes.
+            if self.mode == "passive":
+                uptime = getattr(health, "uptime_seconds", 0.0)
+                peer_count = getattr(health, "peer_count", 0)
+                if (uptime >= self._auto_promote_min_uptime
+                        and peer_count >= self._auto_promote_min_peers):
+                    self.mode = "full"
+                    self._lookup = IterativeLookup(
+                        local_id=self._ctx.node_id,
+                        kbuckets=self.kbuckets,
+                        send_fn=self._send_plugin_message,
+                        k=self.k,
+                        alpha=self.alpha,
+                        timeout=self.lookup_timeout,
+                    )
+                    self._log.info(
+                        f"KAD_AUTO_PROMOTED mode=full uptime={uptime:.0f}s peers={peer_count}"
+                    )
+                    # TP-15: Self-lookup to populate routing table after promotion
+                    asyncio.create_task(self._lookup.find_nodes(self._ctx.node_id))
+
             # Bucket refresh (full mode only, every 60 min per bucket)
             if self._lookup and self.mode == "full":
                 await self._maybe_refresh_buckets()
+
+            # KAD-02: Republish own provider records (full mode, every ~900s)
+            if self.mode == "full" and self._lookup and self._own_skills:
+                if now - self._last_republish >= self._republish_interval:
+                    self._last_republish = now
+                    for sk, cp in list(self._own_skills.items()):
+                        asyncio.create_task(self._put_provider_to_closest(sk, cp))
+                    if self._debug:
+                        self._log.info(f"KAD_REPUBLISH count={len(self._own_skills)}")
 
             # Gap Mitigations: Prune stale rate limit entries
             if hasattr(self, '_find_node_log'):
@@ -564,6 +921,12 @@ class KademliaPlugin(PluginHooks):
                     del self._find_node_log[k]
 
             await self._sweep_k_buckets(health)
+
+            # KAD-09: Issue PINGs for pending evictions and resolve timed-out ones
+            await self._resolve_pending_evictions(peers)
+
+            # KAD-04: Periodic checkpoint to SQLite (every 5 min)
+            self.kbuckets.maybe_checkpoint()
 
             if self._debug:
                 stats = self.providers.stats()
@@ -575,9 +938,30 @@ class KademliaPlugin(PluginHooks):
         except Exception as e:
             self._log.warning(f"KAD_TICK_ERR {type(e).__name__}: {e}")
 
-    async def on_shutdown(self) -> None:
-        """Log final statistics."""
+    async def iterative_find_node(self, target_id: str) -> list:
+        """KAD-01: Bootstrap self-lookup wrapper.
+
+        Delegates to self._lookup.find_nodes(target_id) when the lookup module
+        is available (full mode).  Returns an empty list gracefully otherwise.
+        """
+        if self._lookup is None:
+            if self._debug:
+                self._log.info("KAD_SELF_LOOKUP_SKIPPED lookup_not_initialized")
+            return []
         try:
+            result = await self._lookup.find_nodes(target_id)
+            if self._debug:
+                self._log.info(f"KAD_SELF_LOOKUP target={target_id[:16]} found={len(result)}")
+            return result
+        except Exception as e:
+            self._log.warning(f"KAD_SELF_LOOKUP_ERR {type(e).__name__}: {e}")
+            return []
+
+    async def on_shutdown(self) -> None:
+        """KAD-04: Save routing table to SQLite and log final statistics."""
+        try:
+            # KAD-04: Flush routing table to DB on shutdown
+            self.kbuckets.save_on_shutdown()
             stats = self.providers.stats()
             b_stats = self.kbuckets.get_bucket_stats()
             self._log.info(

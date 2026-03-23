@@ -94,10 +94,11 @@ def test_price_validation_zero_allowed():
     assert result.price == 0.0
 
 def test_price_validation_negative():
+    """ESC-02: Negative prices are now valid (bounty/escrow pattern)."""
     sheet = {"name": "s", "version": "1.0.0", "description": "d", "tags": ["t"],
              "input_schema": {}, "output_schema": {}, "price": -1.0}
-    with pytest.raises(ValidationError, match="not be negative"):
-        validate_skill_sheet(sheet)
+    result = validate_skill_sheet(sheet)
+    assert result.price == -1.0
 
 def test_price_validation_too_high():
     sheet = {"name": "s", "version": "1.0.0", "description": "d", "tags": ["t"], 
