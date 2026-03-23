@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tarfile
 import urllib.request
@@ -249,6 +250,46 @@ def install_plugin(
     raise ValueError(f"Unsupported plugin source: {source!r}")
 
 
+def _venv_pip_path(data_dir: str) -> str:
+    """Return path to pip in the node's venv."""
+    if sys.platform == "win32":
+        return os.path.join(data_dir, ".venv", "Scripts", "pip.exe")
+    return os.path.join(data_dir, ".venv", "bin", "pip")
+
+
+def _install_plugin_requirements(plugin_dir: str, data_dir: str) -> None:
+    """Install plugin dependencies from requirements.txt if present.
+
+    If pip fails, logs a warning but does not block plugin loading.
+    Also checks for requirements-local.txt and logs an info message.
+    """
+    req_txt = os.path.join(plugin_dir, "requirements.txt")
+    req_local = os.path.join(plugin_dir, "requirements-local.txt")
+
+    if os.path.exists(req_txt):
+        pip = _venv_pip_path(data_dir)
+        if os.path.exists(pip):
+            log.info("PLUGIN_DEPS_INSTALL plugin_dir=%s", plugin_dir)
+            try:
+                result = subprocess.run(
+                    [pip, "install", "-r", req_txt],
+                    capture_output=True, text=True, timeout=300,
+                )
+                if result.returncode != 0:
+                    log.warning("PLUGIN_DEPS_FAIL plugin_dir=%s error=%s",
+                                plugin_dir, result.stderr.strip()[:200])
+                else:
+                    log.info("PLUGIN_DEPS_OK plugin_dir=%s", plugin_dir)
+            except Exception as e:
+                log.warning("PLUGIN_DEPS_FAIL plugin_dir=%s error=%s",
+                            plugin_dir, e)
+        else:
+            log.warning("PLUGIN_DEPS_SKIP reason=no_venv pip_path=%s", pip)
+
+    if os.path.exists(req_local):
+        log.info("PLUGIN_DEPS_LOCAL available: pip install -r %s", req_local)
+
+
 def remove_plugin(name: str, plugin_root: str) -> None:
     dest = os.path.join(plugin_root, name)
     if os.path.exists(dest):
@@ -310,6 +351,10 @@ class PluginManager:
             if installed is None:
                 try:
                     install_plugin(name, plugin_cfg, self._plugin_root, self._staging_dir)
+                    data_dir = self._cfg["node"].get("data_dir", ".")
+                    _install_plugin_requirements(
+                        os.path.join(self._plugin_root, name), data_dir,
+                    )
                 except Exception as e:
                     log.error("PLUGIN_INSTALL_FAIL plugin=%s error=%s", name, e)
             else:
@@ -321,6 +366,10 @@ class PluginManager:
         if not plugin_cfg:
             raise ValueError(f"Plugin '{name}' not in manifest ({self._manifest_path})")
         install_plugin(name, plugin_cfg, self._plugin_root, self._staging_dir)
+        data_dir = self._cfg["node"].get("data_dir", ".")
+        _install_plugin_requirements(
+            os.path.join(self._plugin_root, name), data_dir,
+        )
 
     def remove(self, name: str) -> None:
         remove_plugin(name, self._plugin_root)

@@ -230,6 +230,28 @@ def cmd_rollback(args: argparse.Namespace) -> None:
     print(f"Rolled back to v{target}. Restart knarr-watchman to apply.")
 
 
+def cmd_init(args: argparse.Namespace) -> None:
+    """Bootstrap a new knarr node from scratch."""
+    data_dir = args.data_dir
+    if not data_dir:
+        print("Error: --data-dir is required for init", file=sys.stderr)
+        sys.exit(1)
+
+    from .init import run_init
+
+    try:
+        run_init(
+            data_dir=data_dir,
+            force=args.force,
+            enable_thrall=args.enable_thrall,
+            github_token=args.github_token,
+            wheel=args.wheel,
+        )
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_plugin(args: argparse.Namespace) -> None:
     """Dispatch plugin subcommands."""
     cfg = load_config(args.config)
@@ -297,6 +319,23 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command")
     sub.required = True
+
+    # --- init ---
+    init_p = sub.add_parser("init", help="Bootstrap a new knarr node")
+    init_p.add_argument("--force", action="store_true",
+                        help="Regenerate identity and vault (does not touch configs)")
+    init_p.add_argument("--github-token", default=None,
+                        help="GitHub API token for authenticated requests")
+    init_p.add_argument("--wheel", default=None,
+                        help="Install knarr from local .whl (air-gapped)")
+    thrall_group = init_p.add_mutually_exclusive_group()
+    thrall_group.add_argument("--enable-thrall", action="store_const",
+                              const=True, dest="enable_thrall",
+                              help="Enable Thrall without prompting")
+    thrall_group.add_argument("--no-thrall", action="store_const",
+                              const=False, dest="enable_thrall",
+                              help="Disable Thrall without prompting")
+    init_p.set_defaults(func=cmd_init, enable_thrall=None)
 
     run_p = sub.add_parser("run", help="Start watchman supervisor (foreground)")
     run_p.set_defaults(func=cmd_run)
