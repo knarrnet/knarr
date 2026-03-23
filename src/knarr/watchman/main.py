@@ -322,6 +322,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # --- init ---
     init_p = sub.add_parser("init", help="Bootstrap a new knarr node")
+    init_p.add_argument("--data-dir", default=None,
+                        help="Target data directory (required for init)")
     init_p.add_argument("--force", action="store_true",
                         help="Regenerate identity and vault (does not touch configs)")
     init_p.add_argument("--github-token", default=None,
