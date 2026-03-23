@@ -315,10 +315,14 @@ def _write_watchman_toml(data_dir: str) -> bool:
     # Use forward slashes for TOML compatibility on Windows
     data_dir_toml = data_dir.replace("\\", "/")
 
+    # Use venv python + module invocation so the command works regardless
+    # of whether knarr is on system PATH (standalone binary installs to venv)
+    venv_python = _python_in_venv(data_dir).replace("\\", "/")
+
     content = f"""\
 [node]
-command = "knarr"
-args = ["serve"]
+command = "{venv_python}"
+args = ["-m", "knarr", "serve"]
 data_dir = "{data_dir_toml}"
 
 [health]
@@ -460,8 +464,13 @@ def run_init(
     print("node identity and encrypted secrets and cannot be recovered")
     print("if lost.")
     print()
+    # Point to the venv's knarr-watchman script (works even if not on system PATH)
+    if sys.platform == "win32":
+        venv_watchman = os.path.join(data_dir, ".venv", "Scripts", "knarr-watchman.exe")
+    else:
+        venv_watchman = os.path.join(data_dir, ".venv", "bin", "knarr-watchman")
     print("To start your node:")
-    print(f"  knarr-watchman --data-dir {data_dir} run")
+    print(f"  \"{venv_watchman}\" --data-dir \"{data_dir}\" run")
     print("=" * 60)
 
     return {
