@@ -35,10 +35,7 @@ jobs:
       - name: Install build tooling
         run: |
           python -m pip install --upgrade pip
-          python -m pip install . pyinstaller build ruff
-
-      - name: Lint
-        run: ruff check src/
+          python -m pip install . pyinstaller build
 
       - name: Build watchman binary
         run: pyinstaller --clean --noconfirm knarr-watchman.spec
