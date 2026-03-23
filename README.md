@@ -487,14 +487,57 @@ Show node identity, reputation data, and ledger summary.
 For production deployments, use `knarr-watchman` — a process supervisor that runs
 alongside your node and handles crash recovery, health monitoring, and staged upgrades.
 
-### Install
+### Bootstrap a new node
 
-Watchman is included in the knarr package. After `pip install`, `knarr-watchman` is
-available as a CLI command.
+The fastest way to set up a production node from scratch:
+
+```bash
+pip install git+https://github.com/knarrnet/knarr.git
+knarr-watchman init --data-dir /var/lib/knarr
+```
+
+This single command:
+1. Detects a suitable Python (3.11+)
+2. Creates the data directory structure
+3. Creates a virtual environment and installs knarr
+4. Generates Ed25519 identity, Solana wallet, and encrypted vault
+5. Writes default `knarr.toml` and `watchman.toml`
+6. Prompts whether to enable the Thrall intelligence layer
+
+```
+Python: python3
+Creating virtual environment...
+Installed knarr 0.51.1
+Checking identity...
+============================================================
+Node initialized successfully!
+  Node ID:   a1b2c3d4...
+  Wallet:    7Xk9...
+  Version:   0.51.1
+  Data dir:  /var/lib/knarr
+
+WARNING: Back up node.db and vault.db — these contain your
+node identity and encrypted secrets and cannot be recovered
+if lost.
+
+To start your node:
+  knarr-watchman --data-dir /var/lib/knarr run
+============================================================
+```
+
+| Flag | Description |
+|------|-------------|
+| `--data-dir` | Target directory (required) |
+| `--force` | Regenerate identity even if one exists |
+| `--wheel <path>` | Install from a local `.whl` file (air-gapped) |
+| `--github-token` | GitHub API token (avoids rate limits) |
+| `--enable-thrall` | Enable Thrall without prompting |
+| `--no-thrall` | Disable Thrall without prompting |
 
 ### Configure
 
-Copy `contrib/watchman.toml.example` to your data directory and adjust:
+After `init`, edit the generated configs in your data directory. Or start from
+`contrib/watchman.toml.example` if you prefer manual setup:
 
 ```toml
 [node]
