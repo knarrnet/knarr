@@ -4,7 +4,8 @@ from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
-project_root = Path(__file__).resolve().parent
+# SPECPATH is set by PyInstaller; __file__ is not available in spec context
+project_root = Path(SPECPATH)
 
 datas = collect_data_files("knarr")
 hiddenimports = collect_submodules("nacl") + collect_submodules("cryptography")
