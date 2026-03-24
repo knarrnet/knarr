@@ -869,41 +869,48 @@ class CockpitServer:
                 self._respond_error(writer, 404, f"Cannot resolve address for node {target_id[:16]}...")
                 return
 
-        try:
-            result = await self._node.submit_async_task(
-                provider["node_id"], provider["host"], provider["port"],
-                skill, task_input, timeout_ms=timeout_ms
-            )
-            if result.status in ("accepted", "queued"):
-                # Store local tracking entry for remote job
-                expires_at = time.time() + 86400
-                self._node.storage.insert_remote_job(
-                    result.task_id, skill, provider["node_id"],
-                    provider["host"], provider["port"], expires_at
+        # Fire-and-forget: return job_id immediately, track in background.
+        # submit_async_task blocks up to 60s waiting for remote ACK — at scale
+        # this starves the cockpit HTTP handler (BR-cockpit-deadlock-150-nodes).
+        import uuid as _uuid
+        job_id = str(_uuid.uuid4())
+        expires_at = time.time() + 86400
+        self._node.storage.insert_remote_job(
+            job_id, skill, provider["node_id"],
+            provider["host"], provider["port"], expires_at
+        )
+
+        async def _submit_and_track():
+            try:
+                result = await self._node.submit_async_task(
+                    provider["node_id"], provider["host"], provider["port"],
+                    skill, task_input, timeout_ms=timeout_ms
                 )
-                self._respond(writer, "202 Accepted", "application/json", json.dumps({
-                    "status": result.status,
-                    "job_id": result.task_id,
-                    "position": getattr(result, "position", 0)
-                }).encode("utf-8"))
-            elif result.status == "completed":
-                expires_at = time.time() + 86400
-                self._node.storage.insert_remote_job(
-                    result.task_id, skill, provider["node_id"],
-                    provider["host"], provider["port"], expires_at
+                if result.status in ("accepted", "queued", "completed"):
+                    self._node.storage.update_async_job_status(
+                        job_id, result.status
+                    )
+                else:
+                    reason = getattr(result, "reason", "") or result.status
+                    self._node.storage.update_async_job_status(
+                        job_id, "failed", error={"message": reason}
+                    )
+            except asyncio.TimeoutError:
+                self._node.storage.update_async_job_status(
+                    job_id, "failed", error={"message": "Provider timeout"}
                 )
-                self._respond(writer, "200 OK", "application/json", json.dumps({
-                    "status": "completed",
-                    "job_id": result.task_id,
-                }).encode("utf-8"))
-            else:
-                reason = getattr(result, "reason", "") or result.status
-                self._respond_error(writer, 409, f"Task rejected: {reason}")
-        except asyncio.TimeoutError:
-            self._respond_error(writer, 503, "Provider timeout — retry later")
-        except Exception as e:
-            logger.error(f"API remote async execute failed: {e}")
-            self._respond_error(writer, 500, "Task submission failed")
+            except Exception as e:
+                logger.error(f"API remote async execute failed: {e}")
+                self._node.storage.update_async_job_status(
+                    job_id, "failed", error={"message": str(e)}
+                )
+
+        asyncio.create_task(_submit_and_track())
+        self._respond(writer, "202 Accepted", "application/json", json.dumps({
+            "status": "accepted",
+            "job_id": job_id,
+            "position": 0
+        }).encode("utf-8"))
 
     def _handle_asset_list(self, writer):
         """GET /api/assets — List local sidecar assets."""
