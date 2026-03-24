@@ -31,6 +31,10 @@ class SyncEngine:
         # M-018: Per-peer delivery state tracking
         self._peer_delivery_state: Dict[str, Dict[str, Any]] = {}  # node_id -> {last_attempt, consecutive_failures, next_retry_after, circuit_open}
 
+        # v0.51.3: Dispatch failure tracking — cap retries to prevent memory leak
+        self._dispatch_failures: Dict[str, int] = {}  # item_id -> failure count
+        self._dispatch_max_retries = 3
+
         # v0.39.0 C3: Mail circuit breaker — per-peer failure tracking
         self._circuit_state: Dict[str, Dict[str, Any]] = {}
         self._circuit_backoff_steps = [30, 60, 120, 300]  # seconds
@@ -869,6 +873,11 @@ class SyncEngine:
 
     async def _dispatch_system_item(self, item: dict):
         """Dispatch a system mail item to its registered handler."""
+        item_id = item.get("item_id", "")
+        if item_id and self._dispatch_failures.get(item_id, 0) >= self._dispatch_max_retries:
+            self._log.warning("MAIL_DISPATCH_ABANDONED item=%s type=%s retries=%d",
+                              item_id[:8], item.get("msg_type", "?"), self._dispatch_max_retries)
+            return
         msg_type = item.get("msg_type", "")
         handler = self._mail_handlers.get(msg_type)
         if handler:
@@ -933,6 +942,8 @@ class SyncEngine:
                 await handler(dispatch_item)
             except Exception:
                 self._log.error(f"System mail handler failed for {msg_type}", exc_info=True)
+                if item_id:
+                    self._dispatch_failures[item_id] = self._dispatch_failures.get(item_id, 0) + 1
         else:
             self._log.warning(f"No handler for system mail type: {msg_type}")
 

@@ -35,6 +35,14 @@ class Storage:
         self._keepalive_conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._keepalive_conn.execute("PRAGMA journal_mode=WAL")
         self._keepalive_conn.execute("PRAGMA busy_timeout=5000")
+        # v0.51.3: detect DB corruption from OOM kills during WAL writes
+        if db_path != ":memory:":
+            try:
+                result = self._keepalive_conn.execute("PRAGMA integrity_check(1)").fetchone()
+                if result and result[0] != "ok":
+                    logger.warning("STORAGE_INTEGRITY_FAIL db=%s result=%s", db_path, result[0])
+            except sqlite3.DatabaseError as e:
+                logger.error("STORAGE_CORRUPT db=%s err=%s — consider deleting node.db (identity is in vault.db)", db_path, e)
         self._init_db()
 
     def _init_db(self):
