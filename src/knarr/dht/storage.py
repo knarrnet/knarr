@@ -1965,6 +1965,20 @@ class Storage:
         conn.commit()
         logger.debug(f"RECEIPT_LOG_WRITE receipt_id={receipt_id[:16]} type={document_type}")
 
+    def get_receipt(self, receipt_id: str) -> Optional[Dict]:
+        """Look up a receipt by ID from the append-only receipt_log."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT receipt_id, document_type, timestamp, identity, counterparty, "
+            "order_ref, proof_purpose, payload_json, signature, created_at "
+            "FROM receipt_log WHERE receipt_id = ?", (receipt_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return dict(zip(["receipt_id", "document_type", "timestamp", "identity",
+                         "counterparty", "order_ref", "proof_purpose",
+                         "payload_json", "signature", "created_at"], row))
+
     def update_receipt_quality(self, task_id: str, quality_rating: int):
         """Store quality_rating from commerce receipt in execution_log."""
         conn = self._get_conn()
