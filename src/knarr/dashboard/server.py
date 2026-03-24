@@ -860,11 +860,10 @@ class CockpitServer:
         # Resolve host/port from peer table when only node_id provided (V011-005)
         if provider.get("node_id") and not provider.get("host"):
             target_id = provider["node_id"]
-            for peer in self._node.storage.get_peers():
-                if peer.node_id == target_id:
-                    provider["host"] = peer.host
-                    provider["port"] = peer.port
-                    break
+            peer = self._node.storage.get_peer_by_id(target_id)
+            if peer:
+                provider["host"] = peer.host
+                provider["port"] = peer.port
             if not provider.get("host"):
                 self._respond_error(writer, 404, f"Cannot resolve address for node {target_id[:16]}...")
                 return

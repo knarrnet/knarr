@@ -411,6 +411,16 @@ class Storage:
         cursor = conn.execute("SELECT node_id, host, port FROM peers")
         return [NodeInfo(node_id=row[0], host=row[1], port=row[2]) for row in cursor.fetchall()]
 
+    def get_peer_by_id(self, node_id: str) -> Optional[NodeInfo]:
+        """Look up a single peer by node_id. O(1) via PK index."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT node_id, host, port FROM peers WHERE node_id = ?", (node_id,)
+        ).fetchone()
+        if row:
+            return NodeInfo(node_id=row[0], host=row[1], port=row[2])
+        return None
+
     def get_cached_peers(self, max_age_hours: float = 24, limit: int = 10) -> List[NodeInfo]:
         """Returns peers seen within max_age_hours, ordered by most recent first."""
         conn = self._get_conn()

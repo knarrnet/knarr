@@ -3075,7 +3075,7 @@ class DHTNode:
                         # v0.17.4: Push pending mail on any inbound activity (not just heartbeats)
                         # Without this, frequent announces reset silence timer, preventing outbound
                         # heartbeats, which were the only trigger for mail push.
-                        peer_info = next((p for p in self.storage.get_peers() if p.node_id == signer_id), None)
+                        peer_info = self.storage.get_peer_by_id(signer_id)
                         if peer_info:
                             h, p = self.resolve_peer(peer_info.node_id, peer_info.host, peer_info.port)
                             asyncio.create_task(self._sync.push_to_peer(peer_info.node_id, h, p))
@@ -3376,7 +3376,7 @@ class DHTNode:
                 logger.debug(f"HB_RECV from={msg.node_id[:16]} — DB touched")
 
                 # v0.17.0: If they pinged us, try to push any mail we have for them
-                peer_info = next((p for p in self.storage.get_peers() if p.node_id == msg.node_id), None)
+                peer_info = self.storage.get_peer_by_id(msg.node_id)
                 if peer_info:
                     h, p = self.resolve_peer(peer_info.node_id, peer_info.host, peer_info.port)
                     asyncio.create_task(self._sync.push_to_peer(peer_info.node_id, h, p))
@@ -3932,7 +3932,7 @@ class DHTNode:
         """
         _debug = self._config.get("mail", {}).get("debug", False)
         # Resolve address: peer table first, then peer_override with dummy
-        peer_info = next((p for p in self.storage.get_peers() if p.node_id == node_id), None)
+        peer_info = self.storage.get_peer_by_id(node_id)
         if peer_info:
             h, p = self.resolve_peer(peer_info.node_id, peer_info.host, peer_info.port)
         else:

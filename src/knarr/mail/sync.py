@@ -720,8 +720,8 @@ class SyncEngine:
             if to_node == self._node.node_info.node_id:
                 await self._self_deliver(to_node)
                 continue
-            # Try peer table first
-            peer_info = next((p for p in self._node.storage.get_peers() if p.node_id == to_node), None)
+            # Try peer table first — direct PK lookup, not full table scan
+            peer_info = self._node.storage.get_peer_by_id(to_node)
             if peer_info:
                 h, p = self._node.resolve_peer(peer_info.node_id, peer_info.host, peer_info.port)
                 await self.push_to_peer(to_node, h, p)
@@ -1014,7 +1014,7 @@ class SyncEngine:
     async def _pull_from_peer(self, peer_node_id: str) -> int:
         """Send MAIL_PULL_REQ to a specific peer. Returns count of items received."""
         # C-13: Skip peers that don't support mail pull (pre-v0.26.0)
-        peer_info = next((p for p in self._node.storage.get_peers() if p.node_id == peer_node_id), None)
+        peer_info = self._node.storage.get_peer_by_id(peer_node_id)
         if peer_info and hasattr(peer_info, 'version') and peer_info.version:
             try:
                 parts = peer_info.version.split(".")
