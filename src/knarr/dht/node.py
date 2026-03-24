@@ -5932,6 +5932,13 @@ class DHTNode:
         retention_days = int(node_cfg.get("housekeeping_retention_days", 7))
         await self._enqueue_write(self.storage.delete_old_expired_jobs, retention_days)
 
+        # Receipt log: prune old entries (default 7 days)
+        receipt_ttl_hours = float(node_cfg.get("receipt_retention_hours", 168))
+        await self._enqueue_write(self.storage.purge_receipt_log_by_age, receipt_ttl_hours * 3600)
+
+        # Settlement queue: prune processed items older than 24h
+        await self._enqueue_write(self.storage.purge_settled_queue, 86400)
+
     def _get_skill_ttl(self) -> int:
         """Scale skill TTL with network size."""
         peer_count = len(self.storage.get_peers())

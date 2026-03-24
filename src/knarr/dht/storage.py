@@ -589,7 +589,7 @@ class Storage:
         conn.execute("DELETE FROM skills WHERE skill_key = ? AND provider_node_id = ?", (skill_key, provider_node_id))
         conn.commit()
 
-    def query_all_active_skills(self, peer_timeout: float = 300) -> List[Dict[str, Any]]:
+    def query_all_active_skills(self, peer_timeout: float = 300, limit: int = 2000) -> List[Dict[str, Any]]:
         """Returns all active (non-expired) skills — both remote and own.
         Uses LEFT JOIN so gossip-discovered providers (not in peer table) are still visible.
         Falls back to skill-table provider_host/provider_port when peer table has no entry."""
@@ -605,7 +605,8 @@ class Storage:
             WHERE (s.announced_at + s.ttl) > ?
               AND s.is_own = 0
               AND (p.last_seen > ? OR (p.last_seen IS NULL AND s.provider_host != ''))
-        """, (now, now - peer_timeout))
+            LIMIT ?
+        """, (now, now - peer_timeout, limit))
         results = []
         for row in cursor.fetchall():
             # Prefer peer table address, fall back to skill-embedded address
@@ -1655,6 +1656,30 @@ class Storage:
             logger.info(f"EXECLOG_PURGE ttl={max_age_seconds:.0f}s deleted={deleted}")
         return deleted
 
+    def purge_receipt_log_by_age(self, max_age_seconds: float) -> int:
+        """Delete receipt_log entries older than max_age_seconds."""
+        conn = self._get_conn()
+        cutoff = time.time() - max_age_seconds
+        cursor = conn.execute("DELETE FROM receipt_log WHERE created_at < ?", (cutoff,))
+        conn.commit()
+        deleted = cursor.rowcount
+        if deleted:
+            logger.info(f"RECEIPT_LOG_PURGE ttl={max_age_seconds:.0f}s deleted={deleted}")
+        return deleted
+
+    def purge_settled_queue(self, max_age_seconds: float = 86400) -> int:
+        """Delete processed settlement_queue entries older than max_age_seconds."""
+        conn = self._get_conn()
+        cutoff = time.time() - max_age_seconds
+        cursor = conn.execute(
+            "DELETE FROM settlement_queue WHERE status = 'processed' AND processed_at < ?",
+            (cutoff,))
+        conn.commit()
+        deleted = cursor.rowcount
+        if deleted:
+            logger.info(f"SETTLEMENT_QUEUE_PURGE ttl={max_age_seconds:.0f}s deleted={deleted}")
+        return deleted
+
     # Mail v2 Outbox Methods
 
     def enqueue_outbox(self, item_id: str, to_node: str, body_json: str, ttl_expires: float) -> int:
@@ -1982,11 +2007,6 @@ class Storage:
     def update_receipt_quality(self, task_id: str, quality_rating: int):
         """Store quality_rating from commerce receipt in execution_log."""
         conn = self._get_conn()
-        # Add quality_rating column if not exists (migration)
-        try:
-            conn.execute("ALTER TABLE execution_log ADD COLUMN quality_rating INTEGER")
-        except Exception:
-            pass  # Column already exists
         conn.execute(
             "UPDATE execution_log SET quality_rating = ? WHERE job_id = ?",
             (quality_rating, task_id)
@@ -2016,11 +2036,6 @@ class Storage:
     def get_cumulative_refund(self, task_id: str) -> float:
         """B3/S-021: Get cumulative refund amount for a task."""
         conn = self._get_conn()
-        # Add refund_total column if not exists (migration safety)
-        try:
-            conn.execute("ALTER TABLE execution_log ADD COLUMN refund_total REAL NOT NULL DEFAULT 0.0")
-        except Exception:
-            pass  # column already exists
         row = conn.execute(
             "SELECT refund_total FROM execution_log WHERE job_id = ?",
             (task_id,)
@@ -2034,11 +2049,6 @@ class Storage:
         The check-and-update is a single SQL statement to prevent TOCTOU races.
         """
         conn = self._get_conn()
-        # Add refund_total column if not exists (migration safety)
-        try:
-            conn.execute("ALTER TABLE execution_log ADD COLUMN refund_total REAL NOT NULL DEFAULT 0.0")
-        except Exception:
-            pass  # column already exists
         # Atomic: only update if refund_total + amount <= price * 2
         cursor = conn.execute(
             "UPDATE execution_log SET refund_total = refund_total + ? "
