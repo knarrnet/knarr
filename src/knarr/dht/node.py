@@ -37,6 +37,7 @@ from .sidecar import AssetSidecar, TaskContext
 from .pool import ConnectionPool
 from .plugins import PluginLoader, NodeHealth
 from .eventbus import EventBus
+from . import profiling as _profiling
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,10 @@ class DHTNode:
                  config: Optional[Dict[str, Any]] = None, ephemeral: bool = False,
                  signing_key: Optional[SigningKey] = None):
         self._main_loop = None  # set in start() via asyncio.get_running_loop()
+        # F-01: Start tracemalloc if KNARR_TRACEMALLOC=1 is set
+        _profiling.start()
         self.storage = Storage(storage_path)
+        _profiling.take_snapshot("storage_init")
         network_cfg = (config or {}).get("network", {})
         self._pool = ConnectionPool(max_connections=int(network_cfg.get("max_connections", 50)))
         self._connection_idle_timeout = float(network_cfg.get("connection_idle_timeout", 300))
@@ -120,18 +124,21 @@ class DHTNode:
         self._init_encryption()
 
         # Migrate TOML pricing discounts to SQL (one-time, v0.28.0)
+        # PRE-01 #7: use storage.upsert_discount_rule() instead of raw _get_conn()
         toml_discounts = self._config.get("pricing", {}).get("discounts", {})
         if toml_discounts:
             try:
-                conn = self.storage._get_conn()
-                existing = conn.execute("SELECT COUNT(*) FROM pricing_discounts").fetchone()[0]
-                if existing == 0:
+                existing_discounts = self.storage.get_pricing_discounts()
+                if not existing_discounts:
                     for group_name, pct_off in toml_discounts.items():
-                        conn.execute("""
-                            INSERT OR IGNORE INTO pricing_discounts (name, group_name, skill_group, effect_pct, priority, active, created_at)
-                            VALUES (?, ?, '*', ?, 0, 1, ?)
-                        """, (f"toml_{group_name}", group_name, float(pct_off), time.time()))
-                    conn.commit()
+                        self.storage.upsert_discount_rule(
+                            name=f"toml_{group_name}",
+                            group_name=group_name,
+                            skill_group="*",
+                            effect_pct=float(pct_off),
+                            priority=0,
+                            active=1,
+                        )
                     logger.info(f"Migrated {len(toml_discounts)} TOML discount(s) to SQL")
             except Exception as e:
                 logger.warning(f"TOML discount migration: {e}")
@@ -1277,27 +1284,17 @@ class DHTNode:
         return hashlib.sha256(verify_key.encode()).hexdigest()
 
     def _cleanup_zombie_tasks(self):
-        """Fix #13: Transition zombie 'running' tasks in execution_log and async_jobs to 'failed'."""
-        conn = self.storage._get_conn()
-        now = time.time()
+        """Fix #13: Transition zombie 'running' tasks in execution_log and async_jobs to 'failed'.
+
+        PRE-01 #2: Uses storage.cleanup_zombie_tasks() instead of raw _get_conn().
+        """
         configured_ms = self._config.get("task", {}).get("max_task_timeout", 300000)
         timeout_sec = max(configured_ms // 1000, 300) if configured_ms else 86400
-        cursor = conn.execute(
-            "UPDATE execution_log SET status = 'failed', error = ? WHERE status = 'running' AND (created_at + ?) < ?",
-            (json.dumps({"error": "node_restart"}), timeout_sec, now)
-        )
-        conn.commit()
-        if cursor.rowcount > 0:
-            logger.warning(f"Cleaned up {cursor.rowcount} zombie tasks in execution_log")
-
-        cursor2 = conn.execute(
-            "UPDATE async_jobs SET status = 'failed' "
-            "WHERE status IN ('running', 'accepted') AND (created_at + ?) < ?",
-            (timeout_sec, now)
-        )
-        conn.commit()
-        if cursor2.rowcount > 0:
-            logger.warning(f"Cleaned up {cursor2.rowcount} zombie async jobs")
+        exec_count, async_count = self.storage.cleanup_zombie_tasks(timeout_sec)
+        if exec_count > 0:
+            logger.warning(f"Cleaned up {exec_count} zombie tasks in execution_log")
+        if async_count > 0:
+            logger.warning(f"Cleaned up {async_count} zombie async jobs")
 
     def _init_encryption(self):
         """Derives X25519 keys from Ed25519 signing key for node-level encryption."""
@@ -1701,6 +1698,7 @@ class DHTNode:
 
         # V015: Load plugins
         self._plugins.load_plugins()
+        _profiling.take_snapshot("plugin_load")
 
         # v0.22.0: Pass group engine and storage path to plugin contexts
         storage_path_str = self.storage.db_path if hasattr(self.storage, 'db_path') else None  # F-2 fix
@@ -1997,6 +1995,7 @@ class DHTNode:
             logger.info("BOOTSTRAP_JOIN_COMPLETE clearing bootstrap peer list")
             asyncio.get_running_loop().create_task(self._self_populate_routing_table())
 
+        _profiling.take_snapshot("join")
         return joined
 
     async def _process_sync_response(self, resp: SyncResponse):
@@ -2578,6 +2577,8 @@ class DHTNode:
             })
             self._skill_visibility["knarr-static"] = "private"
             logger.info("System skill registered: knarr-static")
+
+        _profiling.take_snapshot("register_system_skills")
 
     async def call_local(self, skill_name: str, input_data: Dict[str, Any],
                          timeout_ms: int = 30000) -> Dict[str, Any]:
@@ -4439,15 +4440,8 @@ class DHTNode:
         result = []
         for rep in reputations:
             node_id = rep["provider_node_id"]
-            # Try to find matching ledger entry via tasks table
-            # (provider_public_key links tasks to ledger)
-            conn = self.storage._get_conn()
-            cursor = conn.execute(
-                "SELECT DISTINCT provider_public_key FROM tasks WHERE provider_node_id = ? AND provider_public_key != ''",
-                (node_id,)
-            )
-            pub_key_row = cursor.fetchone()
-            pub_key = pub_key_row[0] if pub_key_row else ""
+            # PRE-01 helper: use storage method instead of raw _get_conn()
+            pub_key = self.storage.get_provider_public_key_for_node(node_id) or ""
 
             ledger = ledger_entries.get(pub_key, {})
             avg_quality = self.storage.get_average_quality_rating(node_id)
@@ -4800,6 +4794,7 @@ class DHTNode:
             ))
 
         # 1. Load applicable discounts from SQL
+        # PRE-01 #4: use storage.get_discount_rules() instead of raw _get_conn()
         rules_applied = []
         groups = set()
         if self._group_engine:
@@ -4807,24 +4802,7 @@ class DHTNode:
 
         discount_rows = []
         if groups:
-            try:
-                conn = self.storage._get_conn()
-                placeholders = ",".join("?" * len(groups))
-                rows = conn.execute(f"""
-                    SELECT name, group_name, skill_group, effect_pct, priority
-                    FROM pricing_discounts
-                    WHERE group_name IN ({placeholders})
-                      AND (skill_group = '*' OR skill_group = ?)
-                      AND active = 1
-                    ORDER BY priority DESC
-                """, list(groups) + [skill_name]).fetchall()
-                discount_rows = [
-                    {"name": r[0], "group_name": r[1], "skill_group": r[2], "effect_pct": r[3], "priority": r[4]}
-                    for r in rows
-                ]
-            except Exception as e:
-                logger.warning(f"PRICING_SQL_FAIL: {e}")
-                discount_rows = []
+            discount_rows = self.storage.get_discount_rules(list(groups), skill_name)
 
         # Fallback: TOML discounts (dual-read for one version)
         if not discount_rows and groups:
@@ -4863,17 +4841,8 @@ class DHTNode:
             price = base_price - max_discount
 
         # 4. Compute floor
-        cost_projection = None
-        try:
-            conn = self.storage._get_conn()
-            row = conn.execute(
-                "SELECT total_cost FROM skill_cost_projection WHERE skill_name = ?",
-                (skill_name,)
-            ).fetchone()
-            if row:
-                cost_projection = row[0]
-        except Exception:
-            pass
+        # PRE-01 #6: use storage.get_execution_price() instead of raw _get_conn()
+        cost_projection = self.storage.get_execution_price(skill_name)
 
         markup_min = float(self._config.get("pricing", {}).get("floors", {}).get("markup_minimum", 1.1))
         static_floor = float(self._config.get("pricing", {}).get("min_price", 0.01))
@@ -4926,45 +4895,22 @@ class DHTNode:
             return None
 
     def _get_cost_projection(self, skill_name: str) -> Optional[float]:
-        try:
-            row = self.storage._get_conn().execute(
-                "SELECT total_cost FROM skill_cost_projection WHERE skill_name = ?",
-                (skill_name,),
-            ).fetchone()
-            return float(row[0]) if row and row[0] is not None else None
-        except Exception:
-            return None
+        """PRE-01 #6: use storage.get_execution_price() instead of raw _get_conn()."""
+        return self.storage.get_execution_price(skill_name)
 
     def _load_discount_rules(self, node_id: str, skill_name: str):
+        """PRE-01 #4/#5: use storage.get_discount_rules() instead of raw _get_conn()."""
         from ..commerce.pricing_engine import DiscountRule
 
         groups = set(self._group_engine.get_groups(node_id)) if self._group_engine else set()
-        rules = []
-        if groups:
-            try:
-                conn = self.storage._get_conn()
-                placeholders = ",".join("?" * len(groups))
-                rows = conn.execute(
-                    f"""
-                    SELECT name, group_name, skill_group, effect_pct, priority
-                    FROM pricing_discounts
-                    WHERE group_name IN ({placeholders})
-                      AND (skill_group = '*' OR skill_group = ?)
-                      AND active = 1
-                    ORDER BY priority DESC
-                    """,
-                    list(groups) + [skill_name],
-                ).fetchall()
-                rules = [
-                    DiscountRule(
-                        name=r[0], group_name=r[1], skill_group=r[2],
-                        effect_pct=float(r[3]), priority=int(r[4]),
-                    )
-                    for r in rows
-                ]
-            except Exception as e:
-                logger.warning(f"PRICING_SQL_FAIL: {e}")
-                rules = []
+        rows = self.storage.get_discount_rules(list(groups), skill_name)
+        rules = [
+            DiscountRule(
+                name=r["name"], group_name=r["group_name"], skill_group=r["skill_group"],
+                effect_pct=float(r["effect_pct"]), priority=int(r["priority"]),
+            )
+            for r in rows
+        ]
 
         if not rules and groups:
             for group_name, pct_off in self._config.get("pricing", {}).get("discounts", {}).items():
@@ -5824,6 +5770,11 @@ class DHTNode:
         v0.41.0: flush_outbox, pull_from_correspondents, and _peer_heartbeat_sweep
         have been extracted to independent background task loops.
         """
+        # F-01: Snapshot on first tick, then print report
+        if not getattr(self, "_profiling_first_tick_done", False):
+            self._profiling_first_tick_done = True
+            _profiling.take_snapshot("first_tick")
+            _profiling.print_report()
         await self._enqueue_write(self.storage.cleanup_expired_jobs)
         await self._sync.cleanup()
 
@@ -5861,16 +5812,17 @@ class DHTNode:
                     self.bus.emit("node.event_loop_blocked", blocked_seconds=round(elapsed - 2.0, 1), identity=self.node_info.node_id)
 
     async def _stale_task_watchdog(self):
-        """Reaps tasks stuck in 'accepted' longer than 2x their timeout."""
+        """Reaps tasks stuck in 'accepted' longer than 2x their timeout.
+
+        PRE-01 #8: uses storage.cleanup_stale_tasks() instead of raw _get_conn().
+        """
         while self._running:
             await asyncio.sleep(60)
             try:
                 now = time.time()
-                conn = self.storage._get_conn()
-                cursor = conn.execute(
-                    "SELECT task_id, timeout_ms, created_at FROM tasks WHERE status = 'accepted'"
-                )
-                for task_id, timeout_ms, created_at in cursor.fetchall():
+                # Returns list of (task_id, timeout_ms, created_at) for accepted tasks
+                accepted_rows = self.storage.cleanup_stale_tasks(0)  # returns all accepted rows
+                for task_id, timeout_ms, created_at in accepted_rows:
                     max_age = (timeout_ms / 1000.0) * 2
                     age_seconds = now - created_at
                     if age_seconds > max_age:
@@ -5880,9 +5832,8 @@ class DHTNode:
                         logger.warning(f"Reaped stale task {task_id[:8]} (accepted {age_seconds:.0f}s ago)")
                         # v0.33.0: task.timeout
                         if self.bus:
-                            # Retrieve skill_name from task record
-                            task_row = conn.execute("SELECT skill_name FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
-                            _skill = task_row[0] if task_row else "unknown"
+                            task_obj = self.storage.get_task(task_id)
+                            _skill = task_obj.skill_name if task_obj else "unknown"
                             self.bus.emit("task.timeout", skill_name=_skill, task_id=task_id, age_seconds=round(age_seconds, 1), identity=self.node_info.node_id)
             except Exception as e:
                 logger.debug(f"Stale task watchdog error: {e}")

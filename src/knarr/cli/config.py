@@ -386,6 +386,28 @@ def _safe_toml_key(s: str) -> bool:
     return bool(re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$', s))
 
 
+def _toml_value(v) -> str:
+    """E-06: Recursively convert a Python value to a TOML-safe string.
+
+    Handles bool, str, list, dict (nested inline tables), and numeric types.
+    """
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, str):
+        return f'"{_toml_escape(v)}"'
+    if isinstance(v, list):
+        items = ", ".join(_toml_value(item) for item in v)
+        return f"[{items}]"
+    if isinstance(v, dict):
+        parts = []
+        for key, value in v.items():
+            if not _safe_toml_key(key):
+                continue
+            parts.append(f"{key} = {_toml_value(value)}")
+        return "{%s}" % ", ".join(parts)
+    return str(v)
+
+
 def _serialize_skills_toml(skills: dict) -> str:
     """Serialize skills dict to TOML string with proper escaping."""
     lines = []
@@ -396,18 +418,7 @@ def _serialize_skills_toml(skills: dict) -> str:
         for k, v in scfg.items():
             if not _safe_toml_key(k):
                 continue  # Skip key with unsafe name
-            if isinstance(v, bool):
-                lines.append(f'{k} = {"true" if v else "false"}')
-            elif isinstance(v, str):
-                lines.append(f'{k} = "{_toml_escape(v)}"')
-            elif isinstance(v, list):
-                items = ", ".join(
-                    f'"{_toml_escape(x)}"' if isinstance(x, str) else str(x)
-                    for x in v
-                )
-                lines.append(f"{k} = [{items}]")
-            else:
-                lines.append(f"{k} = {v}")
+            lines.append(f"{k} = {_toml_value(v)}")
         lines.append("")
     return "\n".join(lines)
 

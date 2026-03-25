@@ -433,12 +433,12 @@ def test_e4_mcp_handler_poll_results(node):
     """, ("msg1", "p1", "local", now, '{"out": 1}', "result", now + 86400, "unread", now))
     conn.commit()
 
-    result = handle({
+    result = _run_async(handle({
         "action": "poll_results",
         "_caller_node_id": node.node_info.node_id,
         "limit": 10,
         "status": "unread",
-    })
+    }))
 
     assert "results" in result
     assert result["count"] >= 1

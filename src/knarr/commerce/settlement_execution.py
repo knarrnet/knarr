@@ -29,6 +29,17 @@ from ..core.proof import sign_document, verify_document
 
 logger = logging.getLogger(__name__)
 
+# E-01: Module-level debug flag — set via configure_debug() from node init.
+# Previously, handler code referenced an instance debug attribute without
+# initialization, causing AttributeError on every debug log line.
+_debug = False
+
+
+def configure_debug(node) -> None:
+    """Initialize module-level debug flag from node config. Call once at startup."""
+    global _debug
+    _debug = getattr(node, '_debug', False)
+
 
 async def prepare_settlement(
     node_id: str,
@@ -108,6 +119,13 @@ async def prepare_settlement(
             identity=verification_method,
             counterparty=peer_key,
             payload_json=payload_json_str,
+        )
+
+    if _debug:
+        logger.info(
+            f"SETTLEMENT_PREPARED_DEBUG id={receipt_id[:16]} "
+            f"peer={peer_key[:16]} amount={amount:.2f} "
+            f"proposer_balance={proposer_balance:.4f} utilization={utilization:.4f}"
         )
 
     logger.info(
@@ -317,6 +335,13 @@ async def execute_settlement(
         logger.warning(
             f"SETTLEMENT_MAIL_FAIL peer={peer_key[:16]} "
             f"receipt={receipt_id[:16]}: {mail_err}"
+        )
+
+    if _debug:
+        logger.info(
+            f"SETTLEMENT_EXECUTED_DEBUG receipt={receipt_id[:16]} "
+            f"peer={peer_key[:16]} token_amount={token_amount:.2f} "
+            f"current_balance={current_balance:.4f} credit_limit={credit_limit}"
         )
 
     logger.info(

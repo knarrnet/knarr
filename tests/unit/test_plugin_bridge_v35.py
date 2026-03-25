@@ -45,6 +45,51 @@ class MockStorage:
     def _get_conn(self):
         return self._conn
 
+    def query_receipts_filtered(self, document_type=None, counterparty=None,
+                                 since=None, limit=50):
+        """Mirror Storage.query_receipts_filtered for test mock."""
+        conn = self._conn
+        clauses = []
+        params = []
+        if document_type:
+            clauses.append("document_type = ?")
+            params.append(document_type)
+        if counterparty:
+            clauses.append("counterparty = ?")
+            params.append(counterparty)
+        if since is not None:
+            clauses.append("created_at >= ?")
+            params.append(since)
+        where = " AND ".join(clauses) if clauses else "1=1"
+        sql = (
+            "SELECT receipt_id, document_type, timestamp, identity, counterparty, "
+            "order_ref, proof_purpose, payload_json, signature, created_at "
+            f"FROM receipt_log WHERE {where} ORDER BY created_at DESC LIMIT ?"
+        )
+        params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
+        results = []
+        for row in rows:
+            payload = {}
+            try:
+                payload = json.loads(row[7]) if row[7] else {}
+            except (json.JSONDecodeError, TypeError):
+                pass
+            results.append({
+                "receipt_id": row[0],
+                "document_type": row[1],
+                "timestamp": row[2],
+                "identity": row[3],
+                "counterparty": row[4],
+                "order_ref": row[5],
+                "proof_purpose": row[6],
+                "payload_json": row[7],
+                "payload": payload,
+                "signature": row[8],
+                "created_at": row[9],
+            })
+        return results
+
     def insert(self, receipt_id, document_type, counterparty=None,
                payload=None, created_at=None):
         now = created_at or time.time()
