@@ -73,18 +73,17 @@ def test_announce_jurisdiction_field():
 # ── Pricing Discount Tests ────────────────────────────────────
 
 def _make_node_mock(config, groups):
-    """Helper: build a MagicMock node with SQL returning empty (uses TOML fallback)."""
+    """Helper: build a MagicMock node with Storage API returning empty (uses TOML fallback)."""
     from unittest.mock import MagicMock
     node = MagicMock()
     node._config = config
     engine = MagicMock()
     engine.get_groups.return_value = groups
     node._group_engine = engine
-    # Return empty from SQL (pricing_discounts table) so TOML fallback is used
-    cursor = MagicMock()
-    cursor.fetchall.return_value = []
-    cursor.fetchone.return_value = None
-    node.storage._get_conn.return_value.execute.return_value = cursor
+    # PRE-01: Return empty from storage.get_discount_rules() so TOML fallback is used
+    node.storage.get_discount_rules.return_value = []
+    # PRE-01: get_execution_price returns None (no cost data)
+    node.storage.get_execution_price.return_value = None
     return node
 
 

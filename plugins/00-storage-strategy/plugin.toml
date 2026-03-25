@@ -1,0 +1,29 @@
+name = "knarr-storage-strategy"
+version = "0.1.0"
+handler = "handler:StorageStrategyPlugin"
+description = "Storage caching, async reads, archive rotation, and pruning for knarr nodes"
+
+[config]
+debug = false
+
+[config.cache]
+# TTL in seconds for each method group
+peers_ttl = 30
+skills_ttl = 60
+economy_ttl = 10
+own_skills_ttl = 120
+
+[config.retention]
+# Per-table retention in seconds (0 = keep forever)
+receipt_log = 604800        # 7 days, archived before deletion
+execution_log = 604800      # 7 days, archived before deletion
+async_jobs = 86400          # 1 day, deleted
+settlement_queue = 259200   # 3 days, deleted
+
+[config.archive]
+# Base directory for archive files (relative to node data_dir)
+archive_dir = "archives"
+# Compress archives with gzip (true/false)
+compress = true
+# Encrypt and sign archives (requires vault key)
+encrypt = false

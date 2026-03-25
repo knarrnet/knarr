@@ -705,6 +705,41 @@ class SyncEngine:
         if self._debug:
             self._log.info(f"MAIL_ACK_HANDLE from={msg.sender_node_id[:16]} confirmed={len(msg.item_ids)}")
 
+    async def _flush_one_recipient(self, to_node: str) -> None:
+        """Deliver outbox items to a single recipient.
+
+        C-01: Extracted so flush_outbox can run all recipients in parallel via asyncio.gather.
+        """
+        if to_node == self._node.node_info.node_id:
+            await self._self_deliver(to_node)
+            return
+        # Try peer table first — direct PK lookup, not full table scan
+        peer_info = self._node.storage.get_peer_by_id(to_node)
+        if peer_info:
+            h, p = self._node.resolve_peer(peer_info.node_id, peer_info.host, peer_info.port)
+            await self.push_to_peer(to_node, h, p)
+        else:
+            # Not in peer table — try resolve_peer with dummy address (peer_override may resolve it)
+            h, p = self._node.resolve_peer(to_node, "0.0.0.0", 0)
+            if h != "0.0.0.0" and p != 0:
+                if self._debug:
+                    self._log.info(f"MAIL_FLUSH_ORPHAN to={to_node[:16]} via override {h}:{p}")
+                await self.push_to_peer(to_node, h, p)
+            else:
+                # Fall back to skill table address (gossip-discovered providers)
+                skill_addr = self._node.storage.get_provider_address(to_node)
+                if skill_addr:
+                    sh, sp = skill_addr
+                    if self._debug:
+                        self._log.info(f"MAIL_FLUSH_SKILL to={to_node[:16]} via skill table {sh}:{sp}")
+                    await self.push_to_peer(to_node, sh, sp)
+                else:
+                    self._log.warning(f"MAIL_FLUSH_SKIP to={to_node[:16]} (not in peers, no override, no skill address)")
+                    _bus = getattr(self._node, 'bus', None)
+                    if _bus:
+                        # Valid reason values: "no_route"
+                        _bus.emit("mail.flush_skip", to_node=to_node[:16], reason="no_route")
+
     async def flush_outbox(self):
         """Sweep outbox for pending recipients and push, even if not in peer table.
 
@@ -712,40 +747,22 @@ class SyncEngine:
         heartbeat ticks to known peers, but a peer may not be in the routing
         table yet (e.g. same-LAN nodes that fail NAT hairpin discovery).
         Uses resolve_peer() which applies peer_overrides for address resolution.
+
+        C-01: Recipients are flushed in parallel via asyncio.gather so that a
+        slow or unreachable peer does not stall delivery to all other recipients.
         """
         recipients = self._node.storage.get_outbox_recipients()
         if not recipients:
             return
-        for to_node in recipients:
-            if to_node == self._node.node_info.node_id:
-                await self._self_deliver(to_node)
-                continue
-            # Try peer table first — direct PK lookup, not full table scan
-            peer_info = self._node.storage.get_peer_by_id(to_node)
-            if peer_info:
-                h, p = self._node.resolve_peer(peer_info.node_id, peer_info.host, peer_info.port)
-                await self.push_to_peer(to_node, h, p)
-            else:
-                # Not in peer table — try resolve_peer with dummy address (peer_override may resolve it)
-                h, p = self._node.resolve_peer(to_node, "0.0.0.0", 0)
-                if h != "0.0.0.0" and p != 0:
-                    if self._debug:
-                        self._log.info(f"MAIL_FLUSH_ORPHAN to={to_node[:16]} via override {h}:{p}")
-                    await self.push_to_peer(to_node, h, p)
-                else:
-                    # Fall back to skill table address (gossip-discovered providers)
-                    skill_addr = self._node.storage.get_provider_address(to_node)
-                    if skill_addr:
-                        sh, sp = skill_addr
-                        if self._debug:
-                            self._log.info(f"MAIL_FLUSH_SKILL to={to_node[:16]} via skill table {sh}:{sp}")
-                        await self.push_to_peer(to_node, sh, sp)
-                    else:
-                        self._log.warning(f"MAIL_FLUSH_SKIP to={to_node[:16]} (not in peers, no override, no skill address)")
-                        _bus = getattr(self._node, 'bus', None)
-                        if _bus:
-                            # Valid reason values: "no_route"
-                            _bus.emit("mail.flush_skip", to_node=to_node[:16], reason="no_route")
+        if self._debug:
+            self._log.info("MAIL_FLUSH_START count=%d", len(recipients))
+        results = await asyncio.gather(
+            *[self._flush_one_recipient(to_node) for to_node in recipients],
+            return_exceptions=True,
+        )
+        for to_node, result in zip(recipients, results):
+            if isinstance(result, BaseException):
+                self._log.warning("MAIL_FLUSH_ERROR to=%s error=%s", to_node[:16], result)
 
     async def cleanup(self):
         """Periodic cleanup: expire outbox items, purge delivered items."""

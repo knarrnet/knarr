@@ -122,6 +122,14 @@ class KeyringVault:
         )
         self._conn.commit()
 
+    def encrypt_bytes(self, data: bytes) -> bytes:
+        """SA-04: Encrypt raw bytes with the vault's SecretBox."""
+        return bytes(self._box.encrypt(data))
+
+    def decrypt_bytes(self, data: bytes) -> bytes:
+        """SA-04: Decrypt raw bytes with the vault's SecretBox."""
+        return bytes(self._box.decrypt(data))
+
     def delete(self, scope: str, key: str):
         """Remove a secret entry."""
         self._conn.execute(

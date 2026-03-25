@@ -66,20 +66,24 @@ def _decrypt_mail_item(input_data: dict) -> bool:
         return False
 
 
-def handle(input_data: dict) -> dict:
-    """Main handler dispatching to send/poll/ack actions."""
+async def handle(input_data: dict) -> dict:
+    """Main handler dispatching to send/poll/ack actions.
+
+    TP-1: Made async — _handle_send, _handle_poll, _handle_get_message are async
+    due to asyncio.to_thread calls in spillover paths.
+    """
     if _node is None:
         return {"error": "mail_not_initialized", "message": "Mail handler not initialized"}
 
     action = input_data.get("action", "")
     if action == "send":
-        return _handle_send(input_data)
+        return await _handle_send(input_data)
     elif action == "poll":
-        return _handle_poll(input_data)
+        return await _handle_poll(input_data)
     elif action == "ack":
         return _handle_ack(input_data)
     elif action == "get_message":
-        return _handle_get_message(input_data)
+        return await _handle_get_message(input_data)
     elif action == "poll_results":
         return _handle_poll_results(input_data)
     elif action == "check_upgrade":
@@ -168,8 +172,12 @@ def _process_attachments(body: dict) -> Optional[dict]:
     return None
 
 
-def _reassemble_spillover(msg_dict: dict) -> dict:
-    """If message has spillover, fetch from sender's sidecar and reassemble."""
+async def _reassemble_spillover(msg_dict: dict) -> dict:
+    """If message has spillover, fetch from sender's sidecar and reassemble.
+
+    TP-1: Made async — contains await asyncio.to_thread for network fetch.
+    TP-7: Uses storage.get_address() instead of raw _get_conn().
+    """
     import hashlib
     metadata = msg_dict.get("metadata") or {}
     spillover_hash = metadata.get("_spillover_hash")
@@ -184,15 +192,11 @@ def _reassemble_spillover(msg_dict: dict) -> dict:
     try:
         sender_id = msg_dict.get("from_node", "")
         if sender_id and _node:
-            # Look up sender's sidecar port from address_book (not gossip NodeInfo)
-            conn = _node.storage._get_conn()
-            row = conn.execute(
-                "SELECT host, sidecar_port FROM address_book WHERE node_id = ?",
-                (sender_id,)
-            ).fetchone()
-            if row and row[1]:
-                host = row[0]
-                sidecar_port = int(row[1])
+            # TP-7: Look up sender via Storage API instead of raw _get_conn()
+            addr = _node.storage.get_address(sender_id)
+            if addr and addr.get("sidecar_port"):
+                host = addr["last_ip"]
+                sidecar_port = int(addr["sidecar_port"])
 
                 # H-7: SSRF restriction — reject private/loopback/link-local hosts
                 import ipaddress
@@ -216,8 +220,11 @@ def _reassemble_spillover(msg_dict: dict) -> dict:
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE  # sidecar uses self-signed certs
                 req = urllib.request.Request(fetch_url)
-                with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-                    raw_bytes = resp.read()
+                # C-04: urlopen blocks; run in thread to avoid stalling the event loop
+                def _do_fetch():
+                    with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                        return resp.read()
+                raw_bytes = await asyncio.to_thread(_do_fetch)
 
                 # M-10: Verify content hash matches requested hash
                 content_hash = hashlib.sha256(raw_bytes).hexdigest()
@@ -242,8 +249,11 @@ def _reassemble_spillover(msg_dict: dict) -> dict:
     return msg_dict
 
 
-def _handle_send(input_data: dict) -> dict:
-    """Handle 'send' action — store a message from a remote caller."""
+async def _handle_send(input_data: dict) -> dict:
+    """Handle 'send' action — store a message from a remote caller.
+
+    TP-1: Made async — contains await asyncio.to_thread for spillover upload.
+    """
     if not _decrypt_mail_item(input_data):
         return {"status": "rejected", "reason": "decryption_failed"}
 
@@ -365,9 +375,14 @@ def _handle_send(input_data: dict) -> dict:
                 ctx = ssl.create_default_context()
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE  # sidecar uses self-signed certs
-                with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
-                    resp_data = json.loads(resp.read())
-                    spillover_hash = resp_data.get("hash", "")
+                # C-04: urlopen blocks; run in thread to avoid stalling the event loop
+                _req_ref = req
+                _ctx_ref = ctx
+                def _do_upload():
+                    with urllib.request.urlopen(_req_ref, timeout=10, context=_ctx_ref) as resp:
+                        return json.loads(resp.read())
+                resp_data = await asyncio.to_thread(_do_upload)
+                spillover_hash = resp_data.get("hash", "")
 
                 # Truncate body, add spillover reference
                 if spillover_hash:
@@ -467,8 +482,11 @@ def _resolve_poll_attachments(body: dict):
             att["available"] = False
 
 
-def _handle_poll(input_data: dict) -> dict:
-    """Handle 'poll' action — retrieve messages. Local-only."""
+async def _handle_poll(input_data: dict) -> dict:
+    """Handle 'poll' action — retrieve messages. Local-only.
+
+    TP-1: Made async — calls async _reassemble_spillover.
+    """
     if not _is_local_call(input_data):
         return {"error": "local_only", "message": "poll and ack are local-only actions"}
 
@@ -532,7 +550,7 @@ def _handle_poll(input_data: dict) -> dict:
         if isinstance(body_parsed, dict) and "metadata" in body_parsed:
             msg_out["metadata"] = body_parsed["metadata"]
             
-        messages.append(_reassemble_spillover(msg_out))
+        messages.append(await _reassemble_spillover(msg_out))
         last_rowid = row["rowid"]
 
     next_token = str(last_rowid) if last_rowid > 0 else None
@@ -549,8 +567,11 @@ def _handle_poll(input_data: dict) -> dict:
     }
 
 
-def _handle_get_message(input_data: dict) -> dict:
-    """Handle 'get_message' action — retrieve a single message by ID. Local-only."""
+async def _handle_get_message(input_data: dict) -> dict:
+    """Handle 'get_message' action — retrieve a single message by ID. Local-only.
+
+    TP-1: Made async — calls async _reassemble_spillover.
+    """
     if not _is_local_call(input_data):
         return {"error": "local_only", "message": "get_message is a local-only action"}
 
@@ -584,7 +605,7 @@ def _handle_get_message(input_data: dict) -> dict:
         msg_out["metadata"] = body_parsed["metadata"]
 
     return {
-        "message": _reassemble_spillover(msg_out)
+        "message": await _reassemble_spillover(msg_out)
     }
 
 

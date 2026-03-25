@@ -280,6 +280,23 @@ class CockpitServer:
             return None
 
         if not candidates:
+            # E-08: KAD fallback — dynamic skills (e.g. casino game-seat-{id}) that
+            # missed gossip propagation are invisible without this path.
+            storage = getattr(self._node, "storage", None)
+            if storage is not None:
+                try:
+                    kad_results = storage.query_skills_by_name(skill)
+                    for entry in kad_results:
+                        candidates.append({
+                            "node_id": entry["node_id"],
+                            "host": entry["host"],
+                            "port": entry["port"],
+                            "_kad_fallback": True,
+                        })
+                except Exception:
+                    pass  # KAD unavailable — fall through to no-provider
+
+        if not candidates:
             return None
 
         # C1: Build explicit-tier set from the address book.  A single indexed
@@ -1312,22 +1329,12 @@ class CockpitServer:
         self._respond_json(writer, {"status": "ok"})
 
     def _handle_pricing_discounts_list(self, writer):
-        """GET /api/pricing/discounts — Return active pricing groups and rules."""
+        """GET /api/pricing/discounts — Return active pricing groups and rules.
+
+        PRE-01 #9: uses storage.get_pricing_discounts() instead of raw _get_conn().
+        """
         try:
-            conn = self._node.storage._get_conn()
-            cursor = conn.execute("""
-                SELECT id, name, group_name, skill_group, effect_pct, priority, 
-                       active, created_at
-                FROM pricing_discounts
-                ORDER BY active DESC, priority DESC, created_at DESC
-            """)
-            discounts = [
-                {
-                    "id": r[0], "name": r[1], "group_name": r[2],
-                    "skill_group": r[3], "effect_pct": r[4], "priority": r[5],
-                    "active": bool(r[6]), "created_at": r[7]
-                } for r in cursor.fetchall()
-            ]
+            discounts = self._node.storage.get_pricing_discounts()
             
             # v0.28.0 also includes legacy config for visibility in the UI
             legacy_groups = (getattr(self._node, '_config', None) or {}).get("pricing", {}).get("groups", {})
@@ -1375,8 +1382,7 @@ class CockpitServer:
                 self._respond_error(writer, 400, "effect_pct must be between 0 and 100")
                 return
 
-            conn = self._node.storage._get_conn()
-
+            # PRE-01 #10: use storage.upsert_pricing_discount() instead of raw _get_conn()
             if data.get("id"):
                 # Update existing — M-4: reject updates to deactivated rows
                 try:
@@ -1384,27 +1390,21 @@ class CockpitServer:
                 except (ValueError, TypeError):
                     self._respond_error(writer, 400, "Invalid discount ID")
                     return
-                existing = conn.execute("SELECT active FROM pricing_discounts WHERE id = ?", (discount_id,)).fetchone()
+                existing = self._node.storage.get_discount_rule_by_id(discount_id)
                 if not existing:
                     self._respond_error(writer, 404, "Discount not found")
                     return
-                if existing[0] == 0:
+                if not existing["active"]:
                     self._respond_error(writer, 409, "Cannot update deactivated discount")
                     return
-                conn.execute("""
-                    UPDATE pricing_discounts
-                    SET name=?, group_name=?, skill_group=?, effect_pct=?,
-                        priority=?
-                    WHERE id=? AND active=1
-                """, (name, group_name, skill_group, effect_pct, priority, discount_id))
+                self._node.storage.upsert_pricing_discount(
+                    name, group_name, skill_group, effect_pct, priority, active, discount_id
+                )
             else:
-                conn.execute("""
-                    INSERT INTO pricing_discounts
-                    (name, group_name, skill_group, effect_pct, priority, active, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (name, group_name, skill_group, effect_pct, priority, active, time.time()))
+                self._node.storage.upsert_pricing_discount(
+                    name, group_name, skill_group, effect_pct, priority, active
+                )
 
-            conn.commit()
             self._respond_json(writer, {"status": "ok"})
         except json.JSONDecodeError:
             self._respond_error(writer, 400, "Invalid JSON body")
@@ -1413,14 +1413,15 @@ class CockpitServer:
             self._respond_error(writer, 500, "Internal error")
 
     def _handle_pricing_discount_delete(self, writer, discount_id: str):
-        """DELETE /api/pricing/discounts/{id} — Deactivate a discount rule (soft delete)."""
+        """DELETE /api/pricing/discounts/{id} — Deactivate a discount rule (soft delete).
+
+        PRE-01 #11: uses storage.delete_pricing_discount() instead of raw _get_conn().
+        """
         if not discount_id.isdigit() or len(discount_id) > 18:
             self._respond_error(writer, 400, "Invalid discount ID")
             return
         try:
-            conn = self._node.storage._get_conn()
-            conn.execute("UPDATE pricing_discounts SET active = 0 WHERE id = ?", (int(discount_id),))
-            conn.commit()
+            self._node.storage.delete_pricing_discount(int(discount_id))
             self._respond_json(writer, {"status": "deactivated"})
         except Exception as e:
             logger.error(f"Failed to deactivate discount: {e}")
@@ -2652,17 +2653,20 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
         self._respond_json(writer, {"logs": logs, "count": len(logs)})
 
     async def _handle_settlements(self, req):
-        """GET /api/settlements — B1-EXT: aiohttp handler with input validation."""
+        """GET /api/settlements — E-05: aiohttp handler with status_filter + pagination."""
         from aiohttp import web
         query = req.rel_url.query
         try:
+            status_filter = query.get("status")
             limit = max(1, min(int(query.get("limit", "50")), 500))
             offset = max(0, int(query.get("offset", "0")))
         except (ValueError, TypeError):
             return web.Response(status=400, text="Invalid limit or offset")
         try:
-            settlements = self._node.storage.get_settlements(limit=limit, offset=offset) or []
-            return web.json_response({"settlements": settlements, "total": len(settlements)})
+            settlements, total = self._node.storage.get_settlement_queue_page(
+                limit=limit, offset=offset, status_filter=status_filter
+            )
+            return web.json_response({"settlements": settlements, "total": total})
         except Exception:
             return web.Response(status=500, text="Settlement query failed")
 
@@ -2676,47 +2680,10 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
             self._respond_error(writer, 400, "Invalid limit or offset")
             return
         try:
-            conn = self._node.storage._get_conn()
-            if status_filter:
-                rows = conn.execute(
-                    "SELECT id, item_type, from_node, body, priority, status, created_at, processed_at "
-                    "FROM settlement_queue WHERE status = ? ORDER BY priority ASC, created_at ASC "
-                    "LIMIT ? OFFSET ?",
-                    (status_filter, limit, offset),
-                ).fetchall()
-                total_row = conn.execute(
-                    "SELECT COUNT(*) FROM settlement_queue WHERE status = ?",
-                    (status_filter,),
-                ).fetchone()
-            else:
-                rows = conn.execute(
-                    "SELECT id, item_type, from_node, body, priority, status, created_at, processed_at "
-                    "FROM settlement_queue ORDER BY priority ASC, created_at ASC "
-                    "LIMIT ? OFFSET ?",
-                    (limit, offset),
-                ).fetchall()
-                total_row = conn.execute(
-                    "SELECT COUNT(*) FROM settlement_queue"
-                ).fetchone()
-            total = total_row[0] if total_row else 0
-            settlements = []
-            for row in rows:
-                body_val = row[3]
-                if isinstance(body_val, str):
-                    try:
-                        body_val = json.loads(body_val)
-                    except Exception:
-                        pass
-                settlements.append({
-                    "id": row[0],
-                    "item_type": row[1],
-                    "from_node": row[2],
-                    "body": body_val,
-                    "priority": row[4],
-                    "status": row[5],
-                    "created_at": row[6],
-                    "processed_at": row[7],
-                })
+            # PRE-01 #12: use storage.get_settlement_queue_page() instead of raw _get_conn()
+            settlements, total = self._node.storage.get_settlement_queue_page(
+                limit=limit, offset=offset, status_filter=status_filter
+            )
             self._respond_json(writer, {"settlements": settlements, "total": total})
         except Exception:
             self._respond_error(writer, 500, "Settlement query failed")

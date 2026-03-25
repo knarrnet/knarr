@@ -313,11 +313,11 @@ class TestE2EPollResults:
 
         handler.set_node(mock_node)
 
-        result = handler.handle({
+        result = _run(handler.handle({
             "action": "poll_results",
             "_caller_node_id": "me",  # local call
             "limit": 10,
-        })
+        }))
 
         assert "error" not in result, f"Handler returned error: {result}"
         assert result["count"] >= 1

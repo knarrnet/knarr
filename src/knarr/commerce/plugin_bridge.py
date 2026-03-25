@@ -123,55 +123,16 @@ def query_receipts(
 ) -> List[Dict[str, Any]]:
     """Query receipt_log with optional filters.
 
+    PRE-01 #13: delegates to storage.query_receipts_filtered() instead of
+    calling storage._get_conn() directly.
+
     Returns list of dicts with receipt fields + parsed payload.
-    Designed to be both a storage helper and the backing implementation
-    for the PluginContext callback.
     """
     # Clamp limit to [1, _MAX_QUERY_LIMIT]
     limit = max(1, min(limit, _MAX_QUERY_LIMIT))
-
-    conn = storage._get_conn()
-    clauses = []
-    params: list = []
-
-    if document_type:
-        clauses.append("document_type = ?")
-        params.append(document_type)
-    if counterparty:
-        clauses.append("counterparty = ?")
-        params.append(counterparty)
-    if since is not None:
-        clauses.append("created_at >= ?")
-        params.append(since)
-
-    where = " AND ".join(clauses) if clauses else "1=1"
-    sql = (
-        f"SELECT receipt_id, document_type, timestamp, identity, counterparty, "
-        f"order_ref, proof_purpose, payload_json, signature, created_at "
-        f"FROM receipt_log WHERE {where} ORDER BY created_at DESC LIMIT ?"
+    return storage.query_receipts_filtered(
+        document_type=document_type,
+        counterparty=counterparty,
+        since=since,
+        limit=limit,
     )
-    params.append(limit)
-
-    rows = conn.execute(sql, params).fetchall()
-    results = []
-    for row in rows:
-        payload = {}
-        try:
-            payload = json.loads(row[7]) if row[7] else {}
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-        results.append({
-            "receipt_id": row[0],
-            "document_type": row[1],
-            "timestamp": row[2],
-            "identity": row[3],
-            "counterparty": row[4],
-            "order_ref": row[5],
-            "proof_purpose": row[6],
-            "payload": payload,
-            "signature": row[8],
-            "created_at": row[9],
-        })
-
-    return results

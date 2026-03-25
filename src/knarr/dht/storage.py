@@ -21,6 +21,11 @@ MAIL_BUCKETS = {"mail_inbox", "mail_jobreport", "mail_system", "mail_creditnote"
 class Storage:
     """Handles persistence of peers and skills using SQLite."""
 
+    # D-01: Class-level cache for the consolidated fresh-install schema.
+    # Built once from an in-memory migration run, reused across instances.
+    _fresh_schema_script_cache: Optional[str] = None
+    _fresh_schema_versions_cache: Optional[List[str]] = None
+
     @staticmethod
     def parse_jurisdiction(jur_str: str) -> list:
         """Parse comma-separated jurisdiction string to list."""
@@ -45,9 +50,81 @@ class Storage:
                 logger.error("STORAGE_CORRUPT db=%s err=%s — consider deleting node.db (identity is in vault.db)", db_path, e)
         self._init_db()
 
-    def _init_db(self):
-        cursor = self._get_conn().cursor()
-        # Peers table
+    def _is_fresh_db(self) -> bool:
+        """Return True if this is a brand-new database with no tables yet.
+
+        D-01: Used to decide whether to apply the consolidated fresh-install schema
+        or rely on the incremental migration path for existing databases.
+        """
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchone()
+        return row[0] == 0
+
+    def _apply_consolidated_fresh_schema(self, conn: sqlite3.Connection) -> None:
+        """D-01: Apply consolidated schema for a fresh install, derived from in-memory migration run.
+
+        Instead of hand-writing 200+ lines of DDL (which drifts), we run the base schema
+        + all migrations on an in-memory DB and extract the resulting CREATE TABLE/INDEX
+        statements. This is the single source of truth.
+        """
+        script, versions = self._build_consolidated_schema_template()
+        conn.executescript(script)
+        applied_at = time.time()
+        conn.executemany(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            [(version, applied_at) for version in versions],
+        )
+        conn.commit()
+
+    def _build_consolidated_schema_template(self) -> tuple:
+        """D-01: Build the consolidated DDL by running migrations on an in-memory DB.
+
+        Returns (script, versions) where script is a SQL string and versions is the
+        list of migration versions applied. Cached at class level after first call.
+        """
+        cls = type(self)
+        if cls._fresh_schema_script_cache is not None and cls._fresh_schema_versions_cache is not None:
+            return cls._fresh_schema_script_cache, list(cls._fresh_schema_versions_cache)
+
+        template = sqlite3.connect(":memory:", check_same_thread=False)
+        try:
+            template.execute("PRAGMA journal_mode=WAL")
+            template.execute("PRAGMA busy_timeout=5000")
+            self._apply_base_schema(template)
+            self._run_migrations_on_conn(template)
+            rows = template.execute(
+                """
+                SELECT type, name, sql
+                FROM sqlite_master
+                WHERE type IN ('table', 'index')
+                  AND sql IS NOT NULL
+                  AND name NOT LIKE 'sqlite_%'
+                ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END, name
+                """
+            ).fetchall()
+            script = ";\n".join(row[2].rstrip().rstrip(";") for row in rows) + ";\n"
+            versions = [
+                row[0]
+                for row in template.execute(
+                    "SELECT version FROM schema_version ORDER BY version"
+                ).fetchall()
+            ]
+            cls._fresh_schema_script_cache = script
+            cls._fresh_schema_versions_cache = versions
+            return script, list(versions)
+        finally:
+            template.close()
+
+    def _apply_base_schema(self, conn: sqlite3.Connection) -> None:
+        """Apply the base schema (pre-migration-era tables + columns) to a connection.
+
+        Used for both existing DBs (idempotent upgrade) and the in-memory template
+        that _build_consolidated_schema_template() runs migrations against.
+        """
+        cursor = conn.cursor()
+        # Core tables
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS peers (
                 node_id TEXT PRIMARY KEY,
@@ -56,7 +133,6 @@ class Storage:
                 last_seen REAL NOT NULL
             )
         """)
-        # Skills table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS skills (
                 skill_key TEXT,
@@ -77,13 +153,7 @@ class Storage:
                 public_key TEXT NOT NULL
             )
         """)
-        # Node identity table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS node_identity (
-                key_bytes BLOB
-            )
-        """)
-        # Tasks table
+        cursor.execute("CREATE TABLE IF NOT EXISTS node_identity (key_bytes BLOB)")
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 task_id TEXT PRIMARY KEY,
@@ -99,9 +169,9 @@ class Storage:
                 timeout_ms INTEGER NOT NULL DEFAULT 30000
             )
         """)
-        # P5A-001 + Phase 8a-1 + ADR-007 + v0.23.0: Skills table columns
-        # These are pre-migration-era columns — kept inline for backward compat with
-        # databases created before the migration runner existed.
+
+        # Pre-migration-era column additions (kept for backward compat with
+        # databases created before the migration runner existed)
         columns = {row[1] for row in cursor.execute("PRAGMA table_info(skills)").fetchall()}
         for col, col_type, default in [
             ("provider_public_key", "TEXT", None),
@@ -123,7 +193,6 @@ class Storage:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_skills_uri ON skills(uri)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_peer_keys_public_key ON peer_keys(public_key)")
 
-        # Phase 6a + Phase 7: Tasks table columns (pre-migration-era)
         task_columns = {row[1] for row in cursor.execute("PRAGMA table_info(tasks)").fetchall()}
         for col, col_type, default in [
             ("input_size_bytes", "INTEGER", None),
@@ -139,7 +208,6 @@ class Storage:
                 except sqlite3.OperationalError:
                     pass
 
-        # Phase 6b + E-1: Peers table columns (pre-migration-era)
         peer_columns = {row[1] for row in cursor.execute("PRAGMA table_info(peers)").fetchall()}
         for col, col_type, default in [
             ("load", "INTEGER", "DEFAULT -1"),
@@ -152,7 +220,6 @@ class Storage:
                     pass
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_peers_wallet ON peers(wallet)")
 
-        # Ledger table (Phase 5b)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS ledger (
                 peer_public_key TEXT PRIMARY KEY,
@@ -163,7 +230,6 @@ class Storage:
                 last_updated REAL NOT NULL
             )
         """)
-        # Demand table (Phase 5b)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS demand (
                 query_value TEXT PRIMARY KEY,
@@ -174,8 +240,7 @@ class Storage:
             )
         """)
 
-        # Mail bucket tables (v0.29.1) — fresh nodes create buckets directly
-        # Existing nodes get buckets + data migration via v0_29_1.sql
+        # Mail bucket tables (v0.29.1)
         _bucket_ddl = """
             CREATE TABLE IF NOT EXISTS {table} (
                 rowid        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,25 +263,18 @@ class Storage:
             cursor.execute(_bucket_ddl.format(table=bucket))
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{bucket}_status ON {bucket}(status)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{bucket}_expires ON {bucket}(ttl_expires)")
-        # Extra indexes for inbox (poll queries)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_mail_inbox_session ON mail_inbox(session_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_mail_inbox_from ON mail_inbox(from_node)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_mail_inbox_type ON mail_inbox(msg_type)")
 
-        # v0.32.0: Credit note bucket — fresh nodes create directly; existing nodes via migration
+        # v0.32.0: Credit note bucket
         cursor.execute(_bucket_ddl.format(table="mail_creditnote"))
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_mail_creditnote_status ON mail_creditnote(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_mail_creditnote_expires ON mail_creditnote(ttl_expires)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_mail_creditnote_from ON mail_creditnote(from_node)")
-        # session_id used as reference (job_id) for credit note lookup
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_mail_creditnote_ref ON mail_creditnote(session_id)")
-        # C5 security fix: deduplicate credit notes by reference to prevent replay attacks
         cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_creditnote_ref_unique ON mail_creditnote(session_id)")
 
-        # Legacy compat: keep 'mail' table if it exists (pre-v0.29.1 nodes)
-        # The migration renames it to mail_legacy. Fresh nodes never create it.
-
-        # Outbox (sender-side)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS mail_outbox (
                 item_id      TEXT PRIMARY KEY,
@@ -234,7 +292,6 @@ class Storage:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_outbox_to ON mail_outbox(to_node, status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_outbox_expires ON mail_outbox(ttl_expires)")
 
-        # Sequence counters (per-recipient)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS mail_seq (
                 peer_node_id TEXT PRIMARY KEY,
@@ -242,7 +299,6 @@ class Storage:
             )
         """)
 
-        # Address book
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS address_book (
                 node_id      TEXT NOT NULL,
@@ -260,7 +316,6 @@ class Storage:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_addr_tier ON address_book(tier)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_addr_group ON address_book(group_id)")
 
-        # Execution log (v0.13.0)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS execution_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -278,7 +333,6 @@ class Storage:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_execlog_job ON execution_log(job_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_execlog_skill ON execution_log(skill_name)")
 
-        # Async jobs (v0.13.0)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS async_jobs (
                 job_id TEXT PRIMARY KEY,
@@ -324,10 +378,31 @@ class Storage:
                 verified_at REAL NOT NULL
             )
         """)
-        
-        self._get_conn().commit()
 
-        applied = self.run_migrations()
+        conn.commit()
+
+    def _run_migrations_on_conn(self, conn: sqlite3.Connection) -> int:
+        """Run migration scripts against a specific connection.
+
+        Factored out from run_migrations() so it can be called on the in-memory
+        template connection during consolidated schema building.
+        """
+        import os
+        from ..core.migrations import run_migrations
+        migrations_dir = os.path.join(os.path.dirname(__file__), '..', 'migrations')
+        return run_migrations(conn, migrations_dir)
+
+    def _init_db(self):
+        conn = self._get_conn()
+        # D-01: On a completely fresh database, apply consolidated schema derived from
+        # an in-memory migration run (single source of truth, never drifts).
+        # Existing nodes use the incremental base schema + migration path.
+        if self._is_fresh_db():
+            self._apply_consolidated_fresh_schema(conn)
+            return
+        # Existing DB: apply base schema (idempotent) then run incremental migrations
+        self._apply_base_schema(conn)
+        applied = self._run_migrations_on_conn(conn)
         if applied:
             logger.info(f"Applied {applied} schema migration(s)")
 
@@ -335,11 +410,7 @@ class Storage:
         return self._keepalive_conn
 
     def run_migrations(self) -> int:
-        import os
-        from ..core.migrations import run_migrations
-
-        migrations_dir = os.path.join(os.path.dirname(__file__), '..', 'migrations')
-        return run_migrations(self._get_conn(), migrations_dir)
+        return self._run_migrations_on_conn(self._get_conn())
 
     @staticmethod
     def _mail_bucket(msg_type: str, system: bool) -> str:
@@ -2768,6 +2839,305 @@ class Storage:
             (tx_digest, amount, asset, destination, time.time()),
         )
         conn.commit()
+
+
+    # ── PRE-01: Extracted Storage methods (v0.52.0) ───────────────────────────
+    # These replace raw _get_conn() calls scattered across node.py, server.py,
+    # and plugin_bridge.py. Pure extraction — no query logic changed.
+
+    def get_total_network_balance(self) -> float:
+        """PRE-01 #3: Aggregate net balance across all ledger entries."""
+        conn = self._get_conn()
+        row = conn.execute("SELECT SUM(balance) FROM ledger").fetchone()
+        return float(row[0]) if row and row[0] is not None else 0.0
+
+    def get_discount_rules(self, groups: list, skill_name: str) -> list:
+        """PRE-01 #4: Fetch pricing discount rules for a set of groups and skill.
+
+        Returns list of dicts: {name, group_name, skill_group, effect_pct, priority}.
+        """
+        if not groups:
+            return []
+        conn = self._get_conn()
+        placeholders = ",".join("?" * len(groups))
+        try:
+            rows = conn.execute(f"""
+                SELECT name, group_name, skill_group, effect_pct, priority
+                FROM pricing_discounts
+                WHERE group_name IN ({placeholders})
+                  AND (skill_group = '*' OR skill_group = ?)
+                  AND active = 1
+                ORDER BY priority DESC
+            """, list(groups) + [skill_name]).fetchall()
+        except Exception:
+            return []
+        return [
+            {"name": r[0], "group_name": r[1], "skill_group": r[2],
+             "effect_pct": r[3], "priority": r[4]}
+            for r in rows
+        ]
+
+    def get_discount_rule_by_id(self, discount_id: int) -> Optional[dict]:
+        """PRE-01 #5: Fetch a single discount rule by primary key."""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT id, name, group_name, skill_group, effect_pct, priority, active, created_at "
+                "FROM pricing_discounts WHERE id = ?",
+                (discount_id,)
+            ).fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        return {
+            "id": row[0], "name": row[1], "group_name": row[2],
+            "skill_group": row[3], "effect_pct": row[4], "priority": row[5],
+            "active": bool(row[6]), "created_at": row[7],
+        }
+
+    def get_execution_price(self, skill_name: str) -> Optional[float]:
+        """PRE-01 #6: Get the most recent execution price for a skill from execution_log."""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT total_cost FROM skill_cost_projection WHERE skill_name = ?",
+                (skill_name,)
+            ).fetchone()
+            return float(row[0]) if row and row[0] is not None else None
+        except Exception:
+            return None
+
+    def upsert_discount_rule(self, name: str, group_name: str, skill_group: str,
+                              effect_pct: float, priority: int, active: int = 1,
+                              discount_id: Optional[int] = None) -> None:
+        """PRE-01 #7: INSERT or UPDATE a pricing discount rule."""
+        conn = self._get_conn()
+        if discount_id is not None:
+            # Update existing
+            existing = conn.execute(
+                "SELECT active FROM pricing_discounts WHERE id = ?", (discount_id,)
+            ).fetchone()
+            if existing and existing[0] == 0:
+                raise ValueError(f"Cannot update deactivated discount id={discount_id}")
+            conn.execute("""
+                UPDATE pricing_discounts
+                SET name=?, group_name=?, skill_group=?, effect_pct=?, priority=?
+                WHERE id=? AND active=1
+            """, (name, group_name, skill_group, effect_pct, priority, discount_id))
+        else:
+            conn.execute("""
+                INSERT INTO pricing_discounts
+                (name, group_name, skill_group, effect_pct, priority, active, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (name, group_name, skill_group, effect_pct, priority, active, time.time()))
+        conn.commit()
+
+    def cleanup_stale_tasks(self, timeout_sec: int) -> None:
+        """PRE-01 #8: Reap tasks stuck in 'accepted' longer than 2x their timeout.
+
+        Returns list of (task_id, skill_name, age_seconds) for reaped tasks.
+        """
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT task_id, timeout_ms, created_at FROM tasks WHERE status = 'accepted'"
+        )
+        return cursor.fetchall()
+
+    def cleanup_zombie_tasks(self, timeout_sec: int) -> tuple:
+        """PRE-01 #2: Transition zombie 'running' tasks in execution_log and async_jobs to failed.
+
+        Returns (exec_log_count, async_jobs_count).
+        """
+        conn = self._get_conn()
+        now = time.time()
+        cursor = conn.execute(
+            "UPDATE execution_log SET status = 'failed', error = ? "
+            "WHERE status = 'running' AND (created_at + ?) < ?",
+            (json.dumps({"error": "node_restart"}), timeout_sec, now)
+        )
+        conn.commit()
+        exec_count = cursor.rowcount
+
+        cursor2 = conn.execute(
+            "UPDATE async_jobs SET status = 'failed' "
+            "WHERE status IN ('running', 'accepted') AND (created_at + ?) < ?",
+            (timeout_sec, now)
+        )
+        conn.commit()
+        async_count = cursor2.rowcount
+        return (exec_count, async_count)
+
+    def get_pricing_discounts(self) -> list:
+        """PRE-01 #9: Get all pricing discount rules ordered by active DESC, priority DESC."""
+        conn = self._get_conn()
+        try:
+            cursor = conn.execute("""
+                SELECT id, name, group_name, skill_group, effect_pct, priority,
+                       active, created_at
+                FROM pricing_discounts
+                ORDER BY active DESC, priority DESC, created_at DESC
+            """)
+            return [
+                {
+                    "id": r[0], "name": r[1], "group_name": r[2],
+                    "skill_group": r[3], "effect_pct": r[4], "priority": r[5],
+                    "active": bool(r[6]), "created_at": r[7],
+                }
+                for r in cursor.fetchall()
+            ]
+        except Exception:
+            return []
+
+    def upsert_pricing_discount(self, name: str, group_name: str, skill_group: str,
+                                 effect_pct: float, priority: int, active: int = 1,
+                                 discount_id: Optional[int] = None) -> None:
+        """PRE-01 #10: server.py upsert path — INSERT or UPDATE pricing discount."""
+        self.upsert_discount_rule(name, group_name, skill_group, effect_pct,
+                                   priority, active, discount_id)
+
+    def delete_pricing_discount(self, discount_id: int) -> None:
+        """PRE-01 #11: Soft-delete (deactivate) a pricing discount rule."""
+        conn = self._get_conn()
+        conn.execute("UPDATE pricing_discounts SET active = 0 WHERE id = ?", (discount_id,))
+        conn.commit()
+
+    def get_settlement_queue_page(self, limit: int = 50, offset: int = 0,
+                                   status_filter: Optional[str] = None) -> tuple:
+        """PRE-01 #12: Paginated settlement queue query.
+
+        Returns (rows, total) where rows is list of dicts.
+        """
+        conn = self._get_conn()
+        if status_filter:
+            rows = conn.execute(
+                "SELECT id, item_type, from_node, body, priority, status, created_at, processed_at "
+                "FROM settlement_queue WHERE status = ? ORDER BY priority ASC, created_at ASC "
+                "LIMIT ? OFFSET ?",
+                (status_filter, limit, offset),
+            ).fetchall()
+            total_row = conn.execute(
+                "SELECT COUNT(*) FROM settlement_queue WHERE status = ?",
+                (status_filter,),
+            ).fetchone()
+        else:
+            rows = conn.execute(
+                "SELECT id, item_type, from_node, body, priority, status, created_at, processed_at "
+                "FROM settlement_queue ORDER BY priority ASC, created_at ASC "
+                "LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+            total_row = conn.execute("SELECT COUNT(*) FROM settlement_queue").fetchone()
+        total = total_row[0] if total_row else 0
+        result = []
+        for row in rows:
+            body_val = row[3]
+            if isinstance(body_val, str):
+                try:
+                    body_val = json.loads(body_val)
+                except Exception:
+                    pass
+            result.append({
+                "id": row[0],
+                "item_type": row[1],
+                "from_node": row[2],
+                "body": body_val,
+                "priority": row[4],
+                "status": row[5],
+                "created_at": row[6],
+                "processed_at": row[7],
+            })
+        return (result, total)
+
+    def query_receipts_filtered(self, document_type: Optional[str] = None,
+                                 counterparty: Optional[str] = None,
+                                 since: Optional[float] = None,
+                                 limit: int = 50) -> list:
+        """PRE-01 #13: Query receipt_log with optional filters.
+
+        Replaces raw _get_conn() in plugin_bridge.query_receipts().
+        Returns list of receipt dicts with parsed payload.
+        """
+        _MAX_LIMIT = 500
+        limit = max(1, min(limit, _MAX_LIMIT))
+        conn = self._get_conn()
+        clauses = []
+        params: list = []
+
+        if document_type:
+            clauses.append("document_type = ?")
+            params.append(document_type)
+        if counterparty:
+            clauses.append("counterparty = ?")
+            params.append(counterparty)
+        if since is not None:
+            clauses.append("created_at >= ?")
+            params.append(since)
+
+        where = " AND ".join(clauses) if clauses else "1=1"
+        sql = (
+            "SELECT receipt_id, document_type, timestamp, identity, counterparty, "
+            "order_ref, proof_purpose, payload_json, signature, created_at "
+            f"FROM receipt_log WHERE {where} ORDER BY created_at DESC LIMIT ?"
+        )
+        params.append(limit)
+
+        rows = conn.execute(sql, params).fetchall()
+        results = []
+        for row in rows:
+            payload = {}
+            try:
+                payload = json.loads(row[7]) if row[7] else {}
+            except (json.JSONDecodeError, TypeError):
+                pass
+            results.append({
+                "receipt_id": row[0],
+                "document_type": row[1],
+                "timestamp": row[2],
+                "identity": row[3],
+                "counterparty": row[4],
+                "order_ref": row[5],
+                "proof_purpose": row[6],
+                "payload_json": row[7],
+                "payload": payload,
+                "signature": row[8],
+                "created_at": row[9],
+            })
+        return results
+
+    def get_provider_public_key_for_node(self, node_id: str) -> Optional[str]:
+        """PRE-01 helper: Get provider_public_key from tasks table for a node_id."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT DISTINCT provider_public_key FROM tasks "
+            "WHERE provider_node_id = ? AND provider_public_key != '' LIMIT 1",
+            (node_id,)
+        ).fetchone()
+        return row[0] if row else None
+
+    # SA-02: Async fallback methods — pass-through without thread offload.
+    # The 00-storage-strategy plugin replaces these with cached + threaded versions.
+    # Callers use await storage.async_get_peers() so the plugin can intercept.
+
+    async def async_get_peers(self):
+        """SA-02: Async fallback for get_peers. No thread offload (sync pass-through)."""
+        return self.get_peers()
+
+    async def async_get_peer_by_id(self, node_id: str):
+        """SA-02: Async fallback for get_peer_by_id. No thread offload."""
+        return self.get_peer_by_id(node_id)
+
+    async def async_query_all_active_skills(self, skill_name=None, tag=None, limit=None):
+        """SA-02: Async fallback for query_all_active_skills. No thread offload."""
+        return self.query_all_active_skills(skill_name, tag, limit)
+
+    async def async_get_own_skills(self):
+        """SA-02: Async fallback for get_own_skills. No thread offload."""
+        return self.get_own_skills()
+
+    async def async_get_ledger_balance(self, peer_public_key: str):
+        """SA-02: Async fallback for get_ledger_balance. No thread offload."""
+        return self.get_ledger_balance(peer_public_key)
 
 
 class StorageStub:

@@ -188,8 +188,9 @@ class TestMinimumPriceFloor:
         node._group_engine = None
         node._skill_policies = {}
         node.storage = MagicMock()
-        node.storage._get_conn.return_value.execute.return_value.fetchall.return_value = []
-        node.storage._get_conn.return_value.execute.return_value.fetchone.return_value = None
+        # PRE-01: mock Storage API methods instead of raw _get_conn()
+        node.storage.get_discount_rules.return_value = []
+        node.storage.get_execution_price.return_value = None
         # MagicMock(spec=DHTNode) intercepts _resolve_price_builtin — bind real impl so
         # _resolve_price can delegate to it correctly.
         node._resolve_price_builtin = types.MethodType(DHTNode._resolve_price_builtin, node)
@@ -210,8 +211,9 @@ class TestMinimumPriceFloor:
         node._group_engine = None
         node._skill_policies = {}
         node.storage = MagicMock()
-        node.storage._get_conn.return_value.execute.return_value.fetchall.return_value = []
-        node.storage._get_conn.return_value.execute.return_value.fetchone.return_value = None
+        # PRE-01: mock Storage API methods instead of raw _get_conn()
+        node.storage.get_discount_rules.return_value = []
+        node.storage.get_execution_price.return_value = None
         # Bind real _resolve_price_builtin — MagicMock otherwise intercepts and returns empty mock.
         node._resolve_price_builtin = types.MethodType(DHTNode._resolve_price_builtin, node)
 

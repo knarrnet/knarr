@@ -1,4 +1,5 @@
 """Tests for Phase 9a: knarr-mail skill handler and storage."""
+import asyncio
 import json
 import time
 import uuid
@@ -53,7 +54,7 @@ def _send(node, from_id, body=None, ttl_hours=72, **kwargs):
         "_caller_node_id": from_id,
     }
     input_data.update(kwargs)
-    return handle(input_data)
+    return asyncio.run(handle(input_data))
 
 
 def _poll(node, since=None, filters=None, limit=50):
@@ -68,17 +69,17 @@ def _poll(node, since=None, filters=None, limit=50):
         input_data["filters"] = filters
     if limit != 50:
         input_data["limit"] = limit
-    return handle(input_data)
+    return asyncio.run(handle(input_data))
 
 
 def _ack(node, message_ids, disposition="read"):
     """Helper to call ack action (local)."""
-    return handle({
+    return asyncio.run(handle({
         "action": "ack",
         "message_ids": message_ids,
         "disposition": disposition,
         "_caller_node_id": node.node_info.node_id,
-    })
+    }))
 
 
 # -- Basic send/poll/ack --
@@ -193,10 +194,10 @@ def test_mail_poll_local_only(node, remote_node_id):
     """SENTINEL: Remote caller cannot poll another node's mailbox."""
     _send(node, remote_node_id)
 
-    result = handle({
+    result = asyncio.run(handle({
         "action": "poll",
         "_caller_node_id": remote_node_id,  # NOT the local node
-    })
+    }))
     assert result.get("error") == "local_only"
 
 
@@ -204,12 +205,12 @@ def test_mail_ack_local_only(node, remote_node_id):
     """Remote caller cannot ack another node's messages."""
     r = _send(node, remote_node_id)
 
-    result = handle({
+    result = asyncio.run(handle({
         "action": "ack",
         "message_ids": [r["message_id"]],
         "disposition": "read",
         "_caller_node_id": remote_node_id,
-    })
+    }))
     assert result.get("error") == "local_only"
 
 
@@ -315,20 +316,20 @@ def test_mail_stale_token_gap(node, remote_node_id):
 
 def test_mail_unknown_action(node):
     """Unknown action returns error."""
-    result = handle({
+    result = asyncio.run(handle({
         "action": "subscribe",
         "_caller_node_id": node.node_info.node_id,
-    })
+    }))
     assert "error" in result
 
 
 def test_mail_invalid_body(node, remote_node_id):
     """Non-dict body rejected."""
-    result = handle({
+    result = asyncio.run(handle({
         "action": "send",
         "body": "not a dict",
         "_caller_node_id": remote_node_id,
-    })
+    }))
     assert result.get("error") == "invalid_body"
 
 
@@ -353,12 +354,12 @@ def test_mail_ack_batch_limit(node, remote_node_id):
 def test_mail_invalid_disposition(node, remote_node_id):
     """Invalid disposition returns error."""
     r = _send(node, remote_node_id)
-    result = handle({
+    result = asyncio.run(handle({
         "action": "ack",
         "message_ids": [r["message_id"]],
         "disposition": "burned",
         "_caller_node_id": node.node_info.node_id,
-    })
+    }))
     assert result.get("error") == "invalid_disposition"
 
 

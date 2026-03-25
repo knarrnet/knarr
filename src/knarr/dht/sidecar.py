@@ -283,12 +283,11 @@ class AssetSidecar:
             await self._send_response(writer, 400, {"error": "Content hash mismatch"})
             return
 
-        # Atomic write
+        # Atomic write — C-05: use asyncio.to_thread to avoid blocking the event loop
         final_path = os.path.join(self._asset_dir, content_hash)
         if not os.path.exists(final_path):
             tmp_path = final_path + ".tmp"
-            with open(tmp_path, "wb") as f:
-                f.write(data)
+            await self._write_file(tmp_path, data)
             os.replace(tmp_path, final_path)
             self._metadata[content_hash] = AssetMetadata(
                 size=content_length,
@@ -309,8 +308,8 @@ class AssetSidecar:
             await self._send_response(writer, 404, {"error": "Asset not found"})
             return
 
-        with open(path, "rb") as f:
-            data = f.read()
+        # C-05: use asyncio.to_thread to avoid blocking the event loop on large reads
+        data = await self._read_file(path)
 
         if asset_hash in self._metadata:
             self._metadata[asset_hash].access_count += 1
@@ -403,3 +402,19 @@ class AssetSidecar:
     @staticmethod
     def _is_valid_hash(h: str) -> bool:
         return len(h) == 64 and all(c in '0123456789abcdef' for c in h)
+
+    @staticmethod
+    async def _write_file(path: str, data: bytes) -> None:
+        """C-05: Write bytes to path in a thread to avoid blocking the event loop."""
+        def _do_write():
+            with open(path, "wb") as fh:
+                fh.write(data)
+        await asyncio.to_thread(_do_write)
+
+    @staticmethod
+    async def _read_file(path: str) -> bytes:
+        """C-05: Read bytes from path in a thread to avoid blocking the event loop."""
+        def _do_read():
+            with open(path, "rb") as fh:
+                return fh.read()
+        return await asyncio.to_thread(_do_read)

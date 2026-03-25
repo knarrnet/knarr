@@ -66,7 +66,7 @@ def test_positive_price_still_valid():
     assert result.price == 5.0
 
 
-def test_price_above_max_rejected():
-    """Price above 1000.0 must be rejected."""
-    with pytest.raises(ValidationError, match="1000.0"):
-        validate_skill_sheet(_sheet(price=1001.0))
+def test_price_above_old_max_now_allowed():
+    """ESC-02: Hardcoded price ceiling removed. Prices above 1000.0 are now allowed."""
+    result = validate_skill_sheet(_sheet(price=1001.0))
+    assert result.price == 1001.0
