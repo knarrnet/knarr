@@ -41,6 +41,7 @@ class StorageCacheProxy:
         object.__setattr__(self, '_cache', {})
         object.__setattr__(self, '_hits', 0)
         object.__setattr__(self, '_misses', 0)
+        object.__setattr__(self, '_debug', bool(ttl_config.get("debug", False)))
 
     def __getattr__(self, name: str):
         """Delegate all attribute lookups to the underlying storage."""
@@ -59,9 +60,14 @@ class StorageCacheProxy:
             if now < expires_at:
                 self._hits += 1
                 return value
+        t0 = time.monotonic()
         result = fn()
+        elapsed = time.monotonic() - t0
         self._cache[key] = (result, now + ttl)
         self._misses += 1
+        if self._debug:
+            logger.info("CACHE_MISS key=%s db_ms=%.1f total=%d/%d",
+                        key, elapsed * 1000, self._misses, self._hits + self._misses)
         return result
 
     def _invalidate_prefix(self, prefix: str) -> None:
@@ -121,21 +127,35 @@ class StorageCacheProxy:
 
     def upsert_peer(self, *args, **kwargs):
         result = self._storage.upsert_peer(*args, **kwargs)
-        self._invalidate_prefix("peers:")
+        # Granular invalidation: only invalidate the specific peer entry.
+        # peers:all expires via TTL (30s) — one peer updating doesn't meaningfully
+        # change the full list. Prefix invalidation here caused cache thrashing:
+        # 15 upserts/sec at 150 nodes wiped the cache before any read could hit.
+        peer = args[0] if args else None
+        if peer and hasattr(peer, 'node_id'):
+            self._invalidate_key(f"peers:id:{peer.node_id}")
         return result
 
     def remove_peer(self, *args, **kwargs):
         result = self._storage.remove_peer(*args, **kwargs)
+        # Full prefix invalidation on remove — the peer is gone from the list
         self._invalidate_prefix("peers:")
         return result
 
     def upsert_skill(self, *args, **kwargs):
         result = self._storage.upsert_skill(*args, **kwargs)
-        self._invalidate_prefix("skills:")
+        # Granular: only invalidate specific skill entries, not the full catalog.
+        # skills:all expires via TTL (60s). At 150 nodes × 8 skills, prefix
+        # invalidation fires 1200 times during join — cache never gets a hit.
+        skill_key = args[0] if args else None
+        if skill_key:
+            self._invalidate_key(f"skills:all:{skill_key}:None:None")
+        self._invalidate_key("skills:own")
         return result
 
     def remove_skill(self, *args, **kwargs):
         result = self._storage.remove_skill(*args, **kwargs)
+        # Full prefix invalidation on remove — the skill is gone
         self._invalidate_prefix("skills:")
         return result
 
