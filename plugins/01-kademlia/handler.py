@@ -849,7 +849,7 @@ class KademliaPlugin(PluginHooks):
                     self.kbuckets.remove_peer(node_id)
                     remove_result = self._ctx.remove_peer(node_id)
                     if inspect.isawaitable(remove_result):
-                        await remove_result
+                        asyncio.create_task(remove_result)
                     continue
 
                 if silence > self._SWEEP_SILENCE_THRESHOLD and not self._is_well_covered(health):

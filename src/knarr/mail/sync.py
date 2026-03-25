@@ -35,6 +35,10 @@ class SyncEngine:
         self._dispatch_failures: Dict[str, int] = {}  # item_id -> failure count
         self._dispatch_max_retries = 3
 
+        # v0.52.6: Flush-skip counter — abandon outbox items after N no-route skips
+        self._flush_skip_count: Dict[str, int] = {}  # to_node -> skip count
+        self._flush_skip_max = 50  # abandon after 50 skips (~8 minutes at 10s interval)
+
         # v0.39.0 C3: Mail circuit breaker — per-peer failure tracking
         self._circuit_state: Dict[str, Dict[str, Any]] = {}
         self._circuit_backoff_steps = [30, 60, 120, 300]  # seconds
@@ -716,6 +720,7 @@ class SyncEngine:
         # Try peer table first — direct PK lookup, not full table scan
         peer_info = self._node.storage.get_peer_by_id(to_node)
         if peer_info:
+            self._flush_skip_count.pop(to_node, None)  # reset on route found
             h, p = self._node.resolve_peer(peer_info.node_id, peer_info.host, peer_info.port)
             await self.push_to_peer(to_node, h, p)
         else:
@@ -734,10 +739,17 @@ class SyncEngine:
                         self._log.info(f"MAIL_FLUSH_SKILL to={to_node[:16]} via skill table {sh}:{sp}")
                     await self.push_to_peer(to_node, sh, sp)
                 else:
-                    self._log.warning(f"MAIL_FLUSH_SKIP to={to_node[:16]} (not in peers, no override, no skill address)")
+                    skip_count = self._flush_skip_count.get(to_node, 0) + 1
+                    self._flush_skip_count[to_node] = skip_count
+                    if skip_count >= self._flush_skip_max:
+                        # Abandon: peer has been unreachable for ~8 minutes
+                        abandoned = self._node.storage.abandon_outbox(to_node)
+                        self._flush_skip_count.pop(to_node, None)
+                        self._log.warning(f"MAIL_FLUSH_ABANDON to={to_node[:16]} skips={skip_count} abandoned={abandoned}")
+                    else:
+                        self._log.warning(f"MAIL_FLUSH_SKIP to={to_node[:16]} skip={skip_count}/{self._flush_skip_max}")
                     _bus = getattr(self._node, 'bus', None)
                     if _bus:
-                        # Valid reason values: "no_route"
                         _bus.emit("mail.flush_skip", to_node=to_node[:16], reason="no_route")
 
     async def flush_outbox(self):

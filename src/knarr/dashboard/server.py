@@ -430,17 +430,25 @@ class CockpitServer:
             job_id, skill, node_id, host, port, expires_at
         )
 
+        is_local = (node_id == self._node.node_info.node_id)
+
         async def _track():
             try:
-                result = await self._node.submit_async_task(
-                    node_id, host, port, skill, task_input, timeout_ms=timeout_ms
-                )
-                if result.status in ("accepted", "queued", "completed"):
-                    self._node.storage.update_async_job_status(job_id, result.status)
+                if is_local:
+                    # Local skill: call handler directly, bypass TCP self-connection.
+                    # At 20+ peers, TCP self-call competes with peer traffic and times out.
+                    output = await self._node.call_local(skill, task_input, timeout_ms=timeout_ms)
+                    self._node.storage.update_async_job_status(job_id, "completed")
                 else:
-                    reason = getattr(result, "reason", "") or result.status
-                    self._node.storage.update_async_job_status(
-                        job_id, "failed", error={"message": reason})
+                    result = await self._node.submit_async_task(
+                        node_id, host, port, skill, task_input, timeout_ms=timeout_ms
+                    )
+                    if result.status in ("accepted", "queued", "completed"):
+                        self._node.storage.update_async_job_status(job_id, result.status)
+                    else:
+                        reason = getattr(result, "reason", "") or result.status
+                        self._node.storage.update_async_job_status(
+                            job_id, "failed", error={"message": reason})
             except asyncio.TimeoutError:
                 self._node.storage.update_async_job_status(
                     job_id, "failed", error={"message": "Provider timeout"})

@@ -5641,7 +5641,9 @@ class DHTNode:
         if not items:
             return
 
-        for item in items:
+        # F-05: Process items in parallel — sequential awaits blocked the tick
+        # for 10 items × 2 awaits per item at 150-node scale.
+        async def _process_one(item):
             try:
                 await self._process_settlement_item(item)
                 await self._enqueue_write(
@@ -5655,6 +5657,8 @@ class DHTNode:
                 await self._enqueue_write(
                     self.storage.mark_settlement_processed, item["id"], "failed"
                 )
+
+        await asyncio.gather(*[_process_one(it) for it in items], return_exceptions=True)
 
     async def _process_settlement_item(self, item: dict):
         """Route a settlement queue item to the appropriate handler."""

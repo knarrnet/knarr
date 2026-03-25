@@ -1895,6 +1895,17 @@ class Storage:
         cursor = conn.execute("SELECT DISTINCT to_node FROM mail_outbox WHERE status = 'pending'")
         return [r[0] for r in cursor.fetchall()]
 
+    def abandon_outbox(self, to_node: str) -> int:
+        """Mark all pending outbox items for a peer as failed (unreachable)."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "UPDATE mail_outbox SET status = 'failed' WHERE to_node = ? AND status = 'pending'",
+            (to_node,)
+        )
+        count = cursor.rowcount
+        conn.commit()
+        return count
+
     def count_outbox(self) -> int:
         """Returns total pending+sending items."""
         conn = self._get_conn()
