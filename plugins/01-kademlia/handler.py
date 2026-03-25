@@ -765,13 +765,17 @@ class KademliaPlugin(PluginHooks):
             target_int = self.kbuckets.local_id_int ^ random_distance
             target_hex = format(target_int, '064x')
 
-            try:
-                await self._lookup.find_nodes(target_hex)
-                self._bucket_last_refresh[i] = now
-                if self._debug:
-                    self._log.info(f"KAD_REFRESH bucket={i}")
-            except Exception:
-                pass  # Best effort
+            # Fire-and-forget: find_nodes is iterative network I/O —
+            # must not block the event loop (v0.52.5: Viggo report).
+            async def _do_refresh(target, idx, ts):
+                try:
+                    await self._lookup.find_nodes(target)
+                    self._bucket_last_refresh[idx] = ts
+                    if self._debug:
+                        self._log.info(f"KAD_REFRESH bucket={idx}")
+                except Exception:
+                    pass  # Best effort
+            asyncio.create_task(_do_refresh(target_hex, i, now))
 
             break  # One bucket per tick (don't flood)
 
@@ -799,13 +803,13 @@ class KademliaPlugin(PluginHooks):
             ping_sent = self._ping_sent_at.get(oldest_id)
 
             if ping_sent is None:
-                # Send PING to oldest node
+                # Fire-and-forget: PING is network I/O — must not block event loop (v0.52.5).
                 peer_info = self._resolve_peer(oldest_id, peers)
                 if peer_info:
-                    await self._send_plugin_message(
+                    asyncio.create_task(self._send_plugin_message(
                         oldest_id, peer_info.host, peer_info.port,
                         "PING", {"_request_id": f"evict-{oldest_id[:16]}"}
-                    )
+                    ))
                     self._ping_sent_at[oldest_id] = now
                     if self._debug:
                         self._log.info(f"KAD_PING_EVICT target={oldest_id[:16]}")
@@ -849,9 +853,11 @@ class KademliaPlugin(PluginHooks):
                     continue
 
                 if silence > self._SWEEP_SILENCE_THRESHOLD and not self._is_well_covered(health):
+                    # Fire-and-forget: push_to_peer is network I/O —
+                    # must not block event loop (v0.52.5: Viggo report).
                     push_result = self._ctx.push_to_peer(node_id, host, port)
                     if inspect.isawaitable(push_result):
-                        await push_result
+                        asyncio.create_task(push_result)
             except Exception as e:
                 self._log.warning(f"KAD_SWEEP_ERR {type(e).__name__}: {e}")
 
