@@ -94,7 +94,7 @@ class CockpitServer:
         self._tls_mode = tls_mode if tls_mode in ("auto", "off", "both") else "auto"
         self._server = None
         self._server_plain = None  # HTTP server for "both" mode
-        self._max_connections = 8
+        self._max_connections = int(getattr(node, '_config', {}).get("cockpit", {}).get("max_connections", 64))
         self._active_connections = 0
         self._exposures = self._build_exposure_index(exposures or {})
         self._rate_limits: Dict[str, Dict[str, list]] = {}  # path -> {ip: [timestamps]}
@@ -420,9 +420,44 @@ class CockpitServer:
         # Strip /s/ prefix and any trailing action
         return self._exposures.get(path)
 
+    def _fire_and_forget_task(self, writer, node_id, host, port, skill, task_input, timeout_ms):
+        """Submit a task via fire-and-forget: return job_id immediately, track in background.
+        Prevents cockpit connection starvation from slow submit_async_task (up to 60s)."""
+        import uuid as _uuid
+        job_id = str(_uuid.uuid4())
+        expires_at = time.time() + 86400
+        self._node.storage.insert_remote_job(
+            job_id, skill, node_id, host, port, expires_at
+        )
+
+        async def _track():
+            try:
+                result = await self._node.submit_async_task(
+                    node_id, host, port, skill, task_input, timeout_ms=timeout_ms
+                )
+                if result.status in ("accepted", "queued", "completed"):
+                    self._node.storage.update_async_job_status(job_id, result.status)
+                else:
+                    reason = getattr(result, "reason", "") or result.status
+                    self._node.storage.update_async_job_status(
+                        job_id, "failed", error={"message": reason})
+            except asyncio.TimeoutError:
+                self._node.storage.update_async_job_status(
+                    job_id, "failed", error={"message": "Provider timeout"})
+            except Exception as e:
+                logger.error(f"API async execute failed: {e}")
+                self._node.storage.update_async_job_status(
+                    job_id, "failed", error={"message": str(e)})
+
+        asyncio.create_task(_track())
+        self._respond(writer, "202 Accepted", "application/json", json.dumps({
+            "status": "accepted", "job_id": job_id, "position": 0
+        }).encode("utf-8"))
+
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle one HTTP request, then close."""
         if self._active_connections >= self._max_connections:
+            logger.warning("COCKPIT_REJECT active=%d max=%d", self._active_connections, self._max_connections)
             writer.close()
             try:
                 await writer.wait_closed()
@@ -811,31 +846,9 @@ class CockpitServer:
         timeout_ms = data.get("timeout_ms") or (int(data.get("timeout", 30)) * 1000)
 
         if local:
-            try:
-                # Async local execute via programmatic loopback
-                result = await self._node.submit_async_task(
-                    self._node.node_info.node_id, "127.0.0.1", self._node.node_info.port,
-                    skill, task_input, timeout_ms=timeout_ms
-                )
-                if result.status in ("accepted", "queued"):
-                    self._respond(writer, "202 Accepted", "application/json", json.dumps({
-                        "status": result.status,
-                        "job_id": result.task_id,
-                        "position": getattr(result, "position", 0)
-                    }).encode("utf-8"))
-                elif result.status == "completed":
-                    self._respond(writer, "200 OK", "application/json", json.dumps({
-                        "status": "completed",
-                        "job_id": result.task_id,
-                    }).encode("utf-8"))
-                else:
-                    reason = getattr(result, "reason", "") or result.status
-                    self._respond_error(writer, 409, f"Task rejected: {reason}")
-            except asyncio.TimeoutError:
-                self._respond_error(writer, 503, "Provider timeout — retry later")
-            except Exception as e:
-                logger.error(f"API local async execute failed: {e}")
-                self._respond_error(writer, 500, "Task submission failed")
+            self._fire_and_forget_task(
+                writer, self._node.node_info.node_id, "127.0.0.1",
+                self._node.node_info.port, skill, task_input, timeout_ms)
             return
 
         # B2: scored candidate selection when no explicit provider
@@ -848,30 +861,9 @@ class CockpitServer:
 
         # B2: if scored selection picked local, execute locally
         if provider.get("_local"):
-            try:
-                result = await self._node.submit_async_task(
-                    self._node.node_info.node_id, "127.0.0.1", self._node.node_info.port,
-                    skill, task_input, timeout_ms=timeout_ms
-                )
-                if result.status in ("accepted", "queued"):
-                    self._respond(writer, "202 Accepted", "application/json", json.dumps({
-                        "status": result.status,
-                        "job_id": result.task_id,
-                        "position": getattr(result, "position", 0)
-                    }).encode("utf-8"))
-                elif result.status == "completed":
-                    self._respond(writer, "200 OK", "application/json", json.dumps({
-                        "status": "completed",
-                        "job_id": result.task_id,
-                    }).encode("utf-8"))
-                else:
-                    reason = getattr(result, "reason", "") or result.status
-                    self._respond_error(writer, 409, f"Task rejected: {reason}")
-            except asyncio.TimeoutError:
-                self._respond_error(writer, 503, "Provider timeout — retry later")
-            except Exception as e:
-                logger.error(f"API local async execute failed: {e}")
-                self._respond_error(writer, 500, "Task submission failed")
+            self._fire_and_forget_task(
+                writer, self._node.node_info.node_id, "127.0.0.1",
+                self._node.node_info.port, skill, task_input, timeout_ms)
             return
 
         # Resolve host/port from peer table when only node_id provided (V011-005)
@@ -2102,40 +2094,11 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
         # Fix D: Use timeout_ms from exposure config
         timeout_ms = exposure.get("timeout_ms") or (exposure.get("timeout", 30) * 1000)
 
-        # Check local first
+        # Check local first — fire-and-forget to avoid holding cockpit connection
         if hasattr(self._node, '_handlers') and skill.lower() in self._node._handlers:
-            try:
-                # v0.17.0: Fix C — Always use async execution for cockpit
-                result = await self._node.submit_async_task(
-                    self._node.node_info.node_id, "127.0.0.1", self._node.node_info.port,
-                    skill, task_input, timeout_ms=timeout_ms
-                )
-                if result.status in ("accepted", "queued"):
-                    self._respond_cors(writer, "202 Accepted", "application/json", json.dumps({
-                        "job_id": result.task_id,
-                        "status": result.status,
-                        "queue_position": getattr(result, "position", 0),
-                        "estimated_wait_ms": getattr(result, "position", 0) * 5000
-                    }).encode("utf-8"))
-                elif result.status == "completed":
-                    self._respond_cors(writer, "200 OK", "application/json", json.dumps({
-                        "job_id": result.task_id,
-                        "status": "completed",
-                    }).encode("utf-8"))
-                else:
-                    reason = getattr(result, "reason", "") or result.status
-                    self._issue_x402_refund(x402_payment)
-                    self._respond_cors(writer, "409 Conflict", "application/json", json.dumps({
-                        "status": "failed",
-                        "error": {"code": "TASK_REJECTED", "message": f"Task rejected: {reason}"}
-                    }).encode("utf-8"))
-            except Exception as e:
-                logger.error(f"Exposure local async execute failed: {type(e).__name__}: {e}")
-                self._issue_x402_refund(x402_payment)
-                self._respond_cors_json(writer, {
-                    "status": "failed",
-                    "error": {"code": "HANDLER_ERROR", "message": "Task submission failed"}
-                })
+            self._fire_and_forget_task(
+                writer, self._node.node_info.node_id, "127.0.0.1",
+                self._node.node_info.port, skill, task_input, timeout_ms)
             return
 
         # Remote execution — resolve provider
@@ -2182,49 +2145,10 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
             self._respond_cors_error(writer, 404, "No provider found")
             return
 
-        try:
-            # v0.17.0: Fix C — Always use async execution for cockpit
-            result = await self._node.submit_async_task(
-                provider["node_id"], provider["host"], provider["port"],
-                skill, task_input, timeout_ms=timeout_ms
-            )
-            if result.status in ("accepted", "queued"):
-                # Store local tracking entry for remote job
-                expires_at = time.time() + 86400
-                self._node.storage.insert_remote_job(
-                    result.task_id, skill, provider["node_id"],
-                    provider["host"], provider["port"], expires_at
-                )
-                self._respond_cors(writer, "202 Accepted", "application/json", json.dumps({
-                    "job_id": result.task_id,
-                    "status": result.status,
-                    "queue_position": getattr(result, "position", 0),
-                    "estimated_wait_ms": getattr(result, "position", 0) * 5000
-                }).encode("utf-8"))
-            elif result.status == "completed":
-                expires_at = time.time() + 86400
-                self._node.storage.insert_remote_job(
-                    result.task_id, skill, provider["node_id"],
-                    provider["host"], provider["port"], expires_at
-                )
-                self._respond_cors(writer, "200 OK", "application/json", json.dumps({
-                    "job_id": result.task_id,
-                    "status": "completed",
-                }).encode("utf-8"))
-            else:
-                reason = getattr(result, "reason", "") or result.status
-                self._issue_x402_refund(x402_payment)
-                self._respond_cors(writer, "409 Conflict", "application/json", json.dumps({
-                    "status": "failed",
-                    "error": {"code": "TASK_REJECTED", "message": f"Task rejected: {reason}"}
-                }).encode("utf-8"))
-        except Exception as e:
-            logger.error(f"Exposure async execute failed: {type(e).__name__}: {e}")
-            self._issue_x402_refund(x402_payment)
-            self._respond_cors_json(writer, {
-                "status": "failed",
-                "error": {"code": "EXECUTION_ERROR", "message": "Task submission failed"}
-            })
+        # Fire-and-forget — don't hold cockpit connection for 60s waiting on remote ACK
+        self._fire_and_forget_task(
+            writer, provider["node_id"], provider["host"], provider["port"],
+            skill, task_input, timeout_ms)
 
     async def _handle_job_status(self, writer, job_id: str):
         """GET /s/{path}/status/{job_id} — Query job status."""
