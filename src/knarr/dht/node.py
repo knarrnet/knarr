@@ -2078,12 +2078,18 @@ class DHTNode:
                 provider_port=self.node_info.port,
                 jurisdiction=self._node_jurisdiction_wire,
             ))
-            # BUG-01: scheduled republish sends to ALL peers, not a fanout sample.
-            # Hot-path announce() still uses fanout=3 for low-overhead initial announce.
-            for peer in peers:
-                asyncio.create_task(self._send_to_peer(peer, msg))
+            # Republish uses sqrt(N) fanout + fire-and-forget (no pool lock).
+            # Full flood kills event loop at 37+ peers (296 pool-locked tasks).
+            # Fire-and-forget is correct semantic — announces don't need responses.
+            import math, random
+            max_fanout = max(3, int(math.sqrt(len(peers))))
+            targets = random.sample(peers, min(max_fanout, len(peers)))
+            for peer in targets:
+                if not await self._plugins.on_outbound(msg, peer):
+                    continue  # Let KAD learn from outbound
+                asyncio.create_task(self._send_fire_forget(peer, msg))
             announced += 1
-        logger.info(f"REPUBLISH_CYCLE skills={announced} peers={len(peers)}")
+        logger.info(f"REPUBLISH_CYCLE skills={announced} peers={len(peers)} fanout={min(max_fanout, len(peers))}")
 
     async def announce(self, skill_sheet_data: Dict[str, Any]):
         """Validates, stores, and announces a skill."""
