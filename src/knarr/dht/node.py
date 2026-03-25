@@ -5540,7 +5540,12 @@ class DHTNode:
         await self._evict_bootstrap_peers()
 
     async def _evict_bootstrap_peers(self) -> None:
-        """KAD-02: Remove bootstrap peer entries from routing table after self-population."""
+        """KAD-02: Remove bootstrap peer entries from routing table after self-population.
+
+        Only evict if the node has enough non-bootstrap peers to sustain gossip
+        and heartbeat liveness. Without this guard, nodes lose their only peer
+        (bootstrap) and become invisible to the network (v0.52.6: Viggo exp-150).
+        """
         if not self._initial_bootstrap_peers:
             return
 
@@ -5555,7 +5560,17 @@ class DHTNode:
         if not bootstrap_addrs:
             return
 
-        for peer in self.storage.get_peers():
+        all_peers = self.storage.get_peers()
+        non_bootstrap = [p for p in all_peers if (p.host, p.port) not in bootstrap_addrs]
+
+        if len(non_bootstrap) < MIN_PEER_FLOOR:
+            logger.info(
+                "KAD02_EVICT_SKIP non_bootstrap=%d < MIN_PEER_FLOOR=%d — keeping bootstrap in peer table",
+                len(non_bootstrap), MIN_PEER_FLOOR,
+            )
+            return
+
+        for peer in all_peers:
             if (peer.host, peer.port) not in bootstrap_addrs:
                 continue
             await self._enqueue_write(self.storage.remove_peer, peer.node_id)
