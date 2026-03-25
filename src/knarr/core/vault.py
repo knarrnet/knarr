@@ -39,9 +39,14 @@ class KeyringVault:
         # Get or create random salt in vault_meta
         salt = self._get_meta("salt")
         if salt is None:
+            # New vault — use INTERACTIVE (64 MiB) instead of MODERATE (256 MiB).
+            # Seed is deterministic (not user-chosen), so INTERACTIVE is sufficient.
             salt = random(SALT_SIZE)
             self._set_meta("salt", salt)
             self._set_meta("version", VAULT_VERSION.to_bytes(4, 'big'))
+            self._set_meta("kdf_memlimit", argon2id.MEMLIMIT_INTERACTIVE.to_bytes(8, 'big'))
+            kdf_memlimit = argon2id.MEMLIMIT_INTERACTIVE
+            kdf_opslimit = argon2id.OPSLIMIT_INTERACTIVE
         else:
             # Check version compatibility
             stored_ver = self._get_meta("version")
@@ -49,12 +54,20 @@ class KeyringVault:
                 ver = int.from_bytes(stored_ver, 'big')
                 if ver > VAULT_VERSION:
                     raise ValueError(f"Vault version {ver} is newer than supported {VAULT_VERSION}")
-        
+            # Existing vault — read stored KDF params, default to MODERATE for pre-v0.52.2 vaults
+            stored_memlimit = self._get_meta("kdf_memlimit")
+            if stored_memlimit:
+                kdf_memlimit = int.from_bytes(stored_memlimit, 'big')
+                kdf_opslimit = argon2id.OPSLIMIT_INTERACTIVE if kdf_memlimit == argon2id.MEMLIMIT_INTERACTIVE else argon2id.OPSLIMIT_MODERATE
+            else:
+                kdf_memlimit = argon2id.MEMLIMIT_MODERATE
+                kdf_opslimit = argon2id.OPSLIMIT_MODERATE
+
         # Derive vault key
         vault_key = argon2id.kdf(
             SecretBox.KEY_SIZE, seed_bytes, salt,
-            opslimit=argon2id.OPSLIMIT_MODERATE,
-            memlimit=argon2id.MEMLIMIT_MODERATE
+            opslimit=kdf_opslimit,
+            memlimit=kdf_memlimit
         )
         self._box = SecretBox(vault_key)
 
