@@ -3078,8 +3078,12 @@ class DHTNode:
                     # This prevents requester_node_id spoofing in TaskRequest.
                     signer_id = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest() if msg.public_key else ''
 
-                    # Record peer activity — any verified message proves liveness
-                    if signer_id:
+                    # Record peer activity — verified message proves liveness.
+                    # PluginMessages (KAD FIND_NODE etc.) are internal to the plugin
+                    # and handled by the plugin's own peer tracking (kbuckets).
+                    # Triggering DB reads + mail pushes for every KAD message caused
+                    # 288 gratuitous operations in 3 minutes at 50 nodes (v0.52.9).
+                    if signer_id and not isinstance(msg, PluginMessage):
                         self._peer_last_activity[signer_id] = time.monotonic()
                         logger.debug(f"IMPLICIT_HB from={signer_id[:16]} type={msg.type}")
                         # v0.17.4: Push pending mail on any inbound activity (not just heartbeats)
