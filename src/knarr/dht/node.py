@@ -3165,7 +3165,15 @@ class DHTNode:
             try:
                 skill_sheet = validate_skill_sheet(msg.skill_sheet)
                 skill_ttl = self._get_skill_ttl()
-                
+
+                # Create/update peer entry from Announce — ensures nodes discovered
+                # via gossip (not just JoinResponse) are routable for heartbeats,
+                # mail, and gossip forwarding. Without this, late-joining nodes are
+                # invisible to early joiners (v0.52.7: Viggo peer-propagation-gap).
+                if msg.provider_host and msg.provider_port and msg.node_id != self.node_info.node_id:
+                    peer = NodeInfo(node_id=msg.node_id, host=msg.provider_host, port=msg.provider_port)
+                    await self._enqueue_write_proto(self.storage.upsert_peer, peer)
+
                 # store peer's encryption key if provided (verify derivation to prevent MITM)
                 if msg.encryption_key:
                     try:
