@@ -1611,6 +1611,9 @@ class DHTNode:
     async def start(self):
         """Starts the server and background tasks."""
         self._main_loop = asyncio.get_running_loop()  # TEST-02: capture running loop (not deprecated get_event_loop)
+        # Share node's 32+ thread pool as default executor — prevents asyncio.to_thread
+        # and run_in_executor(None) from starving on the default 5-8 thread pool at scale.
+        self._main_loop.set_default_executor(self._handler_pool)
         self.server = await asyncio.start_server(
             self._handle_connection, self._bind_host, self.node_info.port
         )
