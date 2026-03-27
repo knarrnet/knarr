@@ -42,7 +42,7 @@ from . import profiling as _profiling
 logger = logging.getLogger(__name__)
 
 
-class TrackedThreadPool(concurrent.futures.Executor):
+class TrackedThreadPool(concurrent.futures.ThreadPoolExecutor):
     """B-03: ThreadPoolExecutor wrapper that tracks active_workers, queue_depth, peak_queue_depth.
 
     Wraps concurrent.futures.ThreadPoolExecutor and exposes pool metrics.
