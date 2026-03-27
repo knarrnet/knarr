@@ -131,6 +131,9 @@ class KademliaPlugin(PluginHooks):
         self._own_skills: Dict[str, str] = {}  # skill_key -> canonical_path
         self._last_republish: float = time.monotonic()
         self._republish_interval: float = float(config.get("republish_interval_seconds", 900.0))
+        # A-07: Post-promotion stagger state
+        # After auto-promote, tick 1 = self-lookup, tick 2 = bucket refresh, tick 3 = republish.
+        self._post_promote_tick: int = 0  # 0 = not promoted yet / finished; 1-3 = stagger stages
         # KAD-14: on_query fan-out rate limiting
         self._query_lookup_rate_limit = int(config.get("max_lookups_per_minute", 5))
         self._query_lookup_log: List[float] = []  # timestamps of recent lookups
@@ -894,8 +897,33 @@ class KademliaPlugin(PluginHooks):
                     self._log.info(
                         f"KAD_AUTO_PROMOTED mode=full uptime={uptime:.0f}s peers={peer_count}"
                     )
-                    # TP-15: Self-lookup to populate routing table after promotion
+                    # A-07: Start stagger sequence instead of immediate self-lookup
+                    # tick 1 = self-lookup, tick 2 = bucket refresh, tick 3 = republish
+                    self._post_promote_tick = 1
+
+            # A-07: Stagger post-promotion sequence across 3 ticks
+            if self._post_promote_tick > 0 and self._lookup and self.mode == "full":
+                if self._post_promote_tick == 1:
+                    # Tick 1: self-lookup to populate routing table
                     asyncio.create_task(self._lookup.find_nodes(self._ctx.node_id))
+                    if self._debug:
+                        self._log.info("KAD_POST_PROMOTE_TICK1 self_lookup_started")
+                    self._post_promote_tick = 2
+                elif self._post_promote_tick == 2:
+                    # Tick 2: bucket refresh
+                    await self._maybe_refresh_buckets()
+                    if self._debug:
+                        self._log.info("KAD_POST_PROMOTE_TICK2 bucket_refresh_done")
+                    self._post_promote_tick = 3
+                elif self._post_promote_tick == 3:
+                    # Tick 3: republish own skills
+                    if self._own_skills:
+                        for sk, cp in list(self._own_skills.items()):
+                            asyncio.create_task(self._put_provider_to_closest(sk, cp))
+                        if self._debug:
+                            self._log.info(f"KAD_POST_PROMOTE_TICK3 republish count={len(self._own_skills)}")
+                    self._post_promote_tick = 0  # done
+                return  # Skip normal bucket refresh + republish during stagger
 
             # Bucket refresh (full mode only, every 60 min per bucket)
             if self._lookup and self.mode == "full":

@@ -41,22 +41,37 @@ class UPnPPlugin(PluginHooks):
 
     def _discover_and_map(self):
         """Discover UPnP gateway and request port mappings."""
+        if self._debug:
+            self._log.info(f"UPNP_DISCOVER_START timeout_ms={self._discovery_timeout}")
         try:
             devices = self._upnp.discover()
+            if self._debug:
+                self._log.info(f"UPNP_DISCOVER_RESULT devices={devices}")
             if devices == 0:
                 self._log.info("UPNP_INIT no gateway found")
                 return
             self._upnp.selectigd()
             self._external_ip = self._upnp.externalipaddress()
             self._log.info(f"UPNP_INIT gateway found, external_ip={self._external_ip}")
+            if self._debug:
+                self._log.info(f"UPNP_LAN_ADDR lan_addr={self._upnp.lanaddr}")
 
             if self._protocol_port > 0:
+                if self._debug:
+                    self._log.info(f"UPNP_MAP_START port={self._protocol_port} type=protocol")
                 self._add_mapping(self._protocol_port, "TCP", f"Knarr protocol {self._protocol_port}")
             if self._sidecar_port > 0:
+                if self._debug:
+                    self._log.info(f"UPNP_MAP_START port={self._sidecar_port} type=sidecar")
                 self._add_mapping(self._sidecar_port, "TCP", f"Knarr sidecar {self._sidecar_port}")
+
+            if self._debug:
+                self._log.info(f"UPNP_INIT_DONE mappings={len(self._mappings)} external_ip={self._external_ip}")
 
         except Exception as e:
             self._log.info(f"UPNP_INIT not available ({e})")
+            if self._debug:
+                self._log.info(f"UPNP_INIT_FAIL error={type(e).__name__} detail={e}")
 
     def _add_mapping(self, port: int, protocol: str, description: str):
         """Request a single port mapping."""
@@ -66,29 +81,48 @@ class UPnPPlugin(PluginHooks):
             )
             self._mappings.append((port, protocol, description))
             self._log.info(f"UPNP_MAP {protocol} port={port}")
+            if self._debug:
+                self._log.info(f"UPNP_MAP_OK port={port} protocol={protocol} desc={description!r}")
         except Exception as e:
             self._log.warning(f"UPNP_MAP_FAIL port={port} err={e}")
+            if self._debug:
+                self._log.info(f"UPNP_MAP_FAIL_DETAIL port={port} error={type(e).__name__} detail={e}")
 
     async def on_tick(self, peers: List[NodeInfo], health: NodeHealth) -> None:
         """Renew port mappings periodically."""
         if not self._upnp or not self._mappings:
+            if self._debug:
+                self._log.info(f"UPNP_TICK_SKIP upnp_ready={self._upnp is not None} mappings={len(self._mappings)}")
             return
 
         now = time.monotonic()
-        if now - self._last_renew < self._renewal_interval:
+        elapsed = now - self._last_renew
+        if elapsed < self._renewal_interval:
+            if self._debug:
+                self._log.info(f"UPNP_TICK_SKIP_INTERVAL elapsed={elapsed:.0f}s interval={self._renewal_interval:.0f}s")
             return
 
+        if self._debug:
+            self._log.info(f"UPNP_RENEW_START mappings={len(self._mappings)} elapsed={elapsed:.0f}s")
         self._last_renew = now
+        renewed = 0
+        failed = 0
         for port, protocol, description in self._mappings:
             try:
-                self._upnp.addportmapping(
+                await asyncio.to_thread(
+                    self._upnp.addportmapping,
                     port, protocol, self._upnp.lanaddr, port, description, ""
                 )
-            except Exception:
-                pass
+                renewed += 1
+                if self._debug:
+                    self._log.info(f"UPNP_RENEW_OK port={port} protocol={protocol}")
+            except Exception as e:
+                failed += 1
+                if self._debug:
+                    self._log.info(f"UPNP_RENEW_FAIL port={port} error={type(e).__name__} detail={e}")
 
         if self._debug:
-            self._log.info(f"UPNP_RENEW mappings={len(self._mappings)}")
+            self._log.info(f"UPNP_RENEW_DONE renewed={renewed} failed={failed} mappings={len(self._mappings)}")
 
     async def on_shutdown(self) -> None:
         """Remove all port mappings."""

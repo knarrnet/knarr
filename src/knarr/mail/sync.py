@@ -1067,7 +1067,8 @@ class SyncEngine:
 
         # Build and send pull request
         req = self._node._sign(MailPullReq(
-            requester_node_id=self._node.node_info.node_id
+            requester_node_id=self._node.node_info.node_id,
+            target_identity=peer_node_id,  # E-01: populate from address book
         ))
 
         try:

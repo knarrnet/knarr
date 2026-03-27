@@ -148,7 +148,9 @@ _KNOWN_KEYS = {
              "auto_upgrade", "backup_retention_days", "wallet", "jurisdiction",
              "event_bus_size", "event_bus_debug", "max_queue_depth",
              "log_retention", "log_retention_hours", "housekeeping_retention_days",
-             "startup_jitter", "sweep_interval"},
+             "startup_jitter", "sweep_interval",
+             "implicit_hb_types", "pools",
+             "identity_bus_size"},
     "economy": {"default_soft_limit", "default_hard_limit", "settlement_min_interval_seconds"},
     "skills": {"minimum_price", "default_timeout"},
     "settlement": {"tab_reminder_auto_netting", "tab_reminder_threshold", "netting_interval", "consumer_interval"},
@@ -173,6 +175,58 @@ def _warn_unknown_keys(raw: dict, path: Path):
                     continue
                 if key not in known:
                     print(f"Warning: Unknown key '{key}' in [{section}] in {path}", file=sys.stderr)
+
+
+# E-04: valid keys inside each [identities.<name>] section
+_IDENTITY_KNOWN_KEYS = {"data_dir", "skills", "vault_key", "mail", "debug"}
+
+
+def parse_identity_configs(config: dict) -> list:
+    """E-04: Parse [identities.*] sections from loaded config.
+
+    Returns a list of identity config dicts, each with at minimum:
+        name, data_dir, skills
+
+    If no [identities] section is present, returns an empty list
+    (single-identity backward-compatible mode).
+
+    Example TOML::
+
+        [identities.alice]
+        data_dir = "identity-alice"
+        skills = ["llm/chat@1.0"]
+
+        [identities.bob]
+        data_dir = "identity-bob"
+        skills = ["tools/dev/echo@1.0"]
+    """
+    identities_raw = config.get("identities")
+    if not identities_raw or not isinstance(identities_raw, dict):
+        return []
+
+    result = []
+    for name, cfg in identities_raw.items():
+        if not isinstance(cfg, dict):
+            _cfg_log.warning(f"CONFIG_IDENTITY_INVALID name={name} — expected a table, got {type(cfg).__name__}")
+            continue
+
+        # Warn on unknown keys
+        for key in cfg:
+            if key not in _IDENTITY_KNOWN_KEYS:
+                _cfg_log.warning(f"CONFIG_IDENTITY_UNKNOWN_KEY name={name} key={key}")
+
+        entry = {
+            "name": name,
+            "data_dir": cfg.get("data_dir", f"identity-{name}"),
+            "skills": list(cfg.get("skills", [])),
+        }
+        # Pass through optional keys
+        for opt_key in ("vault_key", "mail", "debug"):
+            if opt_key in cfg:
+                entry[opt_key] = cfg[opt_key]
+        result.append(entry)
+
+    return result
 
 
 def _warn_invalid_types(raw: dict, path: Path):

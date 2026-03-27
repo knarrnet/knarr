@@ -38,7 +38,8 @@ class EventBus:
     Events with valid_until in the past at emit time are silently discarded.
     """
 
-    __slots__ = ("_ring", "_size", "_head", "_subs", "_debug", "_lock", "_deferred", "_loop")
+    __slots__ = ("_ring", "_size", "_head", "_subs", "_debug", "_lock", "_deferred", "_loop",
+                 "_events_dropped_count", "_last_metrics_log")
 
     def __init__(self, size: int = 256, debug: bool = False):
         size = max(16, min(65536, size))  # clamp to sane range
@@ -55,6 +56,9 @@ class EventBus:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
             self._loop = None  # outside event loop (tests) — fallback to direct set
+        # B-02: Bus metrics
+        self._events_dropped_count: int = 0
+        self._last_metrics_log: float = 0.0
 
     def subscribe(self, *patterns: str) -> "Subscriber":
         """Create a subscriber for events matching any of the given glob patterns.
@@ -155,11 +159,69 @@ class EventBus:
         self._wake_subscribers(event_type)
         return event_id
 
-    def _write_to_ring(self, event: dict) -> None:
-        """Write event into the ring buffer under lock."""
+    @property
+    def ring_fill_pct(self) -> float:
+        """B-02: Percentage of ring buffer currently filled (0.0 – 100.0)."""
+        active = max(0, min(self._head, self._size))
+        return (active / self._size) * 100.0
+
+    @property
+    def events_dropped_count(self) -> int:
+        """B-02: Total number of events that were overwritten (ring was full at emit time)."""
+        return self._events_dropped_count
+
+    @property
+    def deferred_queue_depth(self) -> int:
+        """B-02: Number of events currently waiting in the deferred (future) queue."""
         with self._lock:
-            self._ring[self._head % self._size] = event
+            return len(self._deferred)
+
+    @property
+    def subscribers_behind_count(self) -> int:
+        """B-02: Number of subscribers whose cursor is behind the oldest ring entry."""
+        oldest = self._head - self._size
+        return sum(1 for s in self._subs if s._cursor < oldest)
+
+    def get_metrics(self) -> dict:
+        """B-02: Return a snapshot of bus metrics."""
+        return {
+            "ring_fill_pct": self.ring_fill_pct,
+            "events_dropped_count": self._events_dropped_count,
+            "deferred_queue_depth": self.deferred_queue_depth,
+            "subscribers_behind_count": self.subscribers_behind_count,
+            "ring_size": self._size,
+            "head": self._head,
+            "subscriber_count": len(self._subs),
+        }
+
+    def metrics(self) -> dict:
+        """B-02: Alias for get_metrics() — used by ScopedEventBus."""
+        return self.get_metrics()
+
+    def _write_to_ring(self, event: dict) -> None:
+        """Write event into the ring buffer under lock.
+
+        B-02: Track dropped events when ring is full (old events overwritten).
+        """
+        with self._lock:
+            slot = self._head % self._size
+            if self._ring[slot] is not None:
+                # Overwriting an existing (non-None) slot = drop
+                self._events_dropped_count += 1
+            self._ring[slot] = event
             self._head += 1
+
+        # B-02: Log metrics every 60s when ring is >50% full
+        fill = self.ring_fill_pct
+        if fill > 50.0:
+            import time as _time
+            now = _time.monotonic()
+            if now - self._last_metrics_log >= 60.0:
+                self._last_metrics_log = now
+                log.info(
+                    f"BUS_METRICS fill={fill:.1f}% dropped={self._events_dropped_count} "
+                    f"deferred={self.deferred_queue_depth} behind={self.subscribers_behind_count}"
+                )
 
     def _wake_subscribers(self, event_type: str) -> None:
         """Wake all subscribers matching event_type. Thread-safe via call_soon_threadsafe."""

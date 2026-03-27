@@ -82,6 +82,12 @@ class FakeNode:
         self.node_info.node_id = "test_node_id"
         self.background_tasks = []
 
+    _protocol_pool = None
+    _handler_pool = None
+
+    async def _run_in_protocol_pool(self, fn, *args):
+        return fn(*args)
+
     async def _enqueue_write(self, fn, *args, **kwargs):
         if asyncio.iscoroutinefunction(fn):
             return await fn(*args, **kwargs)

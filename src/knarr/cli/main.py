@@ -464,6 +464,29 @@ async def cmd_serve(args):
     # Ensure node is in its own peer table so storage queries return its own skills [R-01]
     await node._enqueue_write(node.storage.upsert_peer, node.node_info)
 
+    # E-07: Multi-identity startup — parse [identities.*] sections and instantiate
+    # If no [identities] section: single-identity backward-compatible mode (no-op)
+    from ..cli.config import parse_identity_configs
+    from ..dht.identity_storage import setup_identities
+    _identity_configs = parse_identity_configs(config)
+    if _identity_configs:
+        _vault = getattr(node, "_vault", None)
+        _base_data_dir = Path(data_dir)
+        _setup_identities = setup_identities(
+            _identity_configs,
+            base_data_dir=_base_data_dir,
+            vault=_vault,
+            registry=node._identity_registry,
+            debug=bool(config.get("node", {}).get("event_bus_debug", False)),
+        )
+        # E-07: Build skill-to-identity map for TaskRequest demux (D's approach)
+        for _ident in _setup_identities:
+            for _skill in _ident.skills:
+                node._skill_to_identity[_skill] = _ident.node_id
+        logger.info(f"MULTI_IDENTITY_STARTUP identities={len(_setup_identities)} skills_mapped={len(node._skill_to_identity)}")
+    # Single-identity mode: _identity_registry was initialized in DHTNode.__init__
+    # with the node's own node_id as default — no further action needed.
+
     print(f"Node ID: {node.node_info.node_id}")
     print(f"Listening: {bind_host}:{port}")
     if advertise_host and advertise_host != bind_host:
@@ -742,6 +765,13 @@ async def cmd_serve(args):
     print("\nShutting down...", file=sys.stderr)
     if cockpit_server:
         await cockpit_server.stop()
+    # E-07: Close per-identity storage connections before node stop
+    for _ident in node._identity_registry.all:
+        try:
+            if _ident.storage is not None and hasattr(_ident.storage, "close"):
+                _ident.storage.close()
+        except Exception as _e:
+            logger.debug(f"IDENTITY_STORAGE_CLOSE_FAIL name={_ident.name}: {_e}")
     await node.stop()
     try:
         if os.path.exists(pid_path):
