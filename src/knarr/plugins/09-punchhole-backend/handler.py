@@ -257,8 +257,8 @@ class PunchholeBackendPlugin(PluginHooks):
         await asyncio.sleep(0)
 
         try:
-            # Resolve ACL for all tiers and push to frontend
-            self._push_acl_config()
+            # Resolve ACL for all tiers and push to frontend (C-05)
+            await self._push_acl_config()
 
             # Build and emit all non-live objects
             for object_key, obj_config in self._objects.items():
@@ -388,7 +388,7 @@ class PunchholeBackendPlugin(PluginHooks):
         requester_tier = self._resolve_acl_group(requester_node_id)
         return _tier_has_access(requester_tier, required)
 
-    def _push_acl_config(self):
+    async def _push_acl_config(self):
         """Build ACL map for all known nodes and push to frontend via bus."""
         if not self._ctx.emit_event:
             return
@@ -396,7 +396,8 @@ class PunchholeBackendPlugin(PluginHooks):
         # Collect all known nodes and their highest-privilege tier
         acl_map: Dict[str, str] = {}
 
-        peers = self._get_all_peer_node_ids()
+        # C-05: wrap full-table SQLite scan in thread to avoid blocking event loop
+        peers = await asyncio.to_thread(self._get_all_peer_node_ids)
         for nid in peers:
             acl_map[nid] = "peer"
 

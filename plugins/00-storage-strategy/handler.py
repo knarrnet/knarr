@@ -75,10 +75,14 @@ class StorageStrategyPlugin(PluginHooks):
     def _lazy_init(self) -> bool:
         """TP-5: Deferred storage wrapping — called on first on_tick when _node is available."""
         if self._ctx._node is None:
+            if self._debug:
+                logger.info("STORAGE_STRATEGY_DEFERRED_INIT node=not_ready")
             return False
 
         self._raw_storage = self._ctx._node.storage
         ttl_config = self._config.get("cache", {})
+        if self._debug:
+            logger.info("STORAGE_STRATEGY_INIT_BEGIN cache_ttl_config=%r", ttl_config)
         self._proxy = StorageCacheProxy(self._raw_storage, ttl_config)
 
         # SA-02: Patch proxy with thread-offloaded async reads
@@ -92,6 +96,8 @@ class StorageStrategyPlugin(PluginHooks):
         self._archive_dir = os.path.join(
             data_dir, self._archive_cfg.get("archive_dir", "archives")
         )
+        if self._debug:
+            logger.info("STORAGE_STRATEGY_ARCHIVE_DIR dir=%s", self._archive_dir)
 
         self._initialized = True
         logger.info("STORAGE_STRATEGY_INIT cache_proxy=enabled async_reads=enabled")
@@ -111,25 +117,37 @@ class StorageStrategyPlugin(PluginHooks):
         archived_tables: set = set()
         if now - self._last_archive >= self._ARCHIVE_INTERVAL_SECONDS:
             self._last_archive = now
+            if self._debug:
+                logger.info("STORAGE_STRATEGY_ARCHIVE_START interval=%.0f", self._ARCHIVE_INTERVAL_SECONDS)
             try:
                 archived_tables = await self._run_archive_cycle()
+                if self._debug:
+                    logger.info("STORAGE_STRATEGY_ARCHIVE_DONE tables=%r", sorted(archived_tables))
             except Exception as exc:
                 logger.warning("STORAGE_STRATEGY_ARCHIVE_FAIL error=%s", exc)
 
         # SA-06: Pruning
         if now - self._last_prune >= self._PRUNE_INTERVAL_SECONDS:
             self._last_prune = now
+            if self._debug:
+                logger.info("STORAGE_STRATEGY_PRUNE_START interval=%.0f", self._PRUNE_INTERVAL_SECONDS)
             try:
                 self._run_pruning_cycle(archived_tables)
+                if self._debug:
+                    logger.info("STORAGE_STRATEGY_PRUNE_DONE")
             except Exception as exc:
                 logger.warning("STORAGE_STRATEGY_PRUNE_FAIL error=%s", exc)
 
         if self._debug:
             stats = self._proxy.cache_stats()
+            hit_rate = (stats["hits"] / max(1, stats["hits"] + stats["misses"])) * 100
             logger.info(
-                "STORAGE_CACHE_STATS hits=%d misses=%d size=%d",
-                stats["hits"], stats["misses"], stats["size"]
+                "STORAGE_CACHE_STATS hits=%d misses=%d size=%d hit_rate=%.1f%% peers=%d write_queue=%d",
+                stats["hits"], stats["misses"], stats["size"], hit_rate,
+                len(peers), getattr(health, 'write_queue_depth', 0)
             )
+            if stats["misses"] > 0 and hit_rate < 50.0:
+                logger.info("STORAGE_CACHE_LOW_HIT_RATE rate=%.1f%% — consider increasing cache TTLs", hit_rate)
 
     async def _run_archive_cycle(self) -> set:
         """SA-03: Archive old rows from receipt_log and execution_log.

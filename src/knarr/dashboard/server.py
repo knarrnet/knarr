@@ -132,13 +132,15 @@ class CockpitServer:
         if self._tls_mode == "both" and ssl_ctx:
             # HTTP on self._port, HTTPS on self._port + 1
             self._server_plain = await asyncio.start_server(
-                self._handle_connection, self._bind, self._port
+                self._handle_connection, self._bind, self._port,
+                backlog=512,
             )
             sock_plain = self._server_plain.sockets[0]
             self._port = sock_plain.getsockname()[1]
             https_port = self._port + 1
             self._server = await asyncio.start_server(
-                self._handle_connection, self._bind, https_port, ssl=ssl_ctx
+                self._handle_connection, self._bind, https_port, ssl=ssl_ctx,
+                backlog=512,
             )
             self._https_port = self._server.sockets[0].getsockname()[1]
             logger.info(f"Cockpit dashboard listening on {self._bind}:{self._port} (HTTP) + :{self._https_port} (HTTPS)")
@@ -146,7 +148,8 @@ class CockpitServer:
             # Single server: HTTPS (auto) or HTTP (off)
             use_ssl = ssl_ctx if self._tls_mode != "off" else None
             self._server = await asyncio.start_server(
-                self._handle_connection, self._bind, self._port, ssl=use_ssl
+                self._handle_connection, self._bind, self._port, ssl=use_ssl,
+                backlog=512,
             )
             sock = self._server.sockets[0]
             self._port = sock.getsockname()[1]
@@ -650,6 +653,8 @@ class CockpitServer:
                     elif path.startswith("/api/jobs/"):
                         job_id = path[len("/api/jobs/"):]
                         await self._handle_job_status(writer, job_id)
+                    elif path == "/api/metrics":
+                        self._respond_json(writer, self._build_metrics_response())
                     elif path == "/api/economy":
                         self._respond_json(writer, self._node.get_economy_summary())
                     elif path == "/api/results":
@@ -818,8 +823,18 @@ class CockpitServer:
         except Exception as e:
             import traceback
             logger.error(f"Cockpit connection error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        except BaseException:
+            # Post-assembly 1b: CancelledError is BaseException in Python 3.9+.
+            # Ensure decrement runs on task cancellation to prevent counter leak.
+            raise
         finally:
             self._active_connections -= 1
+            # Post-assembly 1b: Log when active connections > 50% of max
+            if self._active_connections > self._max_connections * 0.5:
+                logger.warning(
+                    "COCKPIT_CONNECTIONS_HIGH active=%d max=%d",
+                    self._active_connections, self._max_connections,
+                )
             writer.close()
             try:
                 await writer.wait_closed()
@@ -2397,6 +2412,77 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
     def _respond_json(self, writer, data):
         body = json.dumps(data).encode("utf-8")
         self._respond(writer, "200 OK", "application/json", body)
+
+    def _build_metrics_response(self) -> dict:
+        """B-04: Build /api/metrics response with bus stats, pool stats, cache stats.
+
+        Returns:
+          bus: per-bus metrics (protocol_bus + identity_bus if available)
+          pools: protocol + handler pool metrics
+          cache: hit rate, invalidation count
+          identities: per-identity info list
+        """
+        import time as _time
+
+        # Bus metrics
+        bus_metrics = {}
+        protocol_bus = getattr(self._node, "protocol_bus", None)
+        identity_bus = getattr(self._node, "bus", None)
+        if protocol_bus is not None and hasattr(protocol_bus, "get_metrics"):
+            bus_metrics["protocol_bus"] = protocol_bus.get_metrics()
+        if identity_bus is not None and hasattr(identity_bus, "get_metrics"):
+            bus_metrics["identity_bus"] = identity_bus.get_metrics()
+        # Fallback: single bus (legacy mode)
+        if not bus_metrics and identity_bus is not None and hasattr(identity_bus, "get_metrics"):
+            bus_metrics["bus"] = identity_bus.get_metrics()
+
+        # Pool metrics
+        pool_metrics = {}
+        if hasattr(self._node, "get_pool_metrics"):
+            pool_metrics = self._node.get_pool_metrics()
+
+        # Cache stats (from storage proxy if available)
+        cache_stats = {}
+        storage = getattr(self._node, "storage", None)
+        if storage is not None and hasattr(storage, "cache_stats"):
+            try:
+                cs = storage.cache_stats()
+                total = cs.get("hits", 0) + cs.get("misses", 0)
+                cache_stats = {
+                    "hits": cs.get("hits", 0),
+                    "misses": cs.get("misses", 0),
+                    "size": cs.get("size", 0),
+                    "hit_rate_pct": round((cs.get("hits", 0) / max(1, total)) * 100.0, 1),
+                    "invalidation_count": cs.get("invalidations", 0),
+                }
+            except Exception:
+                pass
+
+        # Per-identity list (E-track; single identity in legacy mode)
+        identities = []
+        registry = getattr(self._node, "_identity_registry", None)
+        if registry is not None and hasattr(registry, "list_identities"):
+            for ident in registry.list_identities():
+                identities.append({
+                    "node_id": ident.get("node_id", ""),
+                    "name": ident.get("name", ""),
+                    "skill_count": ident.get("skill_count", 0),
+                })
+        if not identities:
+            # Legacy single-identity mode
+            identities.append({
+                "node_id": self._node.node_info.node_id,
+                "name": "default",
+                "skill_count": len(getattr(self._node, "_own_skills", {})),
+            })
+
+        return {
+            "ts": _time.time(),
+            "bus": bus_metrics,
+            "pools": pool_metrics,
+            "cache": cache_stats,
+            "identities": identities,
+        }
 
     def _respond_404(self, writer):
         self._respond(writer, "404 Not Found", "text/plain", b"Not Found")

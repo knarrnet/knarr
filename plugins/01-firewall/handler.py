@@ -233,6 +233,11 @@ class FirewallPlugin(PluginHooks):
         self._rate_multipliers = dict(groups_cfg.get("rate_multipliers", {}))
         self._qos_groups = list(groups_cfg.get("qos_priority", []))
 
+        # A-04: Gateway IP exemption — bypass L1 rate limiting for Docker bridge gateway
+        self._gateway_exempt: set = set(config.get("gateway_exempt", []))
+        if self._debug and self._gateway_exempt:
+            self._log.info(f"FIREWALL_GATEWAY_EXEMPT ips={sorted(self._gateway_exempt)}")
+
         # Background Loop
         self._process_task = asyncio.create_task(self._process_loop())
 
@@ -270,33 +275,46 @@ class FirewallPlugin(PluginHooks):
                             self._log.info(f"IN_DROP {msg_type} from={sender_id[:16]} ip={peer_ip} reason=group_blocked group={bg}")
                         return False
 
+        # A-04: Gateway IP exemption — Docker bridge gateway bypass for L1 rate limiting.
+        # L3+ identity checks (Ed25519) still apply.
+        _gateway_exempt = peer_ip in self._gateway_exempt
+        if _gateway_exempt and self._debug:
+            self._log.info(f"GATEWAY_EXEMPT ip={peer_ip} msg_type={msg_type}")
+
         # L4 — Rate Check (all messages, before type split)
+        # Skip for gateway-exempt IPs (Docker bridge — all 150 nodes appear as one IP).
         counter_id = cert_id or peer_ip
-        counter = self._rate_counters[counter_id]
-        weight = self._get_weight(msg)
-        counter.add(weight)
+        if not _gateway_exempt:
+            counter = self._rate_counters[counter_id]
+            weight = self._get_weight(msg)
+            counter.add(weight)
 
-        count = counter.total(self._window_seconds)
-        limit = self._get_effective_limit(msg, cert_id)
-        ratio = count / limit
+            count = counter.total(self._window_seconds)
+            limit = self._get_effective_limit(msg, cert_id)
+            ratio = count / limit
 
-        if ratio > 1.0:
-            if self._debug:
-                self._log.info(f"IN_BAN {msg_type} from={sender_id[:16]} ip={peer_ip} ratio={ratio:.2f}")
-            self._ban(cert_id, peer_ip, "Rate limit exceeded")
-            # Heartbeats exempt — must flow to keep peer alive even during rate-limit
-            if not isinstance(msg, Heartbeat):
-                return False
+            if ratio > 1.0:
+                if self._debug:
+                    self._log.info(f"IN_BAN {msg_type} from={sender_id[:16]} ip={peer_ip} ratio={ratio:.2f}")
+                self._ban(cert_id, peer_ip, "Rate limit exceeded")
+                # Heartbeats exempt — must flow to keep peer alive even during rate-limit
+                if not isinstance(msg, Heartbeat):
+                    return False
 
-        # SA-FW1: Per-IP aggregate rate counter (defeats identity fragmentation)
-        # Every message increments the IP counter regardless of identity.
-        # IP limit is 2x base_limit — allows legitimate multi-identity use
-        # but blocks single-IP floods via keypair rotation.
-        ip_counter = self._ip_rate_counters[peer_ip]
-        ip_counter.add(weight)
-        ip_count = ip_counter.total(self._window_seconds)
-        ip_limit = self._base_limit * 2
-        if ip_count > ip_limit:
+            # SA-FW1: Per-IP aggregate rate counter (defeats identity fragmentation)
+            # Every message increments the IP counter regardless of identity.
+            # IP limit is 2x base_limit — allows legitimate multi-identity use
+            # but blocks single-IP floods via keypair rotation.
+            ip_counter = self._ip_rate_counters[peer_ip]
+            ip_counter.add(weight)
+            ip_count = ip_counter.total(self._window_seconds)
+            ip_limit = self._base_limit * 2
+        else:
+            weight = self._get_weight(msg)
+            ratio = 0.0
+            ip_count = 0
+            ip_limit = 1
+        if not _gateway_exempt and ip_count > ip_limit:
             if self._debug:
                 self._log.info(f"IN_BAN_IP {msg_type} ip={peer_ip} ip_count={ip_count} ip_limit={ip_limit}")
             self._ip_blocklist[peer_ip] = (time.time() + self._ban_duration_minutes * 60, cert_id)

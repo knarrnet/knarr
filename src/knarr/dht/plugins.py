@@ -1,9 +1,11 @@
 import asyncio
 import dataclasses
 import importlib.util
+import json
 import logging
 import sys
 import tomllib
+import urllib.request
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Type, Any
 
@@ -11,6 +13,92 @@ from knarr.core.messages import Message
 from knarr.core.models import NodeInfo
 
 log = logging.getLogger(__name__)
+
+# A-02: Protocol bus topic prefixes — route to shared bus.
+# Everything else goes to the identity bus.
+_PROTOCOL_EVENT_PREFIXES = ("peer.", "node.", "security.", "cache.")
+_PROTOCOL_EVENT_NAMES = {"skill.registered", "skill.removed"}
+
+
+def is_protocol_event(event_type: str) -> bool:
+    """A-02: Classify event topic as protocol (shared) vs identity (scoped)."""
+    event_type = str(event_type or "")
+    if event_type in _PROTOCOL_EVENT_NAMES:
+        return True
+    return event_type.startswith(_PROTOCOL_EVENT_PREFIXES)
+
+
+class ScopedSubscriber:
+    """A-02: Read from a shared protocol bus plus a single identity bus."""
+
+    def __init__(self, *subs):
+        self._subs = [sub for sub in subs if sub is not None]
+        self._buffer: list = []  # TP-9: buffer for simultaneous events
+
+    async def next(self) -> dict:
+        # TP-9: Return buffered events first before waiting for new ones
+        if self._buffer:
+            return self._buffer.pop(0)
+        tasks = [asyncio.create_task(sub.next()) for sub in self._subs]
+        if not tasks:
+            await asyncio.Event().wait()
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        # TP-12: Cancel pending and await to avoid leaked coroutines
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        # TP-9: Collect ALL done results, return first, buffer rest
+        results = [t.result() for t in done]
+        first = results[0]
+        if len(results) > 1:
+            self._buffer.extend(results[1:])
+        return first
+
+    def poll(self) -> list:
+        events = []
+        for sub in self._subs:
+            events.extend(sub.poll())
+        return sorted(events, key=lambda event: (event.get("ts", 0.0), event.get("event_id", "")))
+
+
+class ScopedEventBus:
+    """A-02: Route protocol topics to the shared bus and everything else to one identity bus."""
+
+    def __init__(self, protocol_bus, identity_bus):
+        self.protocol_bus = protocol_bus
+        self.identity_bus = identity_bus
+
+    def emit(self, event_type: str, valid_from: float = None,
+             valid_until: float = None, **fields) -> str:
+        bus = self.protocol_bus if is_protocol_event(event_type) else self.identity_bus
+        return bus.emit(event_type, valid_from=valid_from, valid_until=valid_until, **fields)
+
+    def subscribe(self, *patterns: str) -> ScopedSubscriber:
+        return ScopedSubscriber(
+            self.protocol_bus.subscribe(*patterns),
+            self.identity_bus.subscribe(*patterns),
+        )
+
+    def tick(self) -> int:
+        return int(self.protocol_bus.tick()) + int(self.identity_bus.tick())
+
+    def cancel(self, event_id: str) -> bool:
+        return bool(self.identity_bus.cancel(event_id) or self.protocol_bus.cancel(event_id))
+
+    def unsubscribe(self, subscriber) -> None:
+        """TP-13: Unsubscribe from both internal buses."""
+        if hasattr(self.protocol_bus, "unsubscribe"):
+            self.protocol_bus.unsubscribe(subscriber)
+        if hasattr(self.identity_bus, "unsubscribe"):
+            self.identity_bus.unsubscribe(subscriber)
+
+    def get_metrics(self) -> dict:
+        """Return combined metrics from both buses."""
+        return {
+            "protocol": self.protocol_bus.get_metrics() if hasattr(self.protocol_bus, "get_metrics") else {},
+            "identity": self.identity_bus.get_metrics() if hasattr(self.identity_bus, "get_metrics") else {},
+        }
 
 
 @dataclasses.dataclass
@@ -220,6 +308,24 @@ class PluginContext:
         # Set to None here; wired in node.py after plugin load.
         if not hasattr(self, "sign_bytes"):
             self.sign_bytes = None  # Callable: (bytes) -> (signature_bytes, pubkey_hex)
+
+    def get_economy_stats(self) -> dict:
+        """C-06: Return economy stats from node storage directly (local bypass).
+
+        Avoids circular HTTP round-trip when node is available.
+        Falls back to None when node or storage is not available — caller
+        should then fall back to HTTP API.
+        """
+        try:
+            if self._node is not None:
+                storage = getattr(self._node, "storage", None)
+                if storage is not None:
+                    fn = getattr(storage, "get_economy_stats", None)
+                    if callable(fn):
+                        return fn()
+        except Exception:
+            pass
+        return None
 
 
 class PluginLoader:

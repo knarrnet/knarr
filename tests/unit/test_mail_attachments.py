@@ -1,4 +1,5 @@
 """Tests for knarr-mail sidecar attachment integration."""
+import asyncio
 import base64
 import hashlib
 import json
@@ -82,14 +83,14 @@ def _send(body, caller="sender" + "0" * 58, attachments=None):
     }
     if attachments is not None:
         input_data["attachments"] = attachments
-    return handler.handle(input_data)
+    return asyncio.run(handler.handle(input_data))
 
 
 def _poll(node):
-    return handler.handle({
+    return asyncio.run(handler.handle({
         "action": "poll",
         "_caller_node_id": node.node_info.node_id,
-    })
+    }))
 
 
 # --- Send with URI attachment ---

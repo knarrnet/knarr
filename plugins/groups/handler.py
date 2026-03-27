@@ -1,4 +1,5 @@
 """knarr-groups plugin: GroupEngine implementation with explicit and computed groups."""
+import asyncio
 import hashlib
 import logging
 import operator
@@ -125,7 +126,7 @@ class GroupsPlugin(PluginHooks):
         now = time.monotonic()
         if now - self._last_eval >= self._eval_interval:
             self._last_eval = now
-            self._evaluate_all_computed()
+            await self._evaluate_all_computed()
 
     async def on_query(self, query_type: str, value: str) -> list:
         return []
@@ -196,7 +197,7 @@ class GroupsPlugin(PluginHooks):
             log.warning(f"Groups plugin: cannot open node.db: {e}")
             return None
 
-    def _evaluate_all_computed(self):
+    async def _evaluate_all_computed(self):
         """Re-evaluate all computed and DHT groups, refresh externals."""
         for name, cfg in self._group_defs.items():
             gtype = cfg.get("type", "explicit")
@@ -220,7 +221,7 @@ class GroupsPlugin(PluginHooks):
                 elif gtype == "external":
                     source = cfg.get("source", "")
                     if source == "https":
-                        members = self._fetch_external_https(name, cfg)
+                        members = await self._fetch_external_https(name, cfg)
                         self._cache[name] = members
                         if self._debug:
                             self._ctx.log.info(f"GRP_EVAL name={name} type=external members={len(members)}")
@@ -417,8 +418,12 @@ class GroupsPlugin(PluginHooks):
 
     # ── External HTTPS+Signature Source (v0.26.0) ──────────────
 
-    def _fetch_external_https(self, name: str, cfg: dict) -> Set[str]:
-        """Fetch signed group membership list from HTTPS endpoint."""
+    async def _fetch_external_https(self, name: str, cfg: dict) -> Set[str]:
+        """Async wrapper: run blocking HTTPS fetch in a thread (C-03)."""
+        return await asyncio.to_thread(self._fetch_external_https_blocking, name, cfg)
+
+    def _fetch_external_https_blocking(self, name: str, cfg: dict) -> Set[str]:
+        """Fetch signed group membership list from HTTPS endpoint (blocking)."""
         import urllib.request
         import json as _json
 
@@ -505,11 +510,31 @@ class GroupsPlugin(PluginHooks):
                     self._cache[group_name] = self._evaluate_dht_group(group_name, match)
             elif gtype == "external" and cfg.get("source") == "https":
                 setattr(self, f"_ext_ts_{group_name}", 0)
-                self._cache[group_name] = self._fetch_external_https(group_name, cfg)
+                self._cache[group_name] = self._fetch_external_https_blocking(group_name, cfg)
             elif gtype == "explicit":
                 # Re-read from config + members file (preserves API mutations)
                 self._load_explicit_groups()
         else:
-            self._evaluate_all_computed()
+            # _evaluate_all_computed is async; schedule via running loop or run blocking version
+            try:
+                loop = asyncio.get_running_loop()
+                asyncio.ensure_future(self._evaluate_all_computed())
+            except RuntimeError:
+                # No running loop (CLI context) — run external fetches blocking
+                for _name, _cfg in self._group_defs.items():
+                    _gtype = _cfg.get("type", "explicit")
+                    try:
+                        if _gtype == "computed":
+                            _f = _cfg.get("filter", {})
+                            if _f:
+                                self._cache[_name] = self._evaluate_computed(_name, _f)
+                        elif _gtype == "dht":
+                            _m = _cfg.get("match", {})
+                            if _m:
+                                self._cache[_name] = self._evaluate_dht_group(_name, _m)
+                        elif _gtype == "external" and _cfg.get("source") == "https":
+                            self._cache[_name] = self._fetch_external_https_blocking(_name, _cfg)
+                    except Exception as _e:
+                        log.warning(f"Groups plugin: refresh eval failed for '{_name}': {_e}")
             self._load_explicit_groups()
 

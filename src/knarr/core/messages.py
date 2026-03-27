@@ -98,6 +98,7 @@ class TaskRequest(Message):
     input_data: Dict[str, Any] = field(default_factory=dict)
     timeout_ms: int = 30000
     mode: str = "sync"  # "sync" (default) or "async"
+    target_identity: str = ""  # E-01: target identity for multi-identity routing
     type: str = "TASK_REQUEST"
 
 @dataclass(frozen=True)
@@ -169,6 +170,7 @@ class PluginMessage(Message):
     plugin_name: str = ""    # target plugin (e.g. "knarr-kademlia")
     action: str = ""         # plugin-specific action (e.g. "FIND_NODE")
     payload: str = ""        # JSON-encoded plugin-specific data
+    target_node_id: str = ""  # E-01: target identity node_id for multi-identity routing
     type: str = "PLUGIN_MESSAGE"
 
 @dataclass(frozen=True)
@@ -176,6 +178,7 @@ class MailPullReq(Message):
     """Request pending mail from a peer (Tier 2 pull)."""
     requester_node_id: str = ""
     since_timestamp: float = 0.0
+    target_identity: str = ""  # E-01: target identity for multi-identity routing
     type: str = "MAIL_PULL_REQ"
 
 @dataclass(frozen=True)

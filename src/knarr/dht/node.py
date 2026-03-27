@@ -35,11 +35,80 @@ from .storage import Storage
 from .protocol import send_message, receive_message, request_response, ProtocolError
 from .sidecar import AssetSidecar, TaskContext
 from .pool import ConnectionPool
-from .plugins import PluginLoader, NodeHealth
+from .plugins import PluginLoader, NodeHealth, ScopedEventBus
 from .eventbus import EventBus
 from . import profiling as _profiling
 
 logger = logging.getLogger(__name__)
+
+
+class TrackedThreadPool(concurrent.futures.Executor):
+    """B-03: ThreadPoolExecutor wrapper that tracks active_workers, queue_depth, peak_queue_depth.
+
+    Wraps concurrent.futures.ThreadPoolExecutor and exposes pool metrics.
+    All ThreadPoolExecutor methods are delegated transparently.
+    TP-7: Inherits Executor to satisfy Python 3.13 set_default_executor() type-check.
+    """
+
+    def __init__(self, max_workers: int, thread_name_prefix: str = ""):
+        self._pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix=thread_name_prefix,
+        )
+        self._max_workers = max_workers
+        self._lock = threading.Lock()
+        self._active_workers: int = 0
+        self._queue_depth: int = 0
+        self._peak_queue_depth: int = 0
+        self._last_metrics_log: float = 0.0
+
+    def submit(self, fn, *args, **kwargs):
+        """Submit a callable to the pool, tracking queue depth."""
+        with self._lock:
+            self._queue_depth += 1
+            if self._queue_depth > self._peak_queue_depth:
+                self._peak_queue_depth = self._queue_depth
+
+        def _wrapped(*a, **kw):
+            with self._lock:
+                self._queue_depth -= 1
+                self._active_workers += 1
+            try:
+                return fn(*a, **kw)
+            finally:
+                with self._lock:
+                    self._active_workers -= 1
+
+        # TP-10: Decrement queue_depth if submit itself fails (pool shutdown, etc.)
+        try:
+            return self._pool.submit(_wrapped, *args, **kwargs)
+        except Exception:
+            with self._lock:
+                self._queue_depth -= 1
+            raise
+
+    def get_metrics(self) -> dict:
+        """B-03: Return pool metrics snapshot."""
+        with self._lock:
+            return {
+                "active_workers": self._active_workers,
+                "queue_depth": self._queue_depth,
+                "peak_queue_depth": self._peak_queue_depth,
+                "max_workers": self._max_workers,
+            }
+
+    def shutdown(self, wait: bool = True, **kwargs):
+        return self._pool.shutdown(wait=wait, **kwargs)
+
+    def map(self, fn, *iterables, timeout=None, chunksize=1):
+        return self._pool.map(fn, *iterables, timeout=timeout, chunksize=chunksize)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self._pool.__exit__(*args)
+
 
 MAX_CONCURRENT_CONNECTIONS = 256
 CONNECTION_TIMEOUT = 10.0  # seconds — client connect/send timeout
@@ -59,6 +128,9 @@ SWEEP_BATCH_SIZE = 50  # B3: max peers processed per sweep cycle (P-025)
 BUS_BROADCAST_TOPICS: frozenset = frozenset({"mail.flush_skip"})
 # BUS-01: topics allowed for cross-node EventNotify propagation (receive side)
 _EVENT_BROADCAST_TOPICS: frozenset = frozenset({"mail.flush_skip"})
+
+# A-02: protocol-bus topic prefixes (peer.*, node.*, security.*, cache.*, skill.registered, skill.removed)
+_PROTOCOL_BUS_PREFIXES: tuple = ("peer.", "node.", "security.", "cache.", "skill.registered", "skill.removed")
 
 def _parse_version(v: str) -> tuple:
     """Parse 'major.minor.patch' to tuple for comparison."""
@@ -96,6 +168,9 @@ class DHTNode:
         
         self._write_queue: asyncio.Queue = asyncio.Queue()
         self._write_queue_proto: asyncio.Queue = asyncio.Queue()  # priority: heartbeat, peer upserts
+        # A-06: Event-based write queue notification (replaces 100Hz polling)
+        # Created lazily in start() once the event loop is running.
+        self._write_event: Optional[asyncio.Event] = None
         self._start_time: float = 0.0
         
         self._sidecar: Optional[AssetSidecar] = None
@@ -171,6 +246,16 @@ class DHTNode:
         self._seen_messages: Set[tuple] = set()
         self._seen_task_requests: collections.OrderedDict = collections.OrderedDict()  # SA6-02: msg_id dedup (F-11: ordered for FIFO eviction)
 
+        # A-03: Configurable IMPLICIT_HB message types (D's frozenset + type(msg).__name__)
+        # Default: frozenset of class names that genuinely prove liveness.
+        # Uses type(msg).__name__ for matching (not msg.type wire format) to avoid
+        # case mismatch: wire="HEARTBEAT" vs class="Heartbeat".
+        _hb_types_cfg = self._config.get("node", {}).get("implicit_hb_types", None)
+        if _hb_types_cfg is not None:
+            self._implicit_hb_types: frozenset = frozenset(_hb_types_cfg)
+        else:
+            self._implicit_hb_types = frozenset({"Heartbeat", "Announce", "Query"})
+
         self._task_slots = max(1, min(64, int(self._config.get("node", {}).get("task_slots", 4))))
         # v0.33.0 C-track: configurable max queue depth (floor at 1 to prevent unbounded queue)
         _max_queue = max(1, int(self._config.get("node", {}).get("max_queue_depth", 100)))
@@ -195,10 +280,28 @@ class DHTNode:
         self._shutdown_event: Optional[asyncio.Event] = None  # set by main.py for clean upgrade restart
         self._notified_version: Optional[str] = getattr(self, "_notified_version", None)
         
-        self._handler_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(32, (os.cpu_count() or 4) + 4)
+        # A-01: Two thread pool executors — protocol ops vs handler ops
+        # B-03: Use TrackedThreadPool to expose metrics
+        _pools_cfg = (config or {}).get("node", {}).get("pools", {})
+        _handler_workers = int(_pools_cfg.get("handler", max(32, (os.cpu_count() or 4) + 4)))
+        _protocol_workers = int(_pools_cfg.get("protocol", 8))
+        self._handler_pool = TrackedThreadPool(
+            max_workers=_handler_workers, thread_name_prefix="knarr-handler"
         )
+        self._protocol_pool = TrackedThreadPool(
+            max_workers=_protocol_workers, thread_name_prefix="knarr-protocol"
+        )
+        if self._debug:
+            logger.info(f"POOL_INIT handler_workers={_handler_workers} protocol_workers={_protocol_workers}")
 
+
+        # E-03: IdentityRegistry — maps node_id → Identity (populated at startup or by E-07)
+        from .identities import IdentityRegistry
+        self._identity_registry: IdentityRegistry = IdentityRegistry(
+            default_node_id=self.node_info.node_id, debug=self._debug
+        )
+        # E-02: skill → identity node_id map (populated at startup for multi-identity)
+        self._skill_to_identity: dict = {}  # skill_name -> identity_node_id
 
         # Meta cache registry and TTL (must be before register_meta_realm calls)
         self._meta_realms: dict = {}  # realm_name -> RealmConfig
@@ -264,9 +367,14 @@ class DHTNode:
         # v0.32.0: EventBus — intra-node event channel (ring buffer, volatile)
         # Must be created before PluginLoader so bus callbacks can be wired into context.
         # v0.33.0: bus size configurable via [node] event_bus_size
+        # A-02: two-tier bus split — protocol bus (peer/node/security/cache/skill) + identity bus (everything else)
         _bus_debug = bool(self._config.get("node", {}).get("event_bus_debug", False))
         _bus_size = int(self._config.get("node", {}).get("event_bus_size", 256))
-        self.bus = EventBus(size=_bus_size, debug=_bus_debug)
+        _identity_bus_size = int(self._config.get("node", {}).get("identity_bus_size", _bus_size))
+        _identity_bus = EventBus(size=_identity_bus_size, debug=_bus_debug)    # identity bus
+        self.protocol_bus = EventBus(size=512, debug=_bus_debug)              # protocol bus
+        # TP-6: Wrap both buses in ScopedEventBus so emit() routes automatically
+        self.bus = ScopedEventBus(self.protocol_bus, _identity_bus)
         self._mail_handlers.bind_runtime(bus=self.bus)
 
         # V015: Plugin system
@@ -372,7 +480,12 @@ class DHTNode:
                 logger.warning(f"Invalid peer_override for {nid}: {addr!r} (expected 'host:port')")
 
     async def _wait_either_queue(self):
-        """Wait for an item from either write queue. Protocol queue checked first."""
+        """Wait for an item from either write queue. Protocol queue checked first.
+
+        A-06: Uses asyncio.Event instead of 100Hz sleep polling.
+        Zero wakeups at idle; wakes immediately on enqueue.
+        Falls back to 1.0s timeout in case event is missed (defensive).
+        """
         while True:
             try:
                 return self._write_queue_proto.get_nowait()
@@ -382,7 +495,24 @@ class DHTNode:
                 return self._write_queue.get_nowait()
             except asyncio.QueueEmpty:
                 pass
-            await asyncio.sleep(0.01)
+            # A-06: Wait on event instead of polling
+            if self._write_event is not None:
+                self._write_event.clear()
+                # Re-check after clear (race: item may have been added between get_nowait and clear)
+                try:
+                    return self._write_queue_proto.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    return self._write_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    await asyncio.wait_for(self._write_event.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(0.01)
 
     async def _writer_loop(self):
         """Batched writer: collects writes within a time window for efficiency.
@@ -448,15 +578,21 @@ class DHTNode:
         current_loop = asyncio.get_running_loop()
         future = current_loop.create_future()
         await self._write_queue_proto.put((op, args, future))
+        # A-06: Signal the write event so _wait_either_queue wakes immediately
+        if self._write_event is not None:
+            self._write_event.set()
         return await future
 
     async def _enqueue_write(self, op: Callable, *args: Any) -> Any:
         """Enqueue a write operation and wait for result. Loop-safe. [R-01]"""
         current_loop = asyncio.get_running_loop()
-        
+
         if current_loop is self._main_loop:
             future = current_loop.create_future()
             self._write_queue.put_nowait((op, args, future))
+            # A-06: Signal the write event so _wait_either_queue wakes immediately
+            if self._write_event is not None:
+                self._write_event.set()
             return await future
         else:
             # Cross-loop call: use run_coroutine_threadsafe bridge
@@ -465,13 +601,16 @@ class DHTNode:
             def _bridge():
                 main_fut = self._main_loop.create_future()
                 self._write_queue.put_nowait((op, args, main_fut))
+                # A-06: Signal from thread-safe path
+                if self._write_event is not None:
+                    self._write_event.set()
                 def _done(f):
                     try:
                         future.set_result(f.result())
                     except Exception as e:
                         future.set_exception(e)
                 main_fut.add_done_callback(_done)
-            
+
             self._main_loop.call_soon_threadsafe(_bridge)
             return await asyncio.wrap_future(future)
 
@@ -1564,7 +1703,8 @@ class DHTNode:
             skill_name=skill_name,
             input_data=input_data,
             timeout_ms=timeout_ms,
-            mode="async"
+            mode="async",
+            target_identity=provider_node_id,  # E-01: populate from DHT discovery
         ))
         
         # NODE-02: respect caller's timeout_ms rather than a hardcoded 10s.
@@ -1589,6 +1729,66 @@ class DHTNode:
         """Signs an outbound message with this node's key."""
         return sign_message(msg, self._signing_key)
 
+    async def announce_identity_skills(self, identity) -> int:
+        """E-06: Announce skills for a specific identity using its own signing key.
+
+        Signs Announce messages with identity.signing_key and uses identity.node_id
+        as the provider. KAD PUT_PROVIDER already supports multiple providers per
+        skill key, so each identity can be a distinct provider.
+
+        Args:
+            identity: Identity instance from IdentityRegistry.
+
+        Returns:
+            Number of skills announced.
+        """
+        if not identity or not identity.signing_key:
+            return 0
+
+        peers = self.storage.get_peers()
+        if not peers:
+            return 0
+
+        import math
+        import random
+
+        # TP-5: Derive wallet and encryption_key from identity's own signing key,
+        # not the host node's keys (self._wallet / self._encryption_key_hex).
+        from ..core.wallet import derive_solana_address
+        _identity_wallet = derive_solana_address(identity.signing_key)
+        _identity_x25519_pub = identity.signing_key.verify_key.to_curve25519_public_key()
+        _identity_encryption_key_hex = _identity_x25519_pub.encode().hex()
+
+        announced = 0
+        for skill_name, skill_sheet in identity.skills.items():
+            try:
+                msg = sign_message(
+                    Announce(
+                        node_id=identity.node_id,
+                        skill_key=skill_name,
+                        skill_sheet=skill_sheet.to_dict() if hasattr(skill_sheet, "to_dict") else dict(skill_sheet),
+                        sidecar_port=self._sidecar_port,
+                        encryption_key=_identity_encryption_key_hex,
+                        wallet=_identity_wallet,
+                        provider_host=self.node_info.host,
+                        provider_port=self.node_info.port,
+                        jurisdiction=self._node_jurisdiction_wire,
+                    ),
+                    identity.signing_key,
+                )
+                max_fanout = max(3, int(math.sqrt(len(peers))))
+                targets = random.sample(peers, min(max_fanout, len(peers)))
+                for peer in targets:
+                    asyncio.create_task(self._send_fire_forget(peer, msg))
+                announced += 1
+            except Exception as e:
+                logger.warning(f"IDENTITY_ANNOUNCE_FAIL identity={identity.name} skill={skill_name}: {e}")
+
+        if self._debug:
+            logger.info(f"IDENTITY_SKILLS_ANNOUNCED identity={identity.name} skills={announced}")
+
+        return announced
+
     def _emit_task_rejected(self, skill: str, caller: str, task_id: str, reason: str):
         """v0.33.0: Helper to emit task.rejected from all 6 rejection paths."""
         if self.bus:
@@ -1611,11 +1811,14 @@ class DHTNode:
     async def start(self):
         """Starts the server and background tasks."""
         self._main_loop = asyncio.get_running_loop()  # TEST-02: capture running loop (not deprecated get_event_loop)
+        # A-06: Initialize write event now that the event loop is running
+        self._write_event = asyncio.Event()
         # Share node's 32+ thread pool as default executor — prevents asyncio.to_thread
         # and run_in_executor(None) from starving on the default 5-8 thread pool at scale.
         self._main_loop.set_default_executor(self._handler_pool)
         self.server = await asyncio.start_server(
-            self._handle_connection, self._bind_host, self.node_info.port
+            self._handle_connection, self._bind_host, self.node_info.port,
+            backlog=512,
         )
         # Update port if dynamic (0)
         sock = self.server.sockets[0]
@@ -1856,6 +2059,7 @@ class DHTNode:
             self.server.close()
             await self.server.wait_closed()
         self._handler_pool.shutdown(wait=False)
+        self._protocol_pool.shutdown(wait=False)
         if self._vault:
             self._vault.close()
         self.storage.close()
@@ -2742,9 +2946,10 @@ class DHTNode:
             requester_port=self.node_info.port,
             skill_name=skill_name,
             input_data=input_data,
-            timeout_ms=timeout_ms
+            timeout_ms=timeout_ms,
+            target_identity=provider_node_id,  # E-01: populate from DHT discovery
         ))
-        
+
         self._task_events[task_id] = asyncio.Event()
         self._task_expected_provider[task_id] = ""  # will be set from provider's response key
 
@@ -3083,7 +3288,9 @@ class DHTNode:
                     # and handled by the plugin's own peer tracking (kbuckets).
                     # Triggering DB reads + mail pushes for every KAD message caused
                     # 288 gratuitous operations in 3 minutes at 50 nodes (v0.52.9).
-                    if signer_id and not isinstance(msg, PluginMessage):
+                    # A-03: Only listed class names trigger IMPLICIT_HB (configurable, D's approach).
+                    # Uses type(msg).__name__ to avoid wire-format case mismatch.
+                    if signer_id and type(msg).__name__ in self._implicit_hb_types:
                         self._peer_last_activity[signer_id] = time.monotonic()
                         logger.debug(f"IMPLICIT_HB from={signer_id[:16]} type={msg.type}")
                         # v0.17.4: Push pending mail on any inbound activity (not just heartbeats)
@@ -3110,7 +3317,31 @@ class DHTNode:
                             getattr(msg, 'sidecar_port', 0)
                         )
 
-                    response = await self._process_message(msg, peer_ip=peer_ip)
+                    # E-02: Identity demux — resolve target and scope execution
+                    target_id = self._resolve_target_identity(msg)
+                    identity = None
+                    if target_id and hasattr(self, '_identity_registry'):
+                        identity = self._identity_registry.resolve(target_id)
+
+                    if identity and identity.storage:
+                        # Scope execution to target identity's state
+                        _orig_storage = self.storage
+                        _orig_signing = self._signing_key
+                        _orig_pubkey = self._public_key_hex
+                        self.storage = identity.storage
+                        if identity.signing_key:
+                            self._signing_key = identity.signing_key
+                        if identity.public_key_hex:
+                            self._public_key_hex = identity.public_key_hex
+                        try:
+                            response = await self._process_message(msg, peer_ip=peer_ip)
+                        finally:
+                            self.storage = _orig_storage
+                            self._signing_key = _orig_signing
+                            self._public_key_hex = _orig_pubkey
+                    else:
+                        response = await self._process_message(msg, peer_ip=peer_ip)
+
                     if response:
                         await send_message(writer, response)
                 except asyncio.TimeoutError:
@@ -4495,6 +4726,66 @@ class DHTNode:
             "total_tasks_consumed": total_consumed,
         }
 
+    def get_pool_metrics(self) -> Dict[str, Any]:
+        """B-03: Return metrics for both thread pools."""
+        return {
+            "handler": self._handler_pool.get_metrics() if hasattr(self._handler_pool, "get_metrics") else {},
+            "protocol": self._protocol_pool.get_metrics() if hasattr(self._protocol_pool, "get_metrics") else {},
+        }
+
+    def _resolve_target_identity(self, msg) -> "Optional[str]":
+        """E-02: Resolve target identity node_id for an inbound message.
+
+        Resolution order:
+        1. Explicit target_identity / target_node_id field on message (E-01)
+        2. items[0].to_node for MailSync (mail routing)
+        3. _skill_to_identity map for TaskRequest (skill-based routing)
+        4. Returns None → caller uses default identity
+
+        Returns identity node_id string or None.
+        """
+        from ..core.messages import MailSync, TaskRequest, PluginMessage, MailPullReq
+
+        # 1. Explicit field
+        if isinstance(msg, (TaskRequest, MailPullReq)):
+            ti = getattr(msg, "target_identity", "")
+            if ti:
+                return ti
+        if isinstance(msg, PluginMessage):
+            ti = getattr(msg, "target_node_id", "")
+            if ti:
+                return ti
+
+        # 2. MailSync: route by to_node of first item
+        if isinstance(msg, MailSync) and msg.items:
+            first_item = msg.items[0] if msg.items else None
+            if isinstance(first_item, dict):
+                to_node = first_item.get("to_node", "")
+                if to_node:
+                    return to_node
+
+        # 3. TaskRequest: route by skill_to_identity map
+        if isinstance(msg, TaskRequest) and msg.skill_name:
+            mapped = self._skill_to_identity.get(msg.skill_name, "")
+            if mapped:
+                return mapped
+
+        # 4. No match — use default
+        return None
+
+    def _emit_event(self, event_type: str, **kwargs) -> None:
+        """A-02: Route event to protocol bus or identity bus based on topic prefix.
+
+        Protocol bus: peer.*, node.*, security.*, cache.*, skill.registered, skill.removed
+        Identity bus: everything else (task.*, receipt.*, mail.*, settlement.*, wm.*, credit.*, thrall.*)
+        """
+        if any(event_type == p or event_type.startswith(p) for p in _PROTOCOL_BUS_PREFIXES):
+            if self.protocol_bus:
+                self.protocol_bus.emit(event_type, **kwargs)
+        else:
+            if self.bus:
+                self.bus.emit(event_type, **kwargs)
+
     # Cockpit API Accessors
     def get_status(self) -> dict:
         """Node status summary for cockpit /api/status."""
@@ -5503,8 +5794,20 @@ class DHTNode:
                 logger.error("Heartbeat loop error", exc_info=True)
 
     # v0.41.0 A2: Independent background task loops for network I/O
+    async def _run_in_protocol_pool(self, fn, *args):
+        """A-01: Run a sync function in the protocol pool (not the handler pool).
+
+        Prevents slow skill handlers from starving protocol operations.
+        """
+        loop = asyncio.get_running_loop()
+        # TP-8: Use submit() on TrackedThreadPool (not ._pool) for proper metric tracking
+        return await loop.run_in_executor(self._protocol_pool, fn, *args)
+
     async def _flush_outbox_loop(self):
-        """Independent background loop for flushing mail outbox."""
+        """Independent background loop for flushing mail outbox.
+
+        A-01: flush_outbox is a protocol operation — uses protocol pool for sync work.
+        """
         interval = max(1.0, float(self._config.get("node", {}).get("flush_interval", 10)))
         while self._running:
             await asyncio.sleep(interval)
@@ -5607,7 +5910,8 @@ class DHTNode:
                     list(self._config.get("network", {}).get("bootstrap", []))
                     + list(self._initial_bootstrap_peers or self._bootstrap_peers)
                 ))
-                peers = self.storage.get_peers()
+                # A-01: get_peers in protocol pool (not handler pool)
+                peers = await self._run_in_protocol_pool(self.storage.get_peers)
                 if not peers:
                     # Clear isolation tracking — no peers triggers immediate re-bootstrap
                     self._isolation_since = None
@@ -5819,7 +6123,8 @@ class DHTNode:
         await self._sync.cleanup()
 
         # V015: Plugin tick
-        peers = self.storage.get_peers()
+        # A-01: get_peers in protocol pool (KAD on_tick is a protocol operation)
+        peers = await self._run_in_protocol_pool(self.storage.get_peers)
         health = NodeHealth(
             event_loop_lag_ms=getattr(self, '_loop_lag_ema', 0.0),
             active_connections=self._active_connections,
@@ -5835,6 +6140,20 @@ class DHTNode:
                 logger.info(f"BUS_TICK_FIRED fired={_bus_fired}")
 
         await self._pool.evict_idle(self._connection_idle_timeout)
+
+        # B-03: Log pool metrics every 60s when queue_depth > 0
+        if hasattr(self._handler_pool, "get_metrics") and hasattr(self._protocol_pool, "get_metrics"):
+            _now = time.monotonic()
+            _h_metrics = self._handler_pool.get_metrics()
+            _p_metrics = self._protocol_pool.get_metrics()
+            if _h_metrics.get("queue_depth", 0) > 0 or _p_metrics.get("queue_depth", 0) > 0:
+                if self._debug:
+                    logger.info(
+                        f"POOL_METRICS handler=active:{_h_metrics['active_workers']}"
+                        f"/queue:{_h_metrics['queue_depth']}/peak:{_h_metrics['peak_queue_depth']}"
+                        f" protocol=active:{_p_metrics['active_workers']}"
+                        f"/queue:{_p_metrics['queue_depth']}/peak:{_p_metrics['peak_queue_depth']}"
+                    )
 
         # Netting cycle (runs hourly, checks bilateral positions against soft threshold)
         await self._run_netting_cycle_if_due()
@@ -5955,14 +6274,24 @@ class DHTNode:
             self.refresh_node_meta()
 
     def _get_prune_timeout(self) -> float:
-        """Scale prune timeout with network size. Larger networks need more patience."""
-        peer_count = len(self.storage.get_peers())
+        """Scale prune timeout with network size. Larger networks need more patience.
+
+        A-05: Config lever replaces heuristic. Operator sets prune_timeout_multiplier
+        (e.g. 3.0 for Docker bridge). No IP counting.
+        """
+        peers = self.storage.get_peers()
+        peer_count = len(peers)
         if peer_count < 20:
-            return PEER_DEAD_TIMEOUT           # 300s — small network
+            base = PEER_DEAD_TIMEOUT           # 300s — small network
         elif peer_count < 50:
-            return PEER_DEAD_TIMEOUT * 1.5     # 450s — medium cluster
+            base = PEER_DEAD_TIMEOUT * 1.5     # 450s — medium cluster
         else:
-            return PEER_DEAD_TIMEOUT * 2       # 600s — large cluster
+            base = PEER_DEAD_TIMEOUT * 2       # 600s — large cluster
+
+        # A-05: Config lever — operator sets multiplier (default 1.0)
+        # TP-11: Guard against zero/negative values that would wipe all peers
+        multiplier = max(0.1, float(self._config.get("node", {}).get("prune_timeout_multiplier", 1.0)))
+        return base * multiplier
 
     async def _prune_loop(self):
         while self._running:
