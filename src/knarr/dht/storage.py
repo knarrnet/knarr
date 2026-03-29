@@ -673,10 +673,15 @@ class Storage:
     def query_all_active_skills(self, peer_timeout: float = 300, limit: int = 2000) -> List[Dict[str, Any]]:
         """Returns all active (non-expired) skills — both remote and own.
         Uses LEFT JOIN so gossip-discovered providers (not in peer table) are still visible.
-        Falls back to skill-table provider_host/provider_port when peer table has no entry."""
+        Falls back to skill-table provider_host/provider_port when peer table has no entry,
+        but only if the announcement itself is recent (within peer_timeout)."""
         now = time.time()
         conn = self._get_conn()
         # Remote skills
+        # Liveness filter: providers must either (a) have a recent peer entry, or
+        # (b) have no peer entry but a recent announcement + embedded host.
+        # Without (b)'s age check, skills from departed nodes stay routable for
+        # the full TTL (up to 90 min), causing 62% failure rates on stale providers.
         cursor = conn.execute("""
             SELECT s.provider_node_id, p.host, p.port, s.skill_record_json,
                    p.last_seen, s.announced_at, p.load, s.provider_public_key, s.sidecar_port,
@@ -685,9 +690,9 @@ class Storage:
             LEFT JOIN peers p ON s.provider_node_id = p.node_id
             WHERE (s.announced_at + s.ttl) > ?
               AND s.is_own = 0
-              AND (p.last_seen > ? OR (p.last_seen IS NULL AND s.provider_host != ''))
+              AND (p.last_seen > ? OR (p.last_seen IS NULL AND s.provider_host != '' AND s.announced_at > ?))
             LIMIT ?
-        """, (now, now - peer_timeout, limit))
+        """, (now, now - peer_timeout, now - peer_timeout, limit))
         results = []
         for row in cursor.fetchall():
             # Prefer peer table address, fall back to skill-embedded address
@@ -747,8 +752,8 @@ class Storage:
             WHERE s.skill_key = ?
               AND (s.announced_at + s.ttl) > ?
               AND s.is_own = 0
-              AND (p.last_seen > ? OR (p.last_seen IS NULL AND s.provider_host != ''))
-        """, (name, now, now - peer_timeout))
+              AND (p.last_seen > ? OR (p.last_seen IS NULL AND s.provider_host != '' AND s.announced_at > ?))
+        """, (name, now, now - peer_timeout, now - peer_timeout))
         results = []
         for row in cursor.fetchall():
             host = row[1] or row[9] or ""
@@ -779,8 +784,8 @@ class Storage:
             LEFT JOIN peers p ON s.provider_node_id = p.node_id
             WHERE (s.announced_at + s.ttl) > ?
               AND s.is_own = 0
-              AND (p.last_seen > ? OR (p.last_seen IS NULL AND s.provider_host != ''))
-        """, (now, now - peer_timeout))
+              AND (p.last_seen > ? OR (p.last_seen IS NULL AND s.provider_host != '' AND s.announced_at > ?))
+        """, (now, now - peer_timeout, now - peer_timeout))
         results = []
         for row in cursor.fetchall():
             skill_sheet_dict = json.loads(row[3])
