@@ -444,7 +444,8 @@ class CockpitServer:
                     self._node.storage.update_async_job_status(job_id, "completed")
                 else:
                     result = await self._node.submit_async_task(
-                        node_id, host, port, skill, task_input, timeout_ms=timeout_ms
+                        node_id, host, port, skill, task_input, timeout_ms=timeout_ms,
+                        task_id=job_id
                     )
                     if result.status in ("accepted", "queued", "completed"):
                         self._node.storage.update_async_job_status(job_id, result.status)
@@ -915,7 +916,8 @@ class CockpitServer:
             try:
                 result = await self._node.submit_async_task(
                     provider["node_id"], provider["host"], provider["port"],
-                    skill, task_input, timeout_ms=timeout_ms
+                    skill, task_input, timeout_ms=timeout_ms,
+                    task_id=job_id
                 )
                 if result.status in ("accepted", "queued", "completed"):
                     self._node.storage.update_async_job_status(

@@ -1691,10 +1691,11 @@ class DHTNode:
 
     async def submit_async_task(
         self, provider_node_id: str, provider_host: str, provider_port: int,
-        skill_name: str, input_data: Dict[str, Any], timeout_ms: int = 30000
+        skill_name: str, input_data: Dict[str, Any], timeout_ms: int = 30000,
+        task_id: Optional[str] = None
     ) -> TaskStatus:
         """Submits a task for asynchronous execution (non-blocking)."""
-        task_id = str(uuid.uuid4())
+        task_id = task_id or str(uuid.uuid4())
         req = self._sign(TaskRequest(
             task_id=task_id,
             requester_node_id=self.node_info.node_id,
