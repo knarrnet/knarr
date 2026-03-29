@@ -1819,7 +1819,7 @@ class DHTNode:
         self._main_loop.set_default_executor(self._handler_pool)
         self.server = await asyncio.start_server(
             self._handle_connection, self._bind_host, self.node_info.port,
-            backlog=512,
+            backlog=512, reuse_address=True,
         )
         # Update port if dynamic (0)
         sock = self.server.sockets[0]

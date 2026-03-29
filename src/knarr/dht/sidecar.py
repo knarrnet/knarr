@@ -97,7 +97,8 @@ class AssetSidecar:
             ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             ssl_ctx.load_cert_chain(self._cert_path, self._key_path)
         self._server = await asyncio.start_server(
-            self._handle_connection, self._host, self._port, ssl=ssl_ctx
+            self._handle_connection, self._host, self._port, ssl=ssl_ctx,
+            reuse_address=True,
         )
         # Get actual port if 0 was passed
         sock = self._server.sockets[0]

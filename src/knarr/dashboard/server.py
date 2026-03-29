@@ -133,14 +133,14 @@ class CockpitServer:
             # HTTP on self._port, HTTPS on self._port + 1
             self._server_plain = await asyncio.start_server(
                 self._handle_connection, self._bind, self._port,
-                backlog=512,
+                backlog=512, reuse_address=True,
             )
             sock_plain = self._server_plain.sockets[0]
             self._port = sock_plain.getsockname()[1]
             https_port = self._port + 1
             self._server = await asyncio.start_server(
                 self._handle_connection, self._bind, https_port, ssl=ssl_ctx,
-                backlog=512,
+                backlog=512, reuse_address=True,
             )
             self._https_port = self._server.sockets[0].getsockname()[1]
             logger.info(f"Cockpit dashboard listening on {self._bind}:{self._port} (HTTP) + :{self._https_port} (HTTPS)")
@@ -149,7 +149,7 @@ class CockpitServer:
             use_ssl = ssl_ctx if self._tls_mode != "off" else None
             self._server = await asyncio.start_server(
                 self._handle_connection, self._bind, self._port, ssl=use_ssl,
-                backlog=512,
+                backlog=512, reuse_address=True,
             )
             sock = self._server.sockets[0]
             self._port = sock.getsockname()[1]
