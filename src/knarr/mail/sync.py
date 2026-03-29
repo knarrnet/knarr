@@ -40,6 +40,10 @@ class SyncEngine:
         self._flush_skip_max = 50  # abandon after 50 skips (~8 minutes at 10s interval)
 
         # v0.39.0 C3: Mail circuit breaker — per-peer failure tracking
+        # NOTE(v0.53.1): C3 is effectively dead code for connection failures.
+        # _push_to_peer_inner swallows all exceptions internally → push_to_peer
+        # always calls _circuit_on_success → C3 never opens. M-018 breaker
+        # (inside _push_to_peer_inner) is the real one. Delete C3 in v0.54.0.
         self._circuit_state: Dict[str, Dict[str, Any]] = {}
         self._circuit_backoff_steps = [30, 60, 120, 300]  # seconds
         self._circuit_threshold = 3  # failures before circuit opens
@@ -404,9 +408,10 @@ class SyncEngine:
             # Increment failures and compute backoff
             state["consecutive_failures"] = consecutive_failures + 1
             state["last_attempt"] = now
-            # Exponential backoff: 30s, 60s, 120s, 300s, 600s (cap at 10 min)
-            backoff_schedule = [30, 60, 120, 300, 600]
-            backoff_seconds = backoff_schedule[min(state["consecutive_failures"] - 1, 4)]
+            # Exponential backoff: 0s (retry next tick), 30s, 60s, 120s, 300s, 600s
+            # First failure = 0s: transient startup TIME_WAIT shouldn't block task_result delivery
+            backoff_schedule = [0, 30, 60, 120, 300, 600]
+            backoff_seconds = backoff_schedule[min(state["consecutive_failures"] - 1, 5)]
             state["next_retry_after"] = now + backoff_seconds
 
             # Circuit breaker: open after 5 consecutive failures
