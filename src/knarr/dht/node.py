@@ -2296,7 +2296,8 @@ class DHTNode:
                     continue  # Let KAD learn from outbound
                 asyncio.create_task(self._send_fire_forget(peer, msg))
             announced += 1
-        logger.info(f"REPUBLISH_CYCLE skills={announced} peers={len(peers)} fanout={min(max_fanout, len(peers))}")
+        _fanout = max_fanout if announced > 0 else 0
+        logger.info(f"REPUBLISH_CYCLE skills={announced} peers={len(peers)} fanout={min(_fanout, len(peers))}")
 
     async def announce(self, skill_sheet_data: Dict[str, Any]):
         """Validates, stores, and announces a skill."""
@@ -3946,11 +3947,10 @@ class DHTNode:
                 position=existing.get("position", 0)
             ))
 
-        # H19: Generate job_id for async jobs, or use task_id for sync
+        # H19: Use caller's task_id as job_id — ensures buyer and provider share the same ID.
+        # Previously generated a new UUID for async mode, causing result delivery mismatch.
         job_id = msg.task_id
         is_async = getattr(msg, "mode", "sync") == "async"
-        if is_async:
-            job_id = str(uuid.uuid4())
 
         # v0.37.0 A1: Local skill fast path — execute directly without queue
         # MUST still write receipts, emit bus events, check admission gate, respect max_concurrent
