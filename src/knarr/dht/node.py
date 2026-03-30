@@ -4387,8 +4387,10 @@ class DHTNode:
                 topic = event.get("event", "")
                 if topic not in BUS_BROADCAST_TOPICS:
                     continue
-                # Don't re-broadcast events that arrived from remote nodes
-                if "origin_node" in event and event["origin_node"] != self.node_info.node_id:
+                # Fix B: Any event with origin_node set has already been through
+                # EventNotify relay — don't re-broadcast. The presence of origin_node
+                # means "this arrived via _handle_event_notify, not from local emit."
+                if "origin_node" in event:
                     continue
                 # Build fields_json — strip bus internals, keep user fields
                 kwargs = {k: v for k, v in event.items()
@@ -4403,6 +4405,9 @@ class DHTNode:
                 )
                 peers = self.storage.get_peers()
                 for peer in peers:
+                    # Fix A: Never send EventNotify to self
+                    if peer.node_id == self.node_info.node_id:
+                        continue
                     asyncio.ensure_future(self._send_fire_forget(peer, notify))
                 logger.debug("BUS01_BROADCAST topic=%s peers=%d", topic, len(peers))
             except asyncio.TimeoutError:
