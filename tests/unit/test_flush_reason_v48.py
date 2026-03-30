@@ -31,6 +31,8 @@ class TestFlushSkipReason(unittest.TestCase):
         node.storage.get_peers.return_value = []
         # No provider address fallback
         node.storage.get_provider_address.return_value = None
+        # No peer record for the recipient (forces no_route branch)
+        node.storage.get_peer_by_id.return_value = None
         # resolve_peer returns dummy (no override match)
         node.resolve_peer.return_value = ("0.0.0.0", 0)
         # node_info.node_id so self-delivery check doesn't match

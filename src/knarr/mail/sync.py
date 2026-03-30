@@ -39,51 +39,6 @@ class SyncEngine:
         self._flush_skip_count: Dict[str, int] = {}  # to_node -> skip count
         self._flush_skip_max = 50  # abandon after 50 skips (~8 minutes at 10s interval)
 
-        # v0.39.0 C3: Mail circuit breaker — per-peer failure tracking
-        # NOTE(v0.53.1): C3 is effectively dead code for connection failures.
-        # _push_to_peer_inner swallows all exceptions internally → push_to_peer
-        # always calls _circuit_on_success → C3 never opens. M-018 breaker
-        # (inside _push_to_peer_inner) is the real one. Delete C3 in v0.54.0.
-        self._circuit_state: Dict[str, Dict[str, Any]] = {}
-        self._circuit_backoff_steps = [30, 60, 120, 300]  # seconds
-        self._circuit_threshold = 3  # failures before circuit opens
-
-    def _circuit_allows(self, peer: str) -> bool:
-        """Check if circuit breaker allows sending to this peer."""
-        state = self._circuit_state.get(peer)
-        if not state or not state.get("open", False):
-            return True
-        # Check if backoff period has elapsed (half-open)
-        if time.monotonic() >= state.get("retry_after", 0):
-            return True
-        return False
-
-    def _circuit_on_success(self, peer: str):
-        """Reset circuit breaker on successful delivery."""
-        if peer in self._circuit_state:
-            del self._circuit_state[peer]
-
-    def _circuit_on_failure(self, peer: str):
-        """Record failure, potentially open circuit."""
-        state = self._circuit_state.get(peer)
-        if not state:
-            state = {"failures": 0, "open": False, "retry_after": 0, "backoff_index": 0}
-            self._circuit_state[peer] = state
-        state["failures"] = state.get("failures", 0) + 1
-        if state["failures"] >= self._circuit_threshold:
-            state["open"] = True
-            idx = min(state.get("backoff_index", 0), len(self._circuit_backoff_steps) - 1)
-            backoff = self._circuit_backoff_steps[idx]
-            state["retry_after"] = time.monotonic() + backoff
-            state["backoff_index"] = min(idx + 1, len(self._circuit_backoff_steps) - 1)
-            self._log.warning(
-                f"CIRCUIT_OPEN peer={peer[:16]} failures={state['failures']} backoff={backoff}s"
-            )
-            bus = getattr(self._node, 'bus', None)
-            if bus:
-                bus.emit("mail.peer_circuit_open", peer=peer, failures=state["failures"],
-                         backoff_seconds=backoff, identity=peer)
-
     def register_handler(self, msg_type: str, handler: Callable):
         """Register a dispatch handler for a system mail msg_type."""
         self._mail_handlers[msg_type] = handler
@@ -178,21 +133,12 @@ class SyncEngine:
         if peer_node_id == self._node.node_info.node_id:
             await self._self_deliver(peer_node_id)
             return
-        # v0.39.0 C3: Circuit breaker check — skip if circuit is open
-        if not self._circuit_allows(peer_node_id):
-            if self._debug:
-                self._log.debug(f"CIRCUIT_SKIP peer={peer_node_id[:16]} — circuit open")
-            return
         # V17-005: Per-peer singleflight — skip if already pushing to this peer
         if peer_node_id in self._push_in_flight:
             return
         self._push_in_flight.add(peer_node_id)
         try:
             await self._push_to_peer_inner(peer_node_id, peer_host, peer_port)
-            self._circuit_on_success(peer_node_id)
-        except Exception:
-            self._circuit_on_failure(peer_node_id)
-            raise
         finally:
             self._push_in_flight.discard(peer_node_id)
 

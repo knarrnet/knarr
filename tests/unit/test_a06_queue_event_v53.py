@@ -22,6 +22,10 @@ async def _make_node_async():
     node._write_queue = asyncio.Queue()
     node._write_queue_proto = asyncio.Queue()
     node._write_event = asyncio.Event()
+    node._base_storage = MagicMock()
+    node._base_bus = MagicMock()
+    node._base_signing_key = None
+    node._base_public_key_hex = ""
 
     # Bind the actual methods to the mock
     node._enqueue_write = lambda op, *args: DHTNode._enqueue_write(node, op, *args)

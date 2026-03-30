@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-_PLUGIN_DIR = Path(__file__).parent.parent.parent / "plugins/00-kademlia"
+_PLUGIN_DIR = Path(__file__).parent.parent.parent / "plugins/01-kademlia"
 
 
 def _load_module(name, path):

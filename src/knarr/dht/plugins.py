@@ -4,12 +4,14 @@ import importlib.util
 import json
 import logging
 import sys
+import time
 import tomllib
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Type, Any
 
-from knarr.core.messages import Message
+from knarr.core.messages import Message, PluginMessage
 from knarr.core.models import NodeInfo
 
 log = logging.getLogger(__name__)
@@ -210,6 +212,8 @@ class PluginContext:
         self,
         node_id: str = "",
         plugin_dir=None,
+        config_dir=None,
+        config=None,
         get_peers=None,
         send_to_peer=None,
         send_fire_forget=None,
@@ -247,6 +251,9 @@ class PluginContext:
             self._node = node
             self.node_id = node.node_info.node_id if not node_id else node_id
             self.plugin_dir = data_dir
+            self.config_dir = config_dir
+            self.config = dict(config or {})
+            self._debug = bool(self.config.get("debug", False))
             self.get_peers = get_peers or (lambda: [])
             self.send_to_peer = send_fn
             self.send_fire_forget = send_fn
@@ -279,6 +286,9 @@ class PluginContext:
             self._node = None
             self.node_id = node_id
             self.plugin_dir = plugin_dir
+            self.config_dir = config_dir if config_dir is not None else plugin_dir
+            self.config = dict(config or {})
+            self._debug = bool(self.config.get("debug", False))
             self.get_peers = get_peers
             self.send_to_peer = send_to_peer
             self.send_fire_forget = send_fire_forget
@@ -308,6 +318,83 @@ class PluginContext:
         # Set to None here; wired in node.py after plugin load.
         if not hasattr(self, "sign_bytes"):
             self.sign_bytes = None  # Callable: (bytes) -> (signature_bytes, pubkey_hex)
+
+    async def query_plugin(
+        self,
+        node_id,
+        host,
+        port,
+        plugin_name,
+        action,
+        payload,
+        timeout=5.0,
+        trace_id: str = "",  # A-02: explicit correlation ID for request tracing
+    ) -> Optional[dict]:
+        """Send a fire-and-forget plugin RPC and wait for its correlated response."""
+        node = getattr(self, "_node", None)
+        if node is None:
+            return None
+
+        request_id = str(uuid.uuid4())
+        start = time.monotonic()
+        future = asyncio.get_running_loop().create_future()
+        node._pending_rpcs[request_id] = (future, node_id)  # TP-3: store target_node_id for response validation
+
+        request_payload = dict(payload or {})
+        trace_id = trace_id or str(request_payload.get("trace_id") or request_id)
+        request_payload["_request_id"] = request_id
+        request_payload["trace_id"] = trace_id
+        reply_host = getattr(getattr(node, "node_info", None), "host", "")
+        if not isinstance(reply_host, str):
+            reply_host = ""
+        reply_port = getattr(getattr(node, "node_info", None), "port", 0)
+        if not isinstance(reply_port, int):
+            reply_port = 0
+        request_payload.setdefault("_reply_host", reply_host)
+        request_payload.setdefault("_reply_port", reply_port)
+        target = NodeInfo(node_id=node_id, host=host, port=port)
+        outbound = PluginMessage(
+            node_id=self.node_id,
+            plugin_name=plugin_name,
+            action=action,
+            payload=json.dumps(request_payload),
+            target_node_id=node_id,  # TP-10: explicit target for multi-identity routing
+        )
+
+        sender = getattr(self, "send_fire_forget", None) or getattr(node, "_send_fire_forget", None)
+        if sender is None:
+            node._pending_rpcs.pop(request_id, None)
+            return None
+
+        plugin_log = getattr(self, "log", log)
+        identity_prefix = str(self.node_id or "")[:8]
+        try:
+            if getattr(self, "_debug", False):
+                plugin_log.info(
+                    f"[{trace_id}] [{identity_prefix}] QUERY_PLUGIN_SEND "
+                    f"plugin={plugin_name} action={action} node={str(node_id)[:8]}"
+                )
+            await sender(target, outbound)
+            result = await asyncio.wait_for(future, timeout=timeout)
+            if isinstance(result, dict):
+                result.setdefault("trace_id", trace_id)
+            if getattr(self, "_debug", False):
+                latency_ms = int((time.monotonic() - start) * 1000)
+                plugin_log.info(
+                    f"[{trace_id}] [{identity_prefix}] QUERY_PLUGIN_RECV "
+                    f"plugin={plugin_name} action={action} latency_ms={latency_ms}"
+                )
+            return result
+        except asyncio.TimeoutError:
+            if getattr(self, "_debug", False):
+                latency_ms = int((time.monotonic() - start) * 1000)
+                plugin_log.info(
+                    f"[{trace_id}] [{identity_prefix}] QUERY_PLUGIN_TIMEOUT "
+                    f"plugin={plugin_name} action={action} latency_ms={latency_ms}"
+                )
+            return None
+        finally:
+            node._pending_rpcs.pop(request_id, None)
 
     def get_economy_stats(self) -> dict:
         """C-06: Return economy stats from node storage directly (local bypass).
@@ -361,7 +448,11 @@ class PluginLoader:
             log.info(f"Plugin directory not found: {self._plugin_root}. No plugins loaded.")
             return
 
-        for plugin_path in sorted(self._plugin_root.iterdir()):
+        config_dir = self._plugin_root.parent
+        plugin_entries = []
+        failed_required: List[str] = []
+
+        for plugin_path in self._plugin_root.iterdir():
             if not plugin_path.is_dir():
                 continue
 
@@ -372,98 +463,113 @@ class PluginLoader:
 
             try:
                 plugin_config = tomllib.loads(toml_path.read_text())
-                handler_str = plugin_config.get("handler")
-                if not handler_str:
-                    log.warning(f"Skipping {plugin_path.name}: 'handler' not specified in plugin.toml.")
-                    continue
-
-                module_name, class_name = handler_str.split(":")
-
-                # V015-008: Confine handler path to plugin directory
-                handler_file = (plugin_path / f"{module_name}.py").resolve()
-                if not handler_file.is_relative_to(plugin_path.resolve()):
-                    log.warning(f"Skipping {plugin_path.name}: handler path escapes plugin directory.")
-                    continue
-
-                # Temporarily add plugin's directory to sys.path for import
-                path_entry = str(plugin_path)
-                sys.path.insert(0, path_entry)
-
-                # V035-001: Pre-load sibling .py files with namespaced keys in
-                # sys.modules so that `from X import Y` inside handler code
-                # resolves to THIS plugin's copy, not a previously-loaded one.
-                _sibling_names = {f.stem for f in plugin_path.glob("*.py")}
-                _stashed_mods = {}
-                for _sn in _sibling_names:
-                    if _sn in sys.modules:
-                        _stashed_mods[_sn] = sys.modules.pop(_sn)
-                    # Pre-load this plugin's sibling module into sys.modules
-                    _sib_file = plugin_path / f"{_sn}.py"
-                    if _sib_file.is_file():
-                        _sib_spec = importlib.util.spec_from_file_location(_sn, str(_sib_file))
-                        if _sib_spec and _sib_spec.loader:
-                            _sib_mod = importlib.util.module_from_spec(_sib_spec)
-                            _sib_spec.loader.exec_module(_sib_mod)
-                            sys.modules[_sn] = _sib_mod
-
-                try:
-                    spec = importlib.util.spec_from_file_location(module_name, handler_file)
-                    if spec is None:
-                        raise ImportError(f"Could not find module spec for {module_name}")
-                    module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(module)
-
-                    plugin_class = getattr(module, class_name)
-                    if not issubclass(plugin_class, PluginHooks):
-                        raise TypeError(f"Plugin {class_name} in {module_name} must inherit from PluginHooks.")
-
-                    plugin_logger = logging.getLogger(f"knarr.plugin.{plugin_config['name']}")
-                    state_dir = plugin_path
-                    if self._state_root is not None:
-                        state_dir = self._state_root / plugin_path.name
-                        state_dir.mkdir(parents=True, exist_ok=True)
-
-                    plugin_context = PluginContext(
-                        node_id=self._node_id,
-                        plugin_dir=plugin_path,
-                        state_dir=state_dir,
-                        get_peers=self._get_peers_cb,
-                        send_to_peer=self._send_to_peer_cb,
-                        send_fire_forget=self._send_fire_forget_cb or self._send_to_peer_cb,
-                        delivery_cb=self._delivery_cb,
-                        log=plugin_logger,
-                        register_mail_handler=self._register_mail_handler_cb,
-                        send_mail=self._send_mail_cb,
-                        register_egress_material=self._register_egress_material_cb,
-                        vault_get=self._vault_get_cb,
-                        vault_set=self._vault_set_cb,
-                        storage_path=self._storage_path,
-                        update_cache=self._update_cache_cb,
-                        subscribe_events=self._subscribe_events_cb,   # v0.32.0
-                        emit_event=self._emit_event_cb,               # v0.32.0
-                        bus=self._bus,                                 # v0.33.0
-                    )
-
-                    plugin_instance = plugin_class(plugin_context, config=plugin_config.get("config", {}))
-                    self.plugins.append(plugin_instance)
-                    self._name_to_plugin[plugin_config["name"]] = plugin_instance  # v0.46.0
-                    log.info(f"Loaded plugin: {plugin_config['name']} v{plugin_config.get('version', 'unknown')}")
-
-                except (ImportError, AttributeError, TypeError) as e:
-                    log.warning(f"Failed to load handler for {plugin_path.name}: {e}")
-                finally:
-                    # V035-001: Remove bare-named modules loaded during this plugin
-                    for _n in _sibling_names:
-                        sys.modules.pop(_n, None)
-                    sys.modules.update(_stashed_mods)
-                    # V015-009: Remove by value, not position
-                    try:
-                        sys.path.remove(path_entry)
-                    except ValueError:
-                        pass
-
+                priority = int(plugin_config.get("priority", 10))
+                plugin_entries.append((priority, plugin_path.name.lower(), plugin_path, plugin_config))
             except Exception as e:
                 log.warning(f"Failed to parse plugin.toml for {plugin_path.name}: {e}")
+
+        for _, _, plugin_path, plugin_config in sorted(plugin_entries, key=lambda item: (item[0], item[1])):
+            handler_str = plugin_config.get("handler")
+            if not handler_str:
+                log.warning(f"Skipping {plugin_path.name}: 'handler' not specified in plugin.toml.")
+                if plugin_config.get("required", False):
+                    failed_required.append(plugin_config.get("name", plugin_path.name))
+                continue
+
+            module_name, class_name = handler_str.split(":")
+
+            # V015-008: Confine handler path to plugin directory
+            handler_file = (plugin_path / f"{module_name}.py").resolve()
+            if not handler_file.is_relative_to(plugin_path.resolve()):
+                log.warning(f"Skipping {plugin_path.name}: handler path escapes plugin directory.")
+                if plugin_config.get("required", False):
+                    failed_required.append(plugin_config.get("name", plugin_path.name))
+                continue
+
+            # Temporarily add plugin's directory to sys.path for import
+            path_entry = str(plugin_path)
+            sys.path.insert(0, path_entry)
+
+            # V035-001: Pre-load sibling .py files with namespaced keys in
+            # sys.modules so that `from X import Y` inside handler code
+            # resolves to THIS plugin's copy, not a previously-loaded one.
+            _sibling_names = {f.stem for f in plugin_path.glob("*.py")}
+            _stashed_mods = {}
+            for _sn in _sibling_names:
+                if _sn in sys.modules:
+                    _stashed_mods[_sn] = sys.modules.pop(_sn)
+                # Pre-load this plugin's sibling module into sys.modules
+                _sib_file = plugin_path / f"{_sn}.py"
+                if _sib_file.is_file():
+                    _sib_spec = importlib.util.spec_from_file_location(_sn, str(_sib_file))
+                    if _sib_spec and _sib_spec.loader:
+                        _sib_mod = importlib.util.module_from_spec(_sib_spec)
+                        _sib_spec.loader.exec_module(_sib_mod)
+                        sys.modules[_sn] = _sib_mod
+
+            try:
+                spec = importlib.util.spec_from_file_location(module_name, handler_file)
+                if spec is None:
+                    raise ImportError(f"Could not find module spec for {module_name}")
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+
+                plugin_class = getattr(module, class_name)
+                if not issubclass(plugin_class, PluginHooks):
+                    raise TypeError(f"Plugin {class_name} in {module_name} must inherit from PluginHooks.")
+
+                plugin_logger = logging.getLogger(f"knarr.plugin.{plugin_config['name']}")
+                state_dir = plugin_path
+                if self._state_root is not None:
+                    state_dir = self._state_root / plugin_path.name
+                    state_dir.mkdir(parents=True, exist_ok=True)
+
+                plugin_context = PluginContext(
+                    node_id=self._node_id,
+                    plugin_dir=plugin_path,
+                    config_dir=config_dir,
+                    config=plugin_config.get("config", {}),
+                    state_dir=state_dir,
+                    get_peers=self._get_peers_cb,
+                    send_to_peer=self._send_to_peer_cb,
+                    send_fire_forget=self._send_fire_forget_cb or self._send_to_peer_cb,
+                    delivery_cb=self._delivery_cb,
+                    log=plugin_logger,
+                    register_mail_handler=self._register_mail_handler_cb,
+                    send_mail=self._send_mail_cb,
+                    register_egress_material=self._register_egress_material_cb,
+                    vault_get=self._vault_get_cb,
+                    vault_set=self._vault_set_cb,
+                    storage_path=self._storage_path,
+                    update_cache=self._update_cache_cb,
+                    subscribe_events=self._subscribe_events_cb,   # v0.32.0
+                    emit_event=self._emit_event_cb,               # v0.32.0
+                    bus=self._bus,                                 # v0.33.0
+                )
+
+                plugin_instance = plugin_class(plugin_context, config=plugin_config.get("config", {}))
+                self.plugins.append(plugin_instance)
+                self._name_to_plugin[plugin_config["name"]] = plugin_instance  # v0.46.0
+                log.info(f"Loaded plugin: {plugin_config['name']} v{plugin_config.get('version', 'unknown')}")
+
+            except Exception as e:
+                log.warning(f"Failed to load handler for {plugin_path.name}: {e}")
+                if plugin_config.get("required", False):
+                    failed_required.append(plugin_config.get("name", plugin_path.name))
+            finally:
+                # V035-001: Remove bare-named modules loaded during this plugin
+                for _n in _sibling_names:
+                    sys.modules.pop(_n, None)
+                sys.modules.update(_stashed_mods)
+                # V015-009: Remove by value, not position
+                try:
+                    sys.path.remove(path_entry)
+                except ValueError:
+                    pass
+
+        if failed_required:
+            names = ", ".join(sorted(set(failed_required)))
+            raise RuntimeError(f"Required plugin(s) failed to load: {names}")
 
     async def on_connect(self, peer_ip: str) -> bool:
         for plugin in self.plugins:

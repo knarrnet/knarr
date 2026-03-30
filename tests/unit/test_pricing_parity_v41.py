@@ -82,8 +82,9 @@ class TestBuiltinPath:
                     config[k] = v
         node._config = config
         node._group_engine = None
-        node.storage._get_conn.return_value.execute.return_value.fetchall.return_value = []
-        node.storage._get_conn.return_value.execute.return_value.fetchone.return_value = None
+        # PRE-01: storage now exposes dedicated accessors instead of raw _get_conn()
+        node.storage.get_discount_rules.return_value = []
+        node.storage.get_execution_price.return_value = None
         return node
 
     def test_base_price_zero_returns_zero_builtin(self):

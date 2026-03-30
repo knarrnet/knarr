@@ -15,7 +15,10 @@ MAX_TASK_INPUT_SIZE = 65536  # 64KB (SA-08)
 # ADR-007: URI format — knarr:///category/subcategory/name@major.minor
 # Three-slash = no authority (any provider). Two-slash with hex prefix = specific provider.
 URI_PATTERN = re.compile(
-    r'^knarr://([a-f0-9]{0,16})/([a-z0-9_-]+(/[a-z0-9_-]+)*/[a-z0-9_-]+)(@\d+(\.\d+)?)?$'
+    r'^knarr://(?P<authority>[a-f0-9]{0,64})/'
+    r'(?:(?P<selector>[spcmkgo])/'
+    r'(?P<selector_resource>[a-z0-9._-]+(?:/[a-z0-9._-]+)*(?:@\d+(?:\.\d+)?)?)'
+    r'|(?P<path>[a-z0-9_-]+(?:/[a-z0-9_-]+)*/[a-z0-9_-]+)(?:@(?P<version>\d+(?:\.\d+)?))?)$'
 )
 JURISDICTION_PATTERN = re.compile(r'^[a-z]{2}(\.[a-z]{2,})?$')
 INPUT_SPEC_PATTERN = re.compile(r'^[a-f0-9]{64}$')

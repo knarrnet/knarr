@@ -1,11 +1,13 @@
-"""BUG-01: _reannounce_all() sends to all peers, not a fanout sample.
+"""BUG-01 (updated): _reannounce_all() uses sqrt(N) fanout with fire-and-forget.
 
-BUG: scheduled 300s republish used random.sample(peers, fanout=3), causing
+Original BUG: scheduled 300s republish used random.sample(peers, fanout=3), causing
 sparse coverage at scale (100-node: median node knows only 44/100 providers).
 
-FIX: _reannounce_all() iterates all peers. announce() hot-path still uses fanout=3.
+FIX (v0.50+): _reannounce_all() uses sqrt(N) fanout with fire-and-forget (no pool
+lock) and respects on_outbound plugin hook. announce() hot-path still uses fanout=3.
 """
 import asyncio
+import math
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 import types
@@ -44,16 +46,23 @@ def _make_node_stub(peer_count: int = 10):
     msg_mock = MagicMock()
     node._sign = lambda m: msg_mock
 
+    # Plugin hook: allow all outbound by default
+    node._plugins = MagicMock()
+    node._plugins.on_outbound = AsyncMock(return_value=True)
+
+    # Fire-and-forget sender
+    node._send_fire_forget = AsyncMock()
+
     _bind_reannounce(node)
     return node, peers
 
 
 @pytest.mark.asyncio
-async def test_reannounce_all_sends_to_all_peers():
-    """_reannounce_all() must send to ALL peers, not a fanout sample."""
+async def test_reannounce_sqrt_fanout():
+    """_reannounce_all() sends to sqrt(N) peers, not all peers."""
     from knarr.core.models import SkillSheet
 
-    node, peers = _make_node_stub(peer_count=10)
+    node, peers = _make_node_stub(peer_count=100)
 
     skill = MagicMock(spec=SkillSheet)
     skill.name = "test-skill"
@@ -61,29 +70,24 @@ async def test_reannounce_all_sends_to_all_peers():
     node._own_skills = {"test-skill": skill}
     node._skill_visibility = {"test-skill": "public"}
 
-    sent_to = []
-
-    async def fake_send(peer, msg):
-        sent_to.append(peer.node_id)
-
-    node._send_to_peer = fake_send
-
-    with patch("asyncio.create_task", side_effect=lambda coro: asyncio.get_event_loop().create_task(coro)):
+    created_tasks = []
+    with patch("asyncio.create_task", side_effect=lambda coro: (created_tasks.append(coro), asyncio.get_event_loop().create_task(coro))[1]):
         await node._reannounce_all()
         await asyncio.sleep(0)
 
-    assert len(sent_to) == 10, (
-        f"_reannounce_all() sent to {len(sent_to)} peers, expected 10 (all peers). "
-        "BUG-01: must send to ALL peers on scheduled republish, not a fanout sample."
+    expected_fanout = max(3, int(math.sqrt(100)))  # 10
+    assert len(created_tasks) == expected_fanout, (
+        f"_reannounce_all() created {len(created_tasks)} tasks, expected {expected_fanout} "
+        f"(sqrt({100}) fanout). Must NOT send to all 100 peers."
     )
 
 
 @pytest.mark.asyncio
-async def test_reannounce_all_exceeds_fanout():
-    """_reannounce_all() with 20 peers must NOT limit sends to fanout=3."""
+async def test_reannounce_max_fanout_cap():
+    """_reannounce_all() with small peer count uses min(max_fanout, len(peers))."""
     from knarr.core.models import SkillSheet
 
-    node, peers = _make_node_stub(peer_count=20)
+    node, peers = _make_node_stub(peer_count=4)
 
     skill = MagicMock(spec=SkillSheet)
     skill.name = "test-skill"
@@ -91,26 +95,21 @@ async def test_reannounce_all_exceeds_fanout():
     node._own_skills = {"test-skill": skill}
     node._skill_visibility = {"test-skill": "public"}
 
-    sent_to = []
-
-    async def fake_send(peer, msg):
-        sent_to.append(peer.node_id)
-
-    node._send_to_peer = fake_send
-
-    with patch("asyncio.create_task", side_effect=lambda coro: asyncio.get_event_loop().create_task(coro)):
+    created_tasks = []
+    with patch("asyncio.create_task", side_effect=lambda coro: (created_tasks.append(coro), asyncio.get_event_loop().create_task(coro))[1]):
         await node._reannounce_all()
         await asyncio.sleep(0)
 
-    assert len(sent_to) == 20, (
-        f"_reannounce_all() sent to {len(sent_to)} peers, expected 20 (all peers). "
-        f"fanout={node._gossip_fanout} must NOT limit republish."
+    # max_fanout = max(3, int(sqrt(4))) = 3; min(3, 4) = 3
+    expected = min(max(3, int(math.sqrt(4))), 4)
+    assert len(created_tasks) == expected, (
+        f"_reannounce_all() created {len(created_tasks)} tasks, expected {expected}. "
+        f"fanout=max(3,sqrt(N)) capped at peer count."
     )
-    assert len(sent_to) > node._gossip_fanout
 
 
 @pytest.mark.asyncio
-async def test_reannounce_all_skips_private_skills():
+async def test_reannounce_skips_private_skills():
     """_reannounce_all() must skip private skills."""
     from knarr.core.models import SkillSheet
 
@@ -133,20 +132,15 @@ async def test_reannounce_all_skips_private_skills():
         "private-skill": "private",
     }
 
-    announced_msgs = []
-
-    async def fake_send(peer, msg):
-        pass
-
-    node._send_to_peer = fake_send
     created_tasks = []
 
     with patch("asyncio.create_task", side_effect=lambda coro: (created_tasks.append(coro), asyncio.get_event_loop().create_task(coro))[1]):
         await node._reannounce_all()
         await asyncio.sleep(0)
 
-    # 5 peers x 1 public skill = 5 sends (not 10 which would include private)
-    assert len(created_tasks) == 5, (
-        f"Expected 5 sends (5 peers x 1 public skill), got {len(created_tasks)}. "
+    # sqrt(5) = 2.2 -> max(3, 2) = 3; min(3, 5) = 3 targets for 1 public skill
+    expected_fanout = min(max(3, int(math.sqrt(5))), 5)
+    assert len(created_tasks) == expected_fanout, (
+        f"Expected {expected_fanout} sends (sqrt fanout x 1 public skill), got {len(created_tasks)}. "
         "Private skill must not be republished."
     )

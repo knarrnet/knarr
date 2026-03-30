@@ -174,6 +174,16 @@ class PluginMessage(Message):
     type: str = "PLUGIN_MESSAGE"
 
 @dataclass(frozen=True)
+class Envelope(Message):
+    """URI-addressed wrapper for protocol payloads."""
+    node_id: str = ""
+    uri: str = ""
+    payload: str = ""
+    timestamp: str = ""
+    trace_id: str = ""
+    type: str = "ENVELOPE"
+
+@dataclass(frozen=True)
 class MailPullReq(Message):
     """Request pending mail from a peer (Tier 2 pull)."""
     requester_node_id: str = ""
@@ -236,6 +246,7 @@ def deserialize_message(data: bytes) -> Message:
         "MAIL_SYNC": MailSync,
         "MAIL_ACK": MailAck,
         "PLUGIN_MESSAGE": PluginMessage,
+        "ENVELOPE": Envelope,
         "MAIL_PULL_REQ": MailPullReq,
         "MAIL_PULL_RESP": MailPullResp,
         "MAIL_PULL_ACK": MailPullAck,

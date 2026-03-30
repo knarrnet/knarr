@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 import dataclasses
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -40,6 +41,14 @@ from .eventbus import EventBus
 from . import profiling as _profiling
 
 logger = logging.getLogger(__name__)
+
+
+def _is_winerror_10054(exc: BaseException) -> bool:
+    """Return True for the Windows connection-reset noise case."""
+    return isinstance(exc, OSError) and getattr(exc, "winerror", None) == 10054
+
+
+_current_identity: ContextVar[Optional[Any]] = ContextVar("identity", default=None)
 
 
 class TrackedThreadPool(concurrent.futures.ThreadPoolExecutor):
@@ -141,6 +150,55 @@ def _parse_version(v: str) -> tuple:
 
 class DHTNode:
     """A node in the Knarr DHT network with identity, propagation, task, and economy capabilities."""
+
+    @property
+    def storage(self):
+        identity = _current_identity.get()
+        if identity is not None and getattr(identity, "storage", None) is not None:
+            return identity.storage
+        return getattr(self, "_base_storage", None)
+
+    @storage.setter
+    def storage(self, value):
+        self._base_storage = value
+
+    @property
+    def bus(self):
+        identity = _current_identity.get()
+        scoped_bus = getattr(identity, "bus", None) if identity is not None else None
+        if scoped_bus is None:
+            return getattr(self, "_base_bus", None)
+        if hasattr(scoped_bus, "protocol_bus") and hasattr(scoped_bus, "identity_bus"):
+            return scoped_bus
+        if getattr(self, "protocol_bus", None) is not None:
+            return ScopedEventBus(self.protocol_bus, scoped_bus)
+        return scoped_bus
+
+    @bus.setter
+    def bus(self, value):
+        self._base_bus = value
+
+    @property
+    def _signing_key(self):
+        identity = _current_identity.get()
+        if identity is not None and getattr(identity, "signing_key", None) is not None:
+            return identity.signing_key
+        return getattr(self, "_base_signing_key", None)
+
+    @_signing_key.setter
+    def _signing_key(self, value):
+        self._base_signing_key = value
+
+    @property
+    def _public_key_hex(self):
+        identity = _current_identity.get()
+        if identity is not None and getattr(identity, "public_key_hex", ""):
+            return identity.public_key_hex
+        return getattr(self, "_base_public_key_hex", "")
+
+    @_public_key_hex.setter
+    def _public_key_hex(self, value):
+        self._base_public_key_hex = value
 
     def __init__(self, host: str = "127.0.0.1", port: int = 9000, storage_path: str = ":memory:",
                  advertise_host: Optional[str] = None, policy: Optional[Policy] = None,
@@ -271,6 +329,7 @@ class DHTNode:
         self._task_results: Dict[str, TaskResult] = {}
         self._task_expected_provider: Dict[str, str] = {}  # task_id -> expected provider public_key
         self._admission_cache: Dict[str, Dict[str, Any]] = {}  # job_id -> admission result
+        self._pending_rpcs: Dict[str, tuple] = {}  # TP-3: request_id -> (future, target_node_id)
 
         self._mcp_bridges: List[Any] = []
         self._active_connections: int = 0  # SA-02: accept-level connection tracking
@@ -3303,46 +3362,38 @@ class DHTNode:
                             h, p = self.resolve_peer(peer_info.node_id, peer_info.host, peer_info.port)
                             asyncio.create_task(self._sync.push_to_peer(peer_info.node_id, h, p))
 
+                    if self._resolve_pending_plugin_rpc(msg):
+                        continue
+
                     # V015: Plugin inbound gate
                     if not await self._plugins.on_inbound(msg, peer_ip):
                         # v0.33.0: firewall.blocked
                         if self.bus:
                             self.bus.emit("firewall.blocked", from_node=signer_id or peer_ip, msg_type=msg.type, reason="on_inbound_rejected", identity=signer_id or peer_ip or "unknown")
+                        _current_identity.set(None)
                         continue  # Plugin suppressed — skip but keep connection open
 
                     # v0.17.0: Auto-populate address book cached tier (V17-004: after plugin gate)
+                    # TP-5: Use _base_storage to bypass identity-scoped storage
                     if signer_id:
                         await self._enqueue_write_proto(
-                            self.storage.upsert_address,
+                            self._base_storage.upsert_address,
                             signer_id, "cached", None,
                             peer_ip, getattr(msg, 'port', 0),
                             getattr(msg, 'sidecar_port', 0)
                         )
 
-                    # E-02: Identity demux — resolve target and scope execution
-                    target_id = self._resolve_target_identity(msg)
-                    identity = None
-                    if target_id and hasattr(self, '_identity_registry'):
-                        identity = self._identity_registry.resolve(target_id)
-
-                    if identity and identity.storage:
-                        # Scope execution to target identity's state
-                        _orig_storage = self.storage
-                        _orig_signing = self._signing_key
-                        _orig_pubkey = self._public_key_hex
-                        self.storage = identity.storage
-                        if identity.signing_key:
-                            self._signing_key = identity.signing_key
-                        if identity.public_key_hex:
-                            self._public_key_hex = identity.public_key_hex
-                        try:
-                            response = await self._process_message(msg, peer_ip=peer_ip)
-                        finally:
-                            self.storage = _orig_storage
-                            self._signing_key = _orig_signing
-                            self._public_key_hex = _orig_pubkey
-                    else:
+                    identity = _current_identity.get()
+                    if identity is None:
+                        target_id = self._resolve_target_identity(msg)
+                        if target_id and hasattr(self, '_identity_registry'):
+                            identity = self._identity_registry.resolve(target_id)
+                    if identity is not None:
+                        _current_identity.set(identity)
+                    try:
                         response = await self._process_message(msg, peer_ip=peer_ip)
+                    finally:
+                        _current_identity.set(None)
 
                     if response:
                         await send_message(writer, response)
@@ -3359,7 +3410,11 @@ class DHTNode:
                     logger.warning(f"PROTOCOL_ERR from={peer_ip}: {e}")
                     break
                 except Exception as e:
-                    logger.error(f"Error handling connection: {e}")
+                    if _is_winerror_10054(e):
+                        if self._debug:
+                            logger.debug(f"CONNECTION_RESET peer={peer_ip or 'unknown'} winerror=10054")
+                    else:
+                        logger.error(f"Error handling connection: {e}")
                     break
             writer.close()
             try:
@@ -4409,6 +4464,7 @@ class DHTNode:
             return None
         for key in ("event", "event_id", "ts", "valid_from", "valid_until", "origin_node"):
             payload.pop(key, None)
+        payload.setdefault("identity", msg.origin_node_id)
         if self.bus:
             # origin_node marker prevents _bus_broadcast_loop from re-broadcasting remote events
             self.bus.emit(msg.event_type, origin_node=msg.origin_node_id, **payload)
@@ -4416,6 +4472,39 @@ class DHTNode:
             f"EVENT_NOTIFY_RECV event_type={msg.event_type} origin={msg.origin_node_id[:16]}"
         )
         return None
+
+    def _resolve_pending_plugin_rpc(self, msg: Message) -> bool:
+        """Resolve a pending plugin RPC response before normal plugin dispatch."""
+        if not isinstance(msg, PluginMessage):
+            return False
+
+        try:
+            payload = json.loads(msg.payload) if msg.payload else {}
+        except (TypeError, json.JSONDecodeError):
+            return False
+
+        request_id = str(payload.get("_request_id", "") or "")
+        if not request_id:
+            return False
+
+        entry = self._pending_rpcs.get(request_id)
+        if entry is None:
+            return False
+        future, expected_target = entry
+        if future.done():
+            return False
+
+        # TP-3: Verify the response comes from the node we sent the request to
+        sender_id = str(getattr(msg, "node_id", "") or "")
+        if expected_target and sender_id != expected_target:
+            logger.warning(
+                f"RPC_HIJACK_ATTEMPT request_id={request_id} "
+                f"expected={expected_target[:16]} got={sender_id[:16]}"
+            )
+            return False
+
+        future.set_result(payload)
+        return True
 
     async def _process_message_callback(self, msg: Message, peer_ip: str = ""):
         """Callback for plugins to deliver fire-and-forget messages into the node's processing pipeline."""
@@ -5295,6 +5384,7 @@ class DHTNode:
                     peer=msg.public_key,
                     amount=hold_amount,
                     price=skill_price,
+                    identity=msg.public_key,
                 )
             logger.info(f"SKILL_HELD task={job_id_for_update[:8]} amount={hold_amount}")
             return

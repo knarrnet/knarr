@@ -2073,16 +2073,19 @@ class Storage:
     def write_receipt(self, receipt_id: str, document_type: str, timestamp: str,
                       identity: str, counterparty: str | None, order_ref: str | None,
                       proof_purpose: str, payload_json: str, signature: str | None) -> None:
-        """Write a receipt to the append-only receipt_log. Silently ignores duplicates."""
+        """Write a receipt to the append-only receipt_log. Silently ignores duplicates.
+        P-02: auto-populates uri = knarr://{identity}/c/receipt/{receipt_id}.
+        """
         conn = self._get_conn()
         now = time.time()
+        uri = f"knarr://{identity}/c/receipt/{receipt_id}" if identity else ""
         conn.execute(
             """INSERT OR IGNORE INTO receipt_log
                (receipt_id, document_type, timestamp, identity, counterparty, order_ref,
-                proof_purpose, payload_json, signature, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                proof_purpose, payload_json, signature, created_at, uri)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (receipt_id, document_type, timestamp, identity, counterparty, order_ref,
-             proof_purpose, payload_json, signature, now)
+             proof_purpose, payload_json, signature, now, uri)
         )
         conn.commit()
         logger.debug(f"RECEIPT_LOG_WRITE receipt_id={receipt_id[:16]} type={document_type}")
@@ -2092,14 +2095,14 @@ class Storage:
         conn = self._get_conn()
         cursor = conn.execute(
             "SELECT receipt_id, document_type, timestamp, identity, counterparty, "
-            "order_ref, proof_purpose, payload_json, signature, created_at "
+            "order_ref, proof_purpose, payload_json, signature, created_at, uri "
             "FROM receipt_log WHERE receipt_id = ?", (receipt_id,))
         row = cursor.fetchone()
         if not row:
             return None
         return dict(zip(["receipt_id", "document_type", "timestamp", "identity",
                          "counterparty", "order_ref", "proof_purpose",
-                         "payload_json", "signature", "created_at"], row))
+                         "payload_json", "signature", "created_at", "uri"], row))
 
     def update_receipt_quality(self, task_id: str, quality_rating: int):
         """Store quality_rating from commerce receipt in execution_log."""
@@ -3093,7 +3096,7 @@ class Storage:
         where = " AND ".join(clauses) if clauses else "1=1"
         sql = (
             "SELECT receipt_id, document_type, timestamp, identity, counterparty, "
-            "order_ref, proof_purpose, payload_json, signature, created_at "
+            "order_ref, proof_purpose, payload_json, signature, created_at, uri "
             f"FROM receipt_log WHERE {where} ORDER BY created_at DESC LIMIT ?"
         )
         params.append(limit)
@@ -3118,6 +3121,7 @@ class Storage:
                 "payload": payload,
                 "signature": row[8],
                 "created_at": row[9],
+                "uri": row[10],
             })
         return results
 
@@ -3174,7 +3178,8 @@ class StorageStub:
             proof_purpose   TEXT NOT NULL,
             payload_json    TEXT NOT NULL,
             signature       TEXT,
-            created_at      REAL NOT NULL
+            created_at      REAL NOT NULL,
+            uri             TEXT NOT NULL DEFAULT ''
         )
     """
 
@@ -3187,42 +3192,44 @@ class StorageStub:
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_log_identity ON receipt_log(identity)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_log_ts ON receipt_log(timestamp)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_log_order ON receipt_log(order_ref)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_log_uri ON receipt_log(uri)")
         self._conn.commit()
 
     def write_receipt(self, receipt_id, document_type, timestamp, identity,
                       counterparty, order_ref, proof_purpose, payload_json, signature):
-        """INSERT OR IGNORE into receipt_log. Idempotent."""
+        """INSERT OR IGNORE into receipt_log. Idempotent. P-02: auto-populates uri."""
+        uri = f"knarr://{identity}/c/receipt/{receipt_id}" if identity else ""
         self._conn.execute(
             """INSERT OR IGNORE INTO receipt_log
                (receipt_id, document_type, timestamp, identity, counterparty,
-                order_ref, proof_purpose, payload_json, signature, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                order_ref, proof_purpose, payload_json, signature, created_at, uri)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (receipt_id, document_type, timestamp, identity, counterparty,
-             order_ref, proof_purpose, payload_json, signature, time.time()),
+             order_ref, proof_purpose, payload_json, signature, time.time(), uri),
         )
         self._conn.commit()
 
     def get_receipt(self, receipt_id):
         cursor = self._conn.execute(
             "SELECT receipt_id, document_type, timestamp, identity, counterparty, "
-            "order_ref, proof_purpose, payload_json, signature, created_at "
+            "order_ref, proof_purpose, payload_json, signature, created_at, uri "
             "FROM receipt_log WHERE receipt_id = ?", (receipt_id,))
         row = cursor.fetchone()
         if not row:
             return None
         return dict(zip(["receipt_id", "document_type", "timestamp", "identity",
                          "counterparty", "order_ref", "proof_purpose",
-                         "payload_json", "signature", "created_at"], row))
+                         "payload_json", "signature", "created_at", "uri"], row))
 
     def get_receipts_by_type(self, document_type):
         cursor = self._conn.execute(
             "SELECT receipt_id, document_type, timestamp, identity, counterparty, "
-            "order_ref, proof_purpose, payload_json, signature, created_at "
+            "order_ref, proof_purpose, payload_json, signature, created_at, uri "
             "FROM receipt_log WHERE document_type = ? ORDER BY created_at ASC",
             (document_type,))
         cols = ["receipt_id", "document_type", "timestamp", "identity",
                 "counterparty", "order_ref", "proof_purpose",
-                "payload_json", "signature", "created_at"]
+                "payload_json", "signature", "created_at", "uri"]
         return [dict(zip(cols, r)) for r in cursor.fetchall()]
 
     def count_receipts(self, document_type=None):

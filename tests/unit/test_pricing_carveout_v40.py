@@ -92,7 +92,12 @@ def _make_pricing_node(
         )
     conn.commit()
 
-    node.storage = SimpleNamespace(_get_conn=lambda: conn)
+    node.storage = SimpleNamespace(
+        _get_conn=lambda: conn,
+        get_discount_rules=lambda *a, **kw: [],
+        get_cost_projection=lambda *a, **kw: None,
+        get_execution_price=lambda *a, **kw: None,
+    )
     return node
 
 

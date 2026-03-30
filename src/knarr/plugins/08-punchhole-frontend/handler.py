@@ -21,6 +21,7 @@ Bus emissions:
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
 import re
@@ -29,6 +30,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from knarr.core.messages import PluginMessage
 from knarr.dht.plugins import PluginContext, PluginHooks, NodeHealth
 from knarr.core.models import NodeInfo
 from knarr.core.proof import verify_document
@@ -186,58 +188,62 @@ class PunchholeFrontendPlugin(PluginHooks):
     # Request handler
     # ------------------------------------------------------------------
 
-    async def on_mail_received(self, msg_type: str, from_node: str,
-                               to_node: str, body: Any,
-                               session_id: Optional[str]) -> None:
-        """
-        Handle punchhole requests arriving as mail.
-
-        Expected body shape:
-          {
-            "action": "request",
-            "object_key": "economy.summary",
-            "payload": { ...signed_request... }
-          }
-        """
-        if msg_type != "punchhole.request":
+    def _trace(self, trace_id: str, requester_node_id: str, action: str, **fields) -> None:
+        if not self._debug:
             return
+        extras = " ".join(f"{key}={value}" for key, value in fields.items() if value not in ("", None))
+        message = f"[{trace_id}] [{requester_node_id[:8]}] PUNCHHOLE_{action}"
+        if extras:
+            message = f"{message} {extras}"
+        log.info(message)
 
+    @staticmethod
+    def _is_safe_reply_address(host: str) -> bool:
+        """TP-1: Reject private/loopback/link-local IPs to prevent SSRF."""
         try:
-            request = body if isinstance(body, dict) else json.loads(body)
-        except (TypeError, json.JSONDecodeError) as exc:
-            log.warning(f"punchhole-frontend: malformed request from {from_node}: {exc}")
-            return
+            addr = ipaddress.ip_address(host)
+            return addr.is_global
+        except ValueError:
+            return False  # hostname, not IP — reject
 
-        if not isinstance(request, dict):
-            log.warning(f"punchhole-frontend: expected dict body from {from_node}, got {type(request).__name__}")
-            return
+    def _resolve_peer(self, requester_node_id: str, peer_ip: str, request: dict) -> Optional[NodeInfo]:
+        get_peers = getattr(self._ctx, "get_peers", None)
+        if callable(get_peers):
+            for peer in get_peers() or []:
+                if getattr(peer, "node_id", "") == requester_node_id:
+                    return peer
 
-        action = request.get("action")
-        if action != "request":
-            return
+        reply_host = request.get("_reply_host") or peer_ip
+        reply_port = int(request.get("_reply_port") or 0)
+        # TP-1: Validate reply address is globally routable before using it
+        if reply_host and reply_port > 0 and self._is_safe_reply_address(reply_host):
+            return NodeInfo(node_id=requester_node_id, host=reply_host, port=reply_port)
+        return None
 
-        object_key = request.get("object_key", "")
-        signed_request = request.get("payload", {})
-        requester_node_id = from_node
-
+    async def _process_request(
+        self,
+        requester_node_id: str,
+        object_key: str,
+        signed_request: Any,
+        trace_id: str,
+    ) -> dict:
         # Gate: validate object_key format (alphanumeric, dots, underscores, hyphens only)
         if not object_key or not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$', object_key) or len(object_key) > 128:
             log.warning(f"punchhole-frontend: invalid object_key from {requester_node_id}: {object_key!r}")
-            return
+            return {"status": "rejected", "error": "invalid_object_key", "object_key": object_key}
 
         # Gate 0: backend must be ready
         if not self._backend_ready:
-            if self._debug:
-                log.debug(f"punchhole-frontend: rejecting request from {requester_node_id} — backend not ready")
+            self._trace(trace_id, requester_node_id, "REQUEST_REJECT", reason="backend_not_ready", object_key=object_key)
             self._log_disclosure(requester_node_id, object_key, "", "not_ready")
-            return
+            return {"status": "not_ready", "object_key": object_key}
 
         # Gate 1: verify requester's signature
         verify_key = _hex_to_verify_key(requester_node_id)
         if verify_key is None or not verify_document(signed_request, verify_key):
             log.warning(f"punchhole-frontend: invalid signature from {requester_node_id}")
             self._log_disclosure(requester_node_id, object_key, "", "rejected")
-            return
+            return {"status": "rejected", "error": "invalid_signature", "object_key": object_key}
 
         # Gate 2: resolve ACL group
         acl_group = self._acl.get(requester_node_id, "")
@@ -252,24 +258,18 @@ class PunchholeFrontendPlugin(PluginHooks):
         if entry is not None and not entry["stale"]:
             # Cache hit — serve pre-signed object
             self._log_disclosure(requester_node_id, object_key, acl_group, "hit")
-            if self._debug:
-                log.debug(f"punchhole-frontend: cache hit ({object_key}, {acl_group}) for {requester_node_id}")
-            # Response handled by caller reading the return value;
-            # for now emit a delivery event so the node can route the reply.
-            if self._ctx.emit_event:
-                self._ctx.emit_event(
-                    "punchhole.response",
-                    requester_node_id=requester_node_id,
-                    object_key=object_key,
-                    data=entry["data"],
-                    from_cache=True,
-                )
-            return
+            self._trace(trace_id, requester_node_id, "REQUEST_HIT", object_key=object_key, acl=acl_group)
+            return {
+                "status": "ok",
+                "object_key": object_key,
+                "data": entry["data"],
+                "from_cache": True,
+                "acl_group": acl_group,
+            }
 
         # Cache miss (or stale) — emit to backend
         self._log_disclosure(requester_node_id, object_key, acl_group, "miss")
-        if self._debug:
-            log.debug(f"punchhole-frontend: cache miss ({object_key}, {acl_group}) for {requester_node_id}")
+        self._trace(trace_id, requester_node_id, "REQUEST_MISS", object_key=object_key, acl=acl_group)
 
         if self._ctx.emit_event:
             self._ctx.emit_event(
@@ -277,6 +277,92 @@ class PunchholeFrontendPlugin(PluginHooks):
                 object_key=object_key,
                 requester_tier=acl_group,
                 requester_node_id=requester_node_id,  # CRITICAL for bilateral lookups
+            )
+        return {
+            "status": "miss",
+            "object_key": object_key,
+            "from_cache": False,
+            "acl_group": acl_group,
+        }
+
+    async def on_inbound(self, msg, peer_ip: str) -> bool:
+        """Handle PluginMessage requests using the generic A-01 query_plugin pattern."""
+        if not isinstance(msg, PluginMessage):
+            return True
+        if msg.plugin_name != "knarr-punchhole":
+            return True
+        if msg.action != "REQUEST":
+            return True
+
+        try:
+            request = json.loads(msg.payload) if msg.payload else {}
+        except (TypeError, json.JSONDecodeError) as exc:
+            log.warning(f"punchhole-frontend: malformed PluginMessage from {msg.node_id}: {exc}")
+            return True  # P-01: handled internally, don't trigger firewall.blocked
+
+        if not isinstance(request, dict):
+            return True  # P-01: handled internally, don't trigger firewall.blocked
+
+        trace_id = str(request.get("trace_id", "") or request.get("_request_id", "") or "")
+        result = await self._process_request(
+            requester_node_id=msg.node_id,
+            object_key=str(request.get("object_key", "") or ""),
+            signed_request=request.get("payload", {}),
+            trace_id=trace_id,
+        )
+
+        response_payload = dict(result)
+        request_id = str(request.get("_request_id", "") or "")
+        if request_id:
+            response_payload["_request_id"] = request_id
+        if trace_id:
+            response_payload["trace_id"] = trace_id
+
+        peer = self._resolve_peer(msg.node_id, peer_ip, request)
+        if peer is not None and getattr(self._ctx, "send_fire_forget", None):
+            self._trace(trace_id, msg.node_id, "RESPONSE_SEND", status=result.get("status", ""), object_key=result.get("object_key", ""))
+            await self._ctx.send_fire_forget(
+                peer,
+                PluginMessage(
+                    node_id=self._ctx.node_id,
+                    plugin_name="knarr-punchhole",
+                    action="RESPONSE",
+                    payload=json.dumps(response_payload),
+                ),
+            )
+        return True  # P-01: handled internally, don't trigger firewall.blocked
+
+    async def on_mail_received(self, msg_type: str, from_node: str,
+                               to_node: str, body: Any,
+                               session_id: Optional[str]) -> None:
+        """Deprecated one-version fallback for punchhole requests over mail."""
+        if msg_type != "punchhole.request":
+            return
+
+        try:
+            request = body if isinstance(body, dict) else json.loads(body)
+        except (TypeError, json.JSONDecodeError) as exc:
+            log.warning(f"punchhole-frontend: malformed request from {from_node}: {exc}")
+            return
+
+        if not isinstance(request, dict) or request.get("action") != "request":
+            return
+
+        trace_id = str(request.get("trace_id", "") or "")
+        result = await self._process_request(
+            requester_node_id=from_node,
+            object_key=str(request.get("object_key", "") or ""),
+            signed_request=request.get("payload", {}),
+            trace_id=trace_id,
+        )
+        if result.get("status") == "ok" and self._ctx.emit_event:
+            self._ctx.emit_event(
+                "punchhole.response",
+                requester_node_id=from_node,
+                object_key=result.get("object_key", ""),
+                data=result.get("data"),
+                from_cache=bool(result.get("from_cache", False)),
+                trace_id=trace_id,
             )
 
     async def on_shutdown(self) -> None:
