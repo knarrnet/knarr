@@ -134,7 +134,7 @@ MIN_PEER_FLOOR = 8  # never prune below this many peers
 SWEEP_BATCH_SIZE = 50  # B3: max peers processed per sweep cycle (P-025)
 
 # BUS-01: topics forwarded cross-node via EventNotify (fire-and-forget)
-BUS_BROADCAST_TOPICS: frozenset = frozenset({"mail.flush_skip"})
+BUS_BROADCAST_TOPICS: frozenset = frozenset()  # v0.54.1: mail.flush_skip removed — local event, no network broadcast
 # BUS-01: topics allowed for cross-node EventNotify propagation (receive side)
 _EVENT_BROADCAST_TOPICS: frozenset = frozenset({"mail.flush_skip"})
 
