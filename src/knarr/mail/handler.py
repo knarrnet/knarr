@@ -276,12 +276,12 @@ async def _handle_send(input_data: dict) -> dict:
                 # Misconfiguration: accept_from=groups but no accept_groups defined — fail-closed
                 return {"status": "rejected", "reason": "no_accept_groups_configured"}
             if _group_engine:
-            caller_groups = set(_group_engine.get_groups(caller_node_id))
-            if not caller_groups.intersection(accept_groups):
-                return {"status": "rejected", "reason": "not_in_accepted_groups"}
-        else:
-            # Group engine not available — reject to be safe (fail-closed)
-            return {"status": "rejected", "reason": "groups_not_available"}
+                caller_groups = set(_group_engine.get_groups(caller_node_id))
+                if not caller_groups.intersection(accept_groups):
+                    return {"status": "rejected", "reason": "not_in_accepted_groups"}
+            else:
+                # Group engine not available — reject to be safe (fail-closed)
+                return {"status": "rejected", "reason": "groups_not_available"}
 
     # Validate body
     body = input_data.get("body")
