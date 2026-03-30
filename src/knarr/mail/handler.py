@@ -257,23 +257,25 @@ async def _handle_send(input_data: dict) -> dict:
     if not _decrypt_mail_item(input_data):
         return {"status": "rejected", "reason": "decryption_failed"}
 
-    # Check mailbox config
-    accept_from = _mail_config.get("accept_from", "all")
-    if accept_from == "none":
-        return {"status": "rejected", "reason": "mailbox_disabled"}
-
     caller_node_id = _get_caller_node_id(input_data)
 
-    if accept_from == "whitelist":
-        whitelist = _mail_config.get("whitelist", [])
-        if caller_node_id not in whitelist:
-            return {"status": "rejected", "reason": "not_whitelisted"}
-    elif accept_from == "groups":
-        accept_groups = set(_mail_config.get("accept_groups", []))
-        if not accept_groups:
-            # Misconfiguration: accept_from=groups but no accept_groups defined — fail-closed
-            return {"status": "rejected", "reason": "no_accept_groups_configured"}
-        if _group_engine:
+    # accept_from is an INBOUND policy — "who can send mail TO me."
+    # Local calls (node's own thrall/skill sending outbound mail) bypass it.
+    if not _is_local_call(input_data):
+        accept_from = _mail_config.get("accept_from", "all")
+        if accept_from == "none":
+            return {"status": "rejected", "reason": "mailbox_disabled"}
+
+        if accept_from == "whitelist":
+            whitelist = _mail_config.get("whitelist", [])
+            if caller_node_id not in whitelist:
+                return {"status": "rejected", "reason": "not_whitelisted"}
+        elif accept_from == "groups":
+            accept_groups = set(_mail_config.get("accept_groups", []))
+            if not accept_groups:
+                # Misconfiguration: accept_from=groups but no accept_groups defined — fail-closed
+                return {"status": "rejected", "reason": "no_accept_groups_configured"}
+            if _group_engine:
             caller_groups = set(_group_engine.get_groups(caller_node_id))
             if not caller_groups.intersection(accept_groups):
                 return {"status": "rejected", "reason": "not_in_accepted_groups"}
