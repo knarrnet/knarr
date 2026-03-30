@@ -17,6 +17,7 @@ def _make_node():
     node.storage.get_outbox_recipients.return_value = []
     node.storage.get_peers.return_value = []
     node.storage.get_provider_address.return_value = None
+    node.storage.get_peer_by_id.return_value = None
     node.resolve_peer = MagicMock(return_value=("0.0.0.0", 0))
     node._config = {"mail": {}}
     node.bus = MagicMock()

@@ -5,6 +5,14 @@ from knarr.dashboard.server import CockpitServer
 from unittest.mock import MagicMock
 
 class MockNode:
+    def __init__(self):
+        from unittest.mock import MagicMock
+        self._base_storage = MagicMock()
+        self._base_bus = MagicMock()
+        self._base_signing_key = None
+        self._base_public_key_hex = ""
+        self._handler_pool = None
+        self._config = {}
     def get_status(self): return {"status": "ok"}
     def get_peers(self): return []
     def get_skills(self): return {"local": [], "network": []}
@@ -70,6 +78,7 @@ async def test_cockpit_auth_required():
 async def test_cockpit_connection_limit():
     """Sentinel: cockpit rejects connections beyond max_connections (8)."""
     node = MockNode()
+    node._config = {"cockpit": {"max_connections": 8}}
     server = CockpitServer(node, bind="127.0.0.1", port=0)
     await server.start()
     port = server.port

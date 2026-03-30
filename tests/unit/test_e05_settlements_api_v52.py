@@ -16,6 +16,12 @@ def make_server():
     from knarr.dashboard.server import CockpitServer
 
     mock_node = MagicMock()
+    mock_node._base_storage = MagicMock()
+    mock_node._base_bus = MagicMock()
+    mock_node._base_signing_key = None
+    mock_node._base_public_key_hex = ""
+    mock_node.node_info = MagicMock()
+    mock_node.node_info.node_id = "a" * 64
     mock_node.storage = MagicMock()
     mock_node.storage.get_settlement_queue_page.return_value = ([], 0)
 

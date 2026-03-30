@@ -35,6 +35,7 @@ def _make_node(peers, send_side_effect):
     node = DHTNode.__new__(DHTNode)
     node._enqueue_write = AsyncMock()
     node._enqueue_write_proto = AsyncMock()
+    node._handler_pool = None
     node.storage = SimpleNamespace(
         cleanup_expired_jobs=MagicMock(),
         get_peers=MagicMock(return_value=peers),
@@ -82,6 +83,7 @@ async def test_sweep_completes_within_timeout(monkeypatch):
         return Heartbeat(node_id=peers[0].node_id, timestamp=time.time(), version="0.0.0")
 
     node = _make_node(peers, slow_send)
+    node._run_in_protocol_pool = AsyncMock(side_effect=lambda fn, *a: fn(*a))
     monkeypatch.setattr(node_module, "PEER_HEARTBEAT_SWEEP_TIMEOUT", 0.05)
     monkeypatch.setattr(node_module, "verify_message", lambda _msg: True)
     monkeypatch.setattr(node_module, "verify_node_id", lambda _msg: True)

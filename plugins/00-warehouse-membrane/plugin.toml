@@ -1,0 +1,24 @@
+name = "knarr-warehouse-membrane"
+version = "0.54.0"
+handler = "handler:WarehouseMembranePlugin"
+description = "Infrastructure membrane for URI-addressed inbound routing and identity scoping."
+priority = 0
+required = true
+
+[config]
+debug = false
+
+[config.selector_plugins]
+s = "__skills__"
+c = "__commerce__"
+p = "knarr-punchhole"
+m = "__mail__"
+k = "knarr-kademlia"
+g = "knarr-groups"
+o = "__objects__"
+
+[config.rules]
+"knarr://*/p/*" = { gates = [1, 2, 3], action = "auto_promote" }
+"knarr://*/c/*" = { gates = [1, 2, 3, 4, 5], action = "auto_promote" }
+"knarr://*/s/*" = { gates = [1, 2, 3], action = "auto_promote" }
+"knarr://*/k/*" = { gates = [1, 2], action = "auto_promote" }

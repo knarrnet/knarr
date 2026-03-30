@@ -94,11 +94,8 @@ class TestSettlements400(unittest.TestCase):
     def test_valid_integers_do_not_return_400(self):
         """Valid integer limit and offset must NOT trigger 400 (success path)."""
         server = self._make_server()
-        # Mock the DB so the success path doesn't crash
-        conn = MagicMock()
-        conn.execute.return_value.fetchall.return_value = []
-        conn.execute.return_value.fetchone.return_value = (0,)
-        server._node.storage._get_conn.return_value = conn
+        # PRE-01 #12: storage now exposes get_settlement_queue_page() instead of raw _get_conn()
+        server._node.storage.get_settlement_queue_page.return_value = ([], 0)
 
         responses = self._call_settlements(server, {"limit": ["10"], "offset": ["0"]})
         self.assertEqual(len(responses), 1)

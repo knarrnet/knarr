@@ -5,6 +5,11 @@ import pytest
 from knarr.dashboard.server import CockpitServer
 
 
+class _MockNodeInfo:
+    node_id = "mock" * 16
+    port = 9000
+
+
 class MockNode:
     def get_status(self): return {"status": "ok"}
     def get_peers(self): return []
@@ -12,11 +17,20 @@ class MockNode:
     def get_tasks(self): return []
     def get_ledger(self): return []
     _handlers = {"my-skill": (None, False)}
+    node_info = _MockNodeInfo()
+
+    def __init__(self):
+        from unittest.mock import MagicMock
+        self._base_storage = MagicMock()
+        self.storage = self._base_storage
+        self._base_bus = None
+        self._base_signing_key = None
+        self._base_public_key_hex = ""
 
     def get_skill_schema(self, name):
         return {"input_schema": {"text": "string"}} if name == "my-skill" else None
 
-    async def call_local(self, skill, input_data):
+    async def call_local(self, skill, input_data, **kwargs):
         return {"result": "ok"}
 
 
@@ -70,7 +84,8 @@ async def test_exposure_no_auth_allows_execute():
     await server.start()
     try:
         resp = await _request(server.port, "/s/test-exp/execute", body={"text": "hi"})
-        assert b"200 OK" in resp
+        # Local skill execution now returns 202 Accepted (fire-and-forget)
+        assert b"200 OK" in resp or b"202 Accepted" in resp
     finally:
         await server.stop()
 
@@ -95,7 +110,8 @@ async def test_exposure_token_auth_accepts_valid_token():
     try:
         resp = await _request(server.port, "/s/test-exp/execute",
                               body={"text": "hi"}, token="secret123")
-        assert b"200 OK" in resp
+        # Local skill execution now returns 202 Accepted (fire-and-forget)
+        assert b"200 OK" in resp or b"202 Accepted" in resp
     finally:
         await server.stop()
 
@@ -119,11 +135,11 @@ async def test_exposure_per_day_rate_limit():
     server = _make_server(auth="none", max_per_day=2)
     await server.start()
     try:
-        # First two should succeed
+        # First two should succeed (local skills now return 202 Accepted)
         resp1 = await _request(server.port, "/s/test-exp/execute", body={"text": "1"})
-        assert b"200 OK" in resp1
+        assert b"200 OK" in resp1 or b"202 Accepted" in resp1
         resp2 = await _request(server.port, "/s/test-exp/execute", body={"text": "2"})
-        assert b"200 OK" in resp2
+        assert b"200 OK" in resp2 or b"202 Accepted" in resp2
         # Third should be rate-limited
         resp3 = await _request(server.port, "/s/test-exp/execute", body={"text": "3"})
         assert b"429" in resp3
