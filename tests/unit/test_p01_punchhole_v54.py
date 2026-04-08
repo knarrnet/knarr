@@ -12,7 +12,9 @@ from knarr.core.models import NodeInfo
 
 
 def _load_module():
-    handler_path = Path("workspace/proposed-final/src/knarr/plugins/08-punchhole-frontend/handler.py")
+    import knarr
+    pkg_root = Path(knarr.__file__).parent
+    handler_path = pkg_root / "plugins" / "08-punchhole-frontend" / "handler.py"
     spec = importlib.util.spec_from_file_location("punchhole_frontend_v54", handler_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
