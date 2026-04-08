@@ -1961,8 +1961,8 @@ class DHTNode:
                 max_asset_size=self._config.get("node", {}).get("max_asset_size", 104857600),
                 max_total_size=self._config.get("sidecar", {}).get("max_total_size", 1073741824),
                 asset_ttl=self._config.get("sidecar", {}).get("asset_ttl", 3600),
-                cert_path=cert_path,
-                key_path=key_path,
+                cert_path=cert_path if _tls_enabled else "",
+                key_path=key_path if _tls_enabled else "",
                 vault=self._vault,  # C-04: encrypt assets at rest
             )
             await self._sidecar.start()
