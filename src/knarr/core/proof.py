@@ -16,8 +16,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from nacl.exceptions import BadSignatureError
-from nacl.signing import SigningKey, VerifyKey
+from .crypto import BadSignatureError, SigningKey, VerifyKey
 
 from . import rfc8785
 

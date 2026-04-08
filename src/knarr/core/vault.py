@@ -6,9 +6,7 @@ import time
 import tomllib
 from typing import Optional
 
-from nacl.pwhash import argon2id
-from nacl.secret import SecretBox
-from nacl.utils import random
+from .crypto import argon2id, SecretBox, random
 
 logger = logging.getLogger(__name__)
 

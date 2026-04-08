@@ -24,7 +24,7 @@ def _generate_or_load_signing_key(vault, identity_name: str):
     Key is stored in vault under 'identity:{name}:signing_key'.
     Returns (signing_key, public_key_hex).
     """
-    from nacl.signing import SigningKey
+    from ..core.crypto import SigningKey
 
     vault_key = f"identity:{identity_name}:signing_key"
     if vault is not None:

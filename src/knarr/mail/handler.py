@@ -53,7 +53,7 @@ def _decrypt_mail_item(input_data: dict) -> bool:
         return False
         
     try:
-        from nacl.public import SealedBox
+        from knarr.core.crypto import SealedBox
         box = SealedBox(_x25519_private)
         raw = base64.b64decode(input_data["encrypted_body"])
         decrypted = box.decrypt(raw)
@@ -318,8 +318,9 @@ async def _handle_send(input_data: dict) -> dict:
     else:
         msg_type = "text"
 
-    session_id = body.get("session_id", None)
-    reply_to = body.get("reply_to", None)
+    # S-05: pick up session_id/reply_to from either top-level input_data or nested body
+    session_id = input_data.get("session_id") or body.get("session_id") or None
+    reply_to = input_data.get("reply_to") or body.get("reply_to") or None
 
     # TTL
     ttl_hours = input_data.get("ttl_hours", DEFAULT_TTL_HOURS)

@@ -65,7 +65,8 @@ class AssetSidecar:
                  max_total_size: int = 1073741824,  # 1GB
                  asset_ttl: int = 3600,  # 1 hour
                  cert_path: str = "",
-                 key_path: str = ""):
+                 key_path: str = "",
+                 vault=None):  # C-04: KeyringVault for asset encryption at rest
         self._host = host
         self._port = port
         self._asset_dir = asset_dir
@@ -75,6 +76,7 @@ class AssetSidecar:
         self._asset_ttl = asset_ttl
         self._cert_path = cert_path
         self._key_path = key_path
+        self._vault = vault  # C-04: encrypt assets at rest using vault key
         self._server = None
         self._cleanup_task = None
         self._metadata: Dict[str, AssetMetadata] = {}
@@ -213,8 +215,7 @@ class AssetSidecar:
 
     def _verify_auth(self, method: str, path: str, headers: dict) -> bool:
         """Verify Ed25519 signature in HTTP headers."""
-        from nacl.signing import VerifyKey
-        from nacl.exceptions import BadSignatureError
+        from ..core.crypto import VerifyKey, BadSignatureError
 
         pub_key_hex = headers.get("x-knarr-publickey", "")
         signature_hex = headers.get("x-knarr-signature", "")
@@ -278,17 +279,28 @@ class AssetSidecar:
         data = await asyncio.wait_for(reader.readexactly(content_length), timeout=300.0)
         content_hash = hashlib.sha256(data).hexdigest()
 
-        # Verify content hash matches header (integrity check)
+        # Verify content hash matches header (integrity check — hash of plaintext)
         declared_hash = headers.get("x-knarr-content-hash", "")
         if declared_hash and declared_hash != "empty" and declared_hash != content_hash:
             await self._send_response(writer, 400, {"error": "Content hash mismatch"})
             return
 
-        # Atomic write — C-05: use asyncio.to_thread to avoid blocking the event loop
+        # C-04: Encrypt asset before writing to disk — fail-closed on error (TP-C04)
+        disk_data = data
+        if self._vault is not None:
+            try:
+                disk_data = self._vault.encrypt_bytes(data)
+                logger.debug("ASSET_ENCRYPT hash=%s len=%d", content_hash[:16], len(data))
+            except Exception as e:
+                logger.error("ASSET_ENCRYPT_FAIL hash=%s err=%s", content_hash[:16], e)
+                await self._send_response(writer, 500, {"error": "Encryption failed"})
+                return
+
+        # Atomic write — use asyncio.to_thread to avoid blocking the event loop
         final_path = os.path.join(self._asset_dir, content_hash)
         if not os.path.exists(final_path):
             tmp_path = final_path + ".tmp"
-            await self._write_file(tmp_path, data)
+            await self._write_file(tmp_path, disk_data)
             os.replace(tmp_path, final_path)
             self._metadata[content_hash] = AssetMetadata(
                 size=content_length,
@@ -309,8 +321,18 @@ class AssetSidecar:
             await self._send_response(writer, 404, {"error": "Asset not found"})
             return
 
-        # C-05: use asyncio.to_thread to avoid blocking the event loop on large reads
-        data = await self._read_file(path)
+        # use asyncio.to_thread to avoid blocking the event loop on large reads
+        disk_data = await self._read_file(path)
+
+        # C-04: Decrypt asset after reading from disk
+        data = disk_data
+        if self._vault is not None:
+            try:
+                data = self._vault.decrypt_bytes(disk_data)
+                logger.debug("ASSET_DECRYPT hash=%s len=%d", asset_hash[:16], len(data))
+            except Exception:
+                # Not encrypted (pre-C-04 asset) — serve raw
+                data = disk_data
 
         if asset_hash in self._metadata:
             self._metadata[asset_hash].access_count += 1

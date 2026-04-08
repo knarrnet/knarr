@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
-from nacl.signing import VerifyKey
+from .crypto import VerifyKey
 
 from .proof import verify_document
 

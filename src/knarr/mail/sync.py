@@ -242,16 +242,11 @@ class SyncEngine:
         await self._node._enqueue_write(self._node.storage.mark_outbox_sending, item_ids)
 
         # 3. Build MailSync message
-        from nacl.public import SealedBox, PublicKey
+        from ..core.crypto import seal_for_peer
         import base64
         items = []
+        # C-03: encrypt ALL mail types (including knarr/ system mail) when peer key available
         peer_key = self._node.storage.get_peer_encryption_key(peer_node_id)
-        sealed_box = None
-        if peer_key:
-            try:
-                sealed_box = SealedBox(PublicKey(bytes.fromhex(peer_key)))
-            except Exception as e:
-                self._log.warning(f"Failed to create SealedBox for {peer_node_id[:16]}: {e}")
         blocked_ids = []
         for p in pending:
             item = json.loads(p["body_json"])
@@ -266,14 +261,18 @@ class SyncEngine:
                     blocked_ids.append(p["item_id"])
                     continue
 
-            if sealed_box is not None:
+            if peer_key and item.get("body") is not None:
                 try:
                     body_bytes = json.dumps(item["body"]).encode('utf-8')
-                    encrypted = sealed_box.encrypt(body_bytes)
+                    encrypted = seal_for_peer(body_bytes, peer_key)
                     item["encrypted_body"] = base64.b64encode(encrypted).decode('utf-8')
                     item["body"] = "[encrypted]"
+                    if self._debug:
+                        self._log.debug(f"MAIL_ENCRYPT item={p['item_id'][:8]} type={item.get('msg_type','?')} to={peer_node_id[:16]}")
                 except Exception as e:
-                    self._log.warning(f"Failed to encrypt mail item {item.get('item_id')}: {e}")
+                    self._log.error(f"MAIL_ENCRYPT_FAIL item={item.get('item_id')} err={e} — skipping item (fail-closed)")
+                    blocked_ids.append(p["item_id"])
+                    continue
 
             items.append(item)
 
@@ -426,7 +425,7 @@ class SyncEngine:
             self._log.info(f"MAIL_RECV from={msg.sender_node_id[:16]} ip={peer_ip} items={len(msg.items)} seq={msg.batch_seq}")
 
         confirmed_ids = []
-        from nacl.public import SealedBox
+        from ..core.crypto import SealedBox
         import base64
         for item in msg.items:
             item_id = item.get("item_id")

@@ -20,7 +20,7 @@ import logging
 import time
 from typing import Callable, Optional, Tuple
 
-from nacl.signing import SigningKey, VerifyKey
+from ..core.crypto import SigningKey, VerifyKey
 
 from .conversion import credits_to_token, get_conversion_rate
 from .documents import Document, settlement_prepared, settlement_accepted, settlement_processed

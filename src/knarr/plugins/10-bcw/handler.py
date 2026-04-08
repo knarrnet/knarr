@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from nacl.signing import SigningKey
+from knarr.core.crypto import SigningKey
 
 from knarr.commerce.transfer_event import ConfirmationStatus, TransferEvent
 from knarr.core.wallet import b58decode, b58encode, derive_solana_address
@@ -76,7 +76,7 @@ def _find_program_address(seeds: list[bytes], program_id_bytes: bytes) -> bytes:
     Iterates nonce 255→0; returns the first SHA-256 hash that is NOT a valid
     Ed25519 curve point, per the Solana runtime spec.
     """
-    from nacl.bindings import crypto_core_ed25519_is_valid_point
+    from knarr.core.crypto import crypto_core_ed25519_is_valid_point
     for nonce in range(255, -1, -1):
         h = hashlib.sha256()
         for s in seeds:

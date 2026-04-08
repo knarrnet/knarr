@@ -2417,6 +2417,11 @@ class Storage:
         conn.commit()
 
     def close(self):
+        # S-02: WAL checkpoint on shutdown to reduce SQLite corruption risk
+        try:
+            self._keepalive_conn.execute("PRAGMA wal_checkpoint(RESTART)")
+        except Exception:
+            pass
         self._keepalive_conn.close()
 
     # ── Meter methods (F1 - Bounty decay and rate limiting) ───────────────────────

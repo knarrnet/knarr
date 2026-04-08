@@ -441,7 +441,7 @@ class CockpitServer:
                     # Local skill: call handler directly, bypass TCP self-connection.
                     # At 20+ peers, TCP self-call competes with peer traffic and times out.
                     output = await self._node.call_local(skill, task_input, timeout_ms=timeout_ms)
-                    self._node.storage.update_async_job_status(job_id, "completed")
+                    self._node.storage.update_async_job_status(job_id, "completed", result={"output": output})
                 else:
                     result = await self._node.submit_async_task(
                         node_id, host, port, skill, task_input, timeout_ms=timeout_ms,
@@ -885,6 +885,14 @@ class CockpitServer:
 
         # B2: if scored selection picked local, execute locally
         if provider.get("_local"):
+            self._fire_and_forget_task(
+                writer, self._node.node_info.node_id, "127.0.0.1",
+                self._node.node_info.port, skill, task_input, timeout_ms)
+            return
+
+        # S-04: Explicit provider matching local node — route locally instead of TCP round-trip
+        if provider.get("node_id") == self._node.node_info.node_id:
+            logger.debug(f"API_EXECUTE_SELF_ROUTE skill={skill} provider={provider['node_id'][:16]}")
             self._fire_and_forget_task(
                 writer, self._node.node_info.node_id, "127.0.0.1",
                 self._node.node_info.port, skill, task_input, timeout_ms)

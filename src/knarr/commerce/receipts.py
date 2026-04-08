@@ -86,7 +86,7 @@ def verify_credit_note(note_json: str) -> bool:
     Returns True if the signature is valid, False otherwise.
     """
     try:
-        from nacl.signing import VerifyKey
+        from knarr.core.crypto import VerifyKey
         note = json.loads(note_json)
         sig_b64 = note.get("signature")
         if not sig_b64:

@@ -219,7 +219,7 @@ def _generate_identity(data_dir: str, force: bool = False) -> tuple:
         finally:
             storage.close()
         if key_bytes:
-            from nacl.signing import SigningKey
+            from knarr.core.crypto import SigningKey
             sk = SigningKey(key_bytes)
             node_id = hashlib.sha256(sk.verify_key.encode()).hexdigest()
             from knarr.core.wallet import derive_solana_address
@@ -238,7 +238,7 @@ def _generate_identity(data_dir: str, force: bool = False) -> tuple:
         )
 
     # Neither exists — generate fresh identity
-    from nacl.signing import SigningKey
+    from knarr.core.crypto import SigningKey
     sk = SigningKey.generate()
     seed = sk.encode()  # 32-byte seed
     node_id = hashlib.sha256(sk.verify_key.encode()).hexdigest()

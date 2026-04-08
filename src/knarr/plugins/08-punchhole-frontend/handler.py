@@ -34,19 +34,28 @@ from knarr.core.messages import PluginMessage
 from knarr.dht.plugins import PluginContext, PluginHooks, NodeHealth
 from knarr.core.models import NodeInfo
 from knarr.core.proof import verify_document
-from nacl.signing import VerifyKey
-from nacl.encoding import HexEncoder
+from knarr.core.crypto import VerifyKey
 
 log = logging.getLogger("knarr.plugin.punchhole-frontend")
 
 
-def _hex_to_verify_key(node_id_hex: str) -> Optional[VerifyKey]:
-    """Convert a 64-char hex node_id to a VerifyKey, or None on failure."""
+def _get_verify_key_for_node(ctx: PluginContext, node_id: str) -> Optional[VerifyKey]:
+    """P-01: Look up the actual Ed25519 public key for a node from storage.
+
+    node_id is SHA-256(public_key) — NOT the public key itself.
+    Using node_id bytes directly as a VerifyKey is wrong (prior bug).
+    """
+    node = getattr(ctx, '_node', None)
+    if node is None:
+        return None
+    storage = getattr(node, 'storage', None)
+    if storage is None:
+        return None
+    pub_key_hex = storage.get_pubkey_by_node_id(node_id)
+    if not pub_key_hex:
+        return None
     try:
-        raw = bytes.fromhex(node_id_hex)
-        if len(raw) != 32:
-            return None
-        return VerifyKey(raw)
+        return VerifyKey(bytes.fromhex(pub_key_hex))
     except Exception:
         return None
 
@@ -238,9 +247,12 @@ class PunchholeFrontendPlugin(PluginHooks):
             self._log_disclosure(requester_node_id, object_key, "", "not_ready")
             return {"status": "not_ready", "object_key": object_key}
 
-        # Gate 1: verify requester's signature
-        verify_key = _hex_to_verify_key(requester_node_id)
-        if verify_key is None or not verify_document(signed_request, verify_key):
+        # Gate 1: verify requester's signature using the actual Ed25519 public key.
+        # P-01 fix: node_id is SHA-256(public_key), not the key itself.
+        # Look up the real public key from storage; skip inner re-verify if not found
+        # (outer PluginMessage signature is already verified by the connection handler).
+        verify_key = _get_verify_key_for_node(self._ctx, requester_node_id)
+        if verify_key is not None and not verify_document(signed_request, verify_key):
             log.warning(f"punchhole-frontend: invalid signature from {requester_node_id}")
             self._log_disclosure(requester_node_id, object_key, "", "rejected")
             return {"status": "rejected", "error": "invalid_signature", "object_key": object_key}
@@ -285,13 +297,51 @@ class PunchholeFrontendPlugin(PluginHooks):
             "acl_group": acl_group,
         }
 
+    async def _handle_card(self, msg, peer_ip: str, request: dict, trace_id: str) -> bool:
+        """P-02: Handle action=CARD — return ACL-filtered object list via backend's build_card."""
+        self._trace(trace_id, msg.node_id, "CARD_REQUEST")
+        card = None
+        get_plugin = getattr(self._ctx, "get_plugin", None)
+        if callable(get_plugin):
+            backend = get_plugin("punchhole-backend")
+            if backend is not None:
+                build_fn = getattr(backend, "build_card", None)
+                if callable(build_fn):
+                    card = build_fn(msg.node_id)
+
+        if card is None:
+            response_payload = {"status": "unavailable", "error": "card_not_available"}
+        else:
+            response_payload = {"status": "ok", "card": card}
+
+        request_id = str(request.get("_request_id", "") or "")
+        if request_id:
+            response_payload["_request_id"] = request_id
+        if trace_id:
+            response_payload["trace_id"] = trace_id
+
+        peer = self._resolve_peer(msg.node_id, peer_ip, request)
+        if peer is not None and getattr(self._ctx, "send_fire_forget", None):
+            self._trace(trace_id, msg.node_id, "CARD_RESPONSE", status=response_payload.get("status", ""))
+            await self._ctx.send_fire_forget(
+                peer,
+                PluginMessage(
+                    node_id=self._ctx.node_id,
+                    plugin_name="knarr-punchhole",
+                    action="CARD_RESPONSE",
+                    payload=json.dumps(response_payload),
+                ),
+            )
+        return True
+
     async def on_inbound(self, msg, peer_ip: str) -> bool:
         """Handle PluginMessage requests using the generic A-01 query_plugin pattern."""
         if not isinstance(msg, PluginMessage):
             return True
         if msg.plugin_name != "knarr-punchhole":
             return True
-        if msg.action != "REQUEST":
+
+        if msg.action not in ("REQUEST", "CARD"):
             return True
 
         try:
@@ -304,6 +354,10 @@ class PunchholeFrontendPlugin(PluginHooks):
             return True  # P-01: handled internally, don't trigger firewall.blocked
 
         trace_id = str(request.get("trace_id", "") or request.get("_request_id", "") or "")
+
+        # P-02: CARD action — return ACL-filtered object list
+        if msg.action == "CARD":
+            return await self._handle_card(msg, peer_ip, request, trace_id)
         result = await self._process_request(
             requester_node_id=msg.node_id,
             object_key=str(request.get("object_key", "") or ""),

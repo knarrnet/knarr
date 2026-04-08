@@ -24,7 +24,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
-    from nacl.signing import SigningKey
+    from knarr.core.crypto import SigningKey
 
 logger = logging.getLogger(__name__)
 

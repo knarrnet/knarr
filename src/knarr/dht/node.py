@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Set, Callable
-from nacl.signing import SigningKey, VerifyKey
+from ..core.crypto import SigningKey, VerifyKey
 
 from .. import __version__
 from ..core.models import NodeInfo, SkillSheet, Task, Policy, GroupPolicy, SkillPolicy
@@ -1514,17 +1514,15 @@ class DHTNode:
         peer_key = self.storage.get_peer_encryption_key(node_id)
         if not peer_key:
             raise ValueError(f"No encryption key found for peer {node_id}")
-        from nacl.public import SealedBox, PublicKey
-        box = SealedBox(PublicKey(bytes.fromhex(peer_key)))
-        return box.encrypt(data)
+        from ..core.crypto import seal_for_peer
+        return seal_for_peer(data, peer_key)
 
     def decrypt_from_peer(self, data: bytes) -> bytes:
         """Decrypts SealedBox data sent to this node."""
         if not self._x25519_private:
             raise RuntimeError("Encryption not initialized")
-        from nacl.public import SealedBox
-        box = SealedBox(self._x25519_private)
-        return box.decrypt(data)
+        from ..core.crypto import unseal
+        return unseal(data, self._x25519_private)
 
     def _sign_receipt(self, task_id: str, skill_name: str,
                       consumer_node_id: str, credits_charged: float,
@@ -1876,9 +1874,46 @@ class DHTNode:
         # Share node's 32+ thread pool as default executor — prevents asyncio.to_thread
         # and run_in_executor(None) from starving on the default 5-8 thread pool at scale.
         self._main_loop.set_default_executor(self._handler_pool)
+
+        # C-02: Resolve and generate TLS cert BEFORE starting server
+        config_dir = self._config.get("_config_dir", os.getcwd())
+        data_dir = self._config.get("_data_dir", config_dir)
+        node_cfg = self._config.get("node", {})
+        network_cfg = self._config.get("network", {})
+        _tls_enabled = node_cfg.get("tls", True)
+        _tls_required = node_cfg.get("tls_required", True)
+
+        from ..core.crypto import ensure_node_tls_cert, create_server_tls_context, create_client_tls_context
+        from ..mail.tls import resolve_cert_paths
+        cert_path, key_path = resolve_cert_paths(self._config, data_dir)
+        custom_tls = "tls_cert" in node_cfg or "tls_key" in node_cfg
+        if _tls_enabled and not custom_tls and (not os.path.exists(cert_path) or not os.path.exists(key_path)):
+            key_bytes = self.storage.get_node_key()
+            if key_bytes:
+                cert_path, key_path = ensure_node_tls_cert(
+                    self._config, data_dir, self.node_info.node_id, key_bytes
+                )
+                self._generated_identity_certs = True
+        self._cert_path = cert_path
+        self._key_path = key_path
+
+        # Build server TLS context
+        _server_ssl_ctx = None
+        if _tls_enabled:
+            _server_ssl_ctx = create_server_tls_context(cert_path, key_path)
+            if _server_ssl_ctx is None and _tls_required:
+                raise RuntimeError("tls_required=true but TLS cert/key unavailable — refusing to start in plaintext")
+            elif _server_ssl_ctx:
+                logger.info("NODE_TLS_SERVER enabled cert=%s", cert_path)
+
+        # Build client TLS context for outbound connections
+        _client_ssl_ctx = create_client_tls_context() if _tls_enabled else None
+        self._pool.set_tls_context(_client_ssl_ctx, tls_required=_tls_required)
+
         self.server = await asyncio.start_server(
             self._handle_connection, self._bind_host, self.node_info.port,
             backlog=512, reuse_address=True,
+            ssl=_server_ssl_ctx,
         )
         # Update port if dynamic (0)
         sock = self.server.sockets[0]
@@ -1887,18 +1922,15 @@ class DHTNode:
             host=self.node_info.host,
             port=sock.getsockname()[1]
         )
-        
+
         addr = self.server.sockets[0].getsockname()
-        logger.info(f"DHT node {self.node_info.node_id} serving on {addr}")
+        tls_label = "TLS" if _server_ssl_ctx else "plaintext"
+        logger.info(f"DHT node {self.node_info.node_id} serving on {addr} ({tls_label})")
         if not self._config.get("network", {}).get("bootstrap", []):
             logger.warning(
                 "No bootstrap peers configured — this node is isolated from the network. "
                 "Add [network] bootstrap = [...] to knarr.toml or use --bootstrap flag"
             )
-        
-        # Auto-generate TLS cert if missing (only for default paths, not custom)
-        config_dir = self._config.get("_config_dir", os.getcwd())
-        data_dir = self._config.get("_data_dir", config_dir)
 
         # WM-I1: Delete stale shutdown sentinel from a previous session
         _sentinel_path = os.path.join(data_dir, "knarr.stop")
@@ -1908,18 +1940,6 @@ class DHTNode:
                 logger.info(f"NODE_STALE_SENTINEL_REMOVED sentinel={_sentinel_path}")
             except OSError:
                 pass
-
-        from ..mail.tls import generate_tls_cert, resolve_cert_paths
-        cert_path, key_path = resolve_cert_paths(self._config, data_dir)
-        network_cfg = self._config.get("network", {})
-        custom_tls = "tls_cert" in network_cfg or "tls_key" in network_cfg
-        if not custom_tls and (not os.path.exists(cert_path) or not os.path.exists(key_path)):
-            key_bytes = self.storage.get_node_key()
-            if key_bytes:
-                generate_tls_cert(key_bytes, self.node_info.node_id, data_dir)
-                self._generated_identity_certs = True
-        self._cert_path = cert_path
-        self._key_path = key_path
 
         # Start sidecar (default: protocol port + 1, set to 0 to disable)
         sidecar_port = self._config.get("node", {}).get("sidecar_port")
@@ -1943,6 +1963,7 @@ class DHTNode:
                 asset_ttl=self._config.get("sidecar", {}).get("asset_ttl", 3600),
                 cert_path=cert_path,
                 key_path=key_path,
+                vault=self._vault,  # C-04: encrypt assets at rest
             )
             await self._sidecar.start()
             self._sidecar_port = self._sidecar.port
@@ -3472,7 +3493,7 @@ class DHTNode:
                 # store peer's encryption key if provided (verify derivation to prevent MITM)
                 if msg.encryption_key:
                     try:
-                        from nacl.signing import VerifyKey
+                        from ..core.crypto import VerifyKey
                         expected = VerifyKey(bytes.fromhex(msg.public_key)).to_curve25519_public_key().encode().hex()
                         if msg.encryption_key == expected:
                             await self._enqueue_write(
@@ -3488,7 +3509,7 @@ class DHTNode:
                 if msg.wallet:
                     try:
                         from ..core.wallet import b58encode
-                        from nacl.signing import VerifyKey
+                        from ..core.crypto import VerifyKey
                         expected = b58encode(VerifyKey(bytes.fromhex(msg.public_key)).encode())
                         if msg.wallet == expected:
                             await self._enqueue_write(
@@ -4898,6 +4919,7 @@ class DHTNode:
                 bootstrap_node_id = peers[0].node_id
         return {
             "node_id": self.node_info.node_id,
+            "public_key": self._public_key_hex,  # S-06: expose Ed25519 public key
             "version": __version__,
             "uptime_seconds": uptime,
             "peer_count": len(self.storage.get_peers()),
@@ -5633,6 +5655,12 @@ class DHTNode:
             raise RuntimeError("Settlement confirmation processing requires a signing key")
 
         prior_balance = float(self.storage.get_ledger_balance(peer_key) or 0.0)
+
+        # S-01: Receiver-side dedup — skip if there's already a pending settlement for this peer.
+        # Adversary-validated: balance==0.0 is unsafe (replay after new debt + false drop on zero-balance peers).
+        if self.storage.has_pending_settlement(peer_key):
+            logger.info("SETTLEMENT_CONFIRM_DEDUP peer=%s already_pending", peer_key[:16])
+            return
 
         # F-02: Reject fraudulent confirmations that understate the settlement amount.
         # Overpayment is legitimate: netting trigger sends settle_amount = debt + target_balance

@@ -6,7 +6,7 @@ extension point for multisig governance wallets.
 """
 from abc import ABC, abstractmethod
 
-from nacl.signing import SigningKey
+from knarr.core.crypto import SigningKey
 
 from knarr.core.wallet import derive_solana_address
 

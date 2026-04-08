@@ -25,6 +25,13 @@ class ConnectionPool:
         self._max = max_connections
         self._last_used: Dict[str, float] = {}
         self._creation_order: List[str] = []  # newest last — LIFO evicts from end
+        self._tls_ctx = None        # C-02: client TLS context
+        self._tls_required = True   # C-02: reject plaintext when True
+
+    def set_tls_context(self, ctx, tls_required: bool = True):
+        """C-02: Set TLS context for outbound connections."""
+        self._tls_ctx = ctx
+        self._tls_required = tls_required
 
     # ------------------------------------------------------------------
     # Lock management
@@ -58,12 +65,24 @@ class ConnectionPool:
         if len(self._pool) >= self._max:
             self._evict_lifo()
 
+        # C-02: Attempt TLS connection; fall back to plaintext if not required
+        ssl_ctx = self._tls_ctx
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=timeout
+                asyncio.open_connection(host, port, ssl=ssl_ctx), timeout=timeout
             )
         except Exception:
-            return None
+            if ssl_ctx is not None and not self._tls_required:
+                # Fallback to plaintext
+                logger.warning("Pool TLS connect failed, falling back to plaintext host=%s port=%d", host, port)
+                try:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(host, port), timeout=timeout
+                    )
+                except Exception:
+                    return None
+            else:
+                return None
 
         self._pool[peer_id] = (reader, writer)
         self._last_used[peer_id] = time.monotonic()

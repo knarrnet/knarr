@@ -294,8 +294,7 @@ def sign_message(msg: Message, signing_key: Any) -> Message:
 
 def verify_message(msg: Message) -> bool:
     """Verifies the signature on a message. Returns True if valid."""
-    from nacl.signing import VerifyKey
-    from nacl.exceptions import BadSignatureError
+    from knarr.core.crypto import VerifyKey, BadSignatureError
 
     if not msg.public_key or not msg.signature:
         return False
