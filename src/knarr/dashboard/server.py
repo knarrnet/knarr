@@ -736,6 +736,10 @@ class CockpitServer:
                             }
                             if data.get("attachments"):
                                 send_data["attachments"] = data["attachments"]
+                            if data.get("session_id"):
+                                send_data["session_id"] = data["session_id"]
+                            if data.get("reply_to"):
+                                send_data["reply_to"] = data["reply_to"]
                             res = await self._node.call_local("knarr-mail", send_data)
                             self._respond_json(writer, res)
                         except Exception as e:
