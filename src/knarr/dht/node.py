@@ -1408,7 +1408,7 @@ class DHTNode:
         """Sends a message directly to a host:port without expecting a Knarr response."""
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=5.0
+                asyncio.open_connection(host, port, ssl=self._client_ssl_ctx), timeout=5.0
             )
             try:
                 await send_message(writer, msg)
@@ -1770,7 +1770,7 @@ class DHTNode:
         # that explicitly so callers receive a retriable asyncio.TimeoutError
         # instead of a RuntimeError("Unexpected response type: NoneType") → HTTP 500.
         ack_timeout = min(60.0, timeout_ms / 1000.0)
-        resp = await request_response(provider_host, provider_port, req, timeout=ack_timeout)
+        resp = await request_response(provider_host, provider_port, req, timeout=ack_timeout, ssl_context=self._client_ssl_ctx)
         if resp is None:
             raise asyncio.TimeoutError(
                 f"Provider {provider_host}:{provider_port} did not acknowledge task within {ack_timeout:.0f}s"
@@ -1908,6 +1908,7 @@ class DHTNode:
 
         # Build client TLS context for outbound connections
         _client_ssl_ctx = create_client_tls_context() if _tls_enabled else None
+        self._client_ssl_ctx = _client_ssl_ctx  # stored for request_response callers
         self._pool.set_tls_context(_client_ssl_ctx, tls_required=_tls_required)
 
         self.server = await asyncio.start_server(
@@ -2172,7 +2173,7 @@ class DHTNode:
                     port=self.node_info.port,
                     ephemeral=self._ephemeral,
                 ))
-                resp = await request_response(host, port, req, timeout=3.0)
+                resp = await request_response(host, port, req, timeout=3.0, ssl_context=self._client_ssl_ctx)
                 if isinstance(resp, JoinResponse) and verify_message(resp):
                     for peer_dict in resp.peers:
                         try:
@@ -2188,7 +2189,7 @@ class DHTNode:
                     # Startup sync from this peer
                     try:
                         sync_req = self._sign(SyncRequest(since=0.0))
-                        sync_resp = await request_response(host, port, sync_req, timeout=10.0)
+                        sync_resp = await request_response(host, port, sync_req, timeout=10.0, ssl_context=self._client_ssl_ctx)
                         if isinstance(sync_resp, SyncResponse) and verify_message(sync_resp):
                             await self._process_sync_response(sync_resp)
                     except Exception as e:
@@ -2238,7 +2239,7 @@ class DHTNode:
                     ephemeral=self._ephemeral
                 ))
                 
-                resp = await request_response(host, port, req)
+                resp = await request_response(host, port, req, ssl_context=self._client_ssl_ctx)
                 if isinstance(resp, JoinResponse) and verify_message(resp):
                     for peer_dict in resp.peers:
                         try:
@@ -2256,7 +2257,7 @@ class DHTNode:
                     # Startup sync
                     try:
                         sync_req = self._sign(SyncRequest(since=0.0))
-                        sync_resp = await request_response(host, port, sync_req, timeout=10.0)
+                        sync_resp = await request_response(host, port, sync_req, timeout=10.0, ssl_context=self._client_ssl_ctx)
                         if isinstance(sync_resp, SyncResponse) and verify_message(sync_resp):
                             await self._process_sync_response(sync_resp)
                     except Exception as e:
@@ -2595,7 +2596,7 @@ class DHTNode:
         peers = self.storage.get_peers()
         if peers:
             msg = self._sign(Query(query_type=query_type, value=value_norm))
-            tasks = [request_response(p.host, p.port, msg, timeout=network_timeout) for p in peers]
+            tasks = [request_response(p.host, p.port, msg, timeout=network_timeout, ssl_context=self._client_ssl_ctx) for p in peers]
             network_responses = await asyncio.gather(*tasks)
 
             for resp in network_responses:
@@ -3036,7 +3037,7 @@ class DHTNode:
         self._task_expected_provider[task_id] = ""  # will be set from provider's response key
 
         try:
-            resp = await request_response(provider_host, provider_port, req, timeout=timeout_ms/1000.0)
+            resp = await request_response(provider_host, provider_port, req, timeout=timeout_ms/1000.0, ssl_context=self._client_ssl_ctx)
             
             if isinstance(resp, TaskResult) and verify_message(resp):
                 # F-03: Bind sync response to the expected provider — reject if the
@@ -4330,7 +4331,7 @@ class DHTNode:
             if not msg.signature:
                 msg = self._sign(msg)
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(peer.host, peer.port), timeout=5.0
+                asyncio.open_connection(peer.host, peer.port, ssl=self._client_ssl_ctx), timeout=5.0
             )
             await send_message(writer, msg)
             writer.close()

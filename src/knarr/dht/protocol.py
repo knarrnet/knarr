@@ -30,11 +30,12 @@ async def receive_message(reader: asyncio.StreamReader, max_size: int = MAX_MESS
     except (asyncio.IncompleteReadError, ConnectionError):
         return None
 
-async def request_response(host: str, port: int, msg: Message, timeout: float = 5.0) -> Optional[Message]:
+async def request_response(host: str, port: int, msg: Message, timeout: float = 5.0,
+                           ssl_context=None) -> Optional[Message]:
     """Connects, sends a message, and waits for a single response."""
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port),
+            asyncio.open_connection(host, port, ssl=ssl_context),
             timeout=timeout
         )
         try:
