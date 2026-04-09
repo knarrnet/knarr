@@ -524,7 +524,14 @@ async def cmd_serve(args):
     skills_loaded = await load_skills_from_config(node, config, config_dir)
 
     # 7a. Register system skills (knarr-mail, etc.)
-    await node.register_system_skills(config)
+    # Skill announces are backgrounded so they don't block cockpit startup.
+    # At 181 skills × 8 peers, sequential DHT PUTs take 3-4 minutes.
+    async def _register_skills_background():
+        try:
+            await node.register_system_skills(config)
+        except Exception as e:
+            logger.error(f"SKILL_REGISTER_FAIL: {e}")
+    asyncio.create_task(_register_skills_background())
 
     # 7b. Load per-skill secrets
     node.load_secrets(os.path.join(data_dir, "secrets.toml"))
