@@ -3909,6 +3909,15 @@ class DHTNode:
                 error={"code": "INVALID_REQUEST", "message": "Invalid requester address fields"}
             ))
 
+        # Ensure requester is routable for result delivery (task_result mail).
+        # Without this, the provider can't push results back to unknown callers.
+        if msg.requester_node_id and msg.requester_host and msg.requester_port:
+            requester_info = NodeInfo(node_id=msg.requester_node_id, host=msg.requester_host, port=msg.requester_port)
+            await self._enqueue_write(self._base_storage.upsert_peer, requester_info)
+            if msg.public_key:
+                await self._enqueue_write(self._base_storage.update_peer_encryption_key,
+                                          msg.requester_node_id, "")  # encryption key resolved later via heartbeat
+
         # Visibility/Whitelist check — BEFORE policy to avoid ledger mutation for unauthorized callers [P6A-004]
         # Self-calls (e.g. cockpit dispatching slow local skills via TCP) bypass visibility
         is_self_call = msg.public_key == self._public_key_hex
