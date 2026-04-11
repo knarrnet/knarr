@@ -38,7 +38,12 @@ def run_netting_cycle(node) -> int:
         if node.storage.has_pending_settlement(pk):
             continue
 
-        # Queue soft-threshold settlement order
+        # Queue soft-threshold settlement order.
+        # Post-review fix (v0.56.0, Opus subagent): pass peer_public_key=pk
+        # explicitly so the dedup column stores the actual pubkey, matching
+        # what has_pending_settlement(pk) queries with above at line 38.
+        # counterparty_node_id stays as the node_id for URI construction.
+        counterparty_node_id = node.storage.get_node_id_for_public_key(pk) or ""
         node.storage.queue_settlement(
             item_type="soft_threshold",
             from_node=node.node_info.node_id,  # self-generated
@@ -52,6 +57,8 @@ def run_netting_cycle(node) -> int:
                 "timestamp": time.time(),
             },
             priority=2,  # soft threshold = priority 2 (below hard limit)
+            counterparty_node_id=counterparty_node_id,
+            peer_public_key=pk,
         )
         queued += 1
 

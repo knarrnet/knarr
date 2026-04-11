@@ -18,6 +18,24 @@ MAX_DEMAND_ENTRIES = 1000
 # v0.32.0: Added mail_creditnote for signed credit notes
 MAIL_BUCKETS = {"mail_inbox", "mail_jobreport", "mail_system", "mail_creditnote"}
 
+
+def _skill_uri(provider_node_id: str, skill_name: str) -> str:
+    if not provider_node_id or not skill_name:
+        return ""
+    return f"knarr://{provider_node_id}/s/{str(skill_name).lower()}"
+
+
+def _mail_uri(node_id: str, message_id: str) -> str:
+    if not node_id or not message_id:
+        return ""
+    return f"knarr://{node_id}/m/{message_id}"
+
+
+def _settlement_uri(counterparty_node_id: str, settlement_id: int | str) -> str:
+    if not counterparty_node_id or settlement_id in (None, ""):
+        return ""
+    return f"knarr://{counterparty_node_id}/c/{settlement_id}"
+
 class Storage:
     """Handles persistence of peers and skills using SQLite."""
 
@@ -492,6 +510,69 @@ class Storage:
             return NodeInfo(node_id=row[0], host=row[1], port=row[2])
         return None
 
+    def get_peer_cert_fingerprint(self, node_id: str) -> str:
+        """Return the stored TLS cert fingerprint for a peer, or ''.
+
+        v0.56.0: renamed from get_peer_tls_cert_fingerprint to match
+        the C-01 CR spec. Callers updated; external callers should migrate.
+        """
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT tls_cert_fingerprint FROM peers WHERE node_id = ?",
+            (node_id,),
+        ).fetchone()
+        return row[0] if row and row[0] else ""
+
+    def set_peer_cert_fingerprint(
+        self,
+        node_id: str,
+        fingerprint: str,
+        host: str = "",
+        port: int = 0,
+    ) -> None:
+        """Store or update the pinned TLS cert fingerprint for a peer.
+
+        v0.56.0: renamed from set_peer_tls_cert_fingerprint to match
+        the C-01 CR spec.
+        """
+        if not node_id or not fingerprint:
+            return
+        conn = self._get_conn()
+        now = time.time()
+        conn.execute(
+            """
+            INSERT INTO peers (node_id, host, port, last_seen, tls_cert_fingerprint)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(node_id) DO UPDATE SET
+                tls_cert_fingerprint = excluded.tls_cert_fingerprint,
+                last_seen = excluded.last_seen,
+                host = CASE
+                    WHEN (COALESCE(peers.host, '') = '') AND excluded.host != '' THEN excluded.host
+                    ELSE peers.host
+                END,
+                port = CASE
+                    WHEN COALESCE(peers.port, 0) = 0 AND excluded.port > 0 THEN excluded.port
+                    ELSE peers.port
+                END
+            """,
+            (node_id, host or "", int(port or 0), now, fingerprint),
+        )
+        conn.commit()
+
+    def clear_peer_cert_fingerprint(self, node_id: str) -> bool:
+        """Clear the stored TLS cert fingerprint for a peer. Returns False if unknown.
+
+        v0.56.0: renamed from clear_peer_tls_cert_fingerprint to match
+        the C-01 CR spec.
+        """
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "UPDATE peers SET tls_cert_fingerprint = '' WHERE node_id = ?",
+            (node_id,),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
     def get_cached_peers(self, max_age_hours: float = 24, limit: int = 10) -> List[NodeInfo]:
         """Returns peers seen within max_age_hours, ordered by most recent first."""
         conn = self._get_conn()
@@ -593,7 +674,7 @@ class Storage:
                     )
                 """)
 
-        uri = skill_sheet.uri or ""
+        uri = skill_sheet.uri or _skill_uri(provider_node_id, skill_key)
         conn.execute("""
             INSERT INTO skills (skill_key, provider_node_id, skill_record_json, announced_at, ttl, is_own,
                                provider_public_key, announce_signature, provider_msg_id, sidecar_port, uri,
@@ -872,30 +953,37 @@ class Storage:
 
     def insert_task(self, task: Task, provider_public_key: str = ""):
         conn = self._get_conn()
+        uri = _skill_uri(task.provider_node_id, task.skill_name)
         conn.execute("""
             INSERT OR REPLACE INTO tasks (
                 task_id, skill_name, requester_node_id, provider_node_id, status,
-                input_data_json, created_at, updated_at, timeout_ms, provider_public_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                input_data_json, created_at, updated_at, timeout_ms, provider_public_key, uri
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             task.task_id, task.skill_name, task.requester_node_id, task.provider_node_id,
             task.status, json.dumps(task.input_data), task.created_at, task.updated_at,
-            task.timeout_ms, provider_public_key
+            task.timeout_ms, provider_public_key, uri
         ))
         conn.commit()
 
     def log_execution(self, job_id: str, skill: str, caller: Optional[str],
                       status: str, wall_ms: int, input_hash: Optional[str] = None,
                       asset_hash: Optional[str] = None, error: Optional[str] = None,
-                      price: Optional[float] = None, price_breakdown: str = ""):
+                      price: Optional[float] = None, price_breakdown: str = "",
+                      provider_node_id: str = ""):
         """Records an execution event to the append-only log."""
         conn = self._get_conn()
+        uri = _skill_uri(provider_node_id, skill)
         conn.execute("""
             INSERT INTO execution_log (
                 job_id, skill_name, caller_node_id, status, wall_time_ms,
-                input_hash, asset_hash, error, created_at, price, price_breakdown
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (job_id, skill, caller, status, wall_ms, input_hash, asset_hash, error, time.time(), price, price_breakdown))
+                input_hash, asset_hash, error, created_at, price, price_breakdown,
+                provider_node_id, uri
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            job_id, skill, caller, status, wall_ms, input_hash, asset_hash, error,
+            time.time(), price, price_breakdown, provider_node_id, uri,
+        ))
         conn.commit()
 
     def get_execution_log(self, job_id: Optional[str] = None, skill: Optional[str] = None,
@@ -923,17 +1011,20 @@ class Storage:
         ]
 
     def insert_async_job(self, job_id: str, skill: str, consumer_id: str,
-                         input_hash: str, position: int, expires_at: float):
+                         input_hash: str, position: int, expires_at: float,
+                         provider_node_id: str = ""):
         """Inserts a new async job record."""
         conn = self._get_conn()
         now = time.time()
         self.purge_stale_failed_jobs()
+        uri = _skill_uri(provider_node_id, skill)
         conn.execute("""
             INSERT INTO async_jobs (
                 job_id, skill_name, consumer_node_id, input_hash,
-                status, queue_position, created_at, updated_at, expires_at
-            ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)
-        """, (job_id, skill, consumer_id, input_hash, position, now, now, expires_at))
+                status, queue_position, created_at, updated_at, expires_at,
+                provider_node_id, uri
+            ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
+        """, (job_id, skill, consumer_id, input_hash, position, now, now, expires_at, provider_node_id, uri))
         conn.commit()
 
     def insert_remote_job(self, job_id: str, skill: str, provider_node_id: str,
@@ -941,15 +1032,16 @@ class Storage:
         """Insert a tracking entry for a remote async job. Returns False on PK collision."""
         conn = self._get_conn()
         now = time.time()
+        uri = _skill_uri(provider_node_id, skill)
         try:
             conn.execute("""
                 INSERT INTO async_jobs (
                     job_id, skill_name, consumer_node_id, input_hash,
                     status, queue_position, created_at, updated_at, expires_at,
-                    provider_node_id, provider_host, provider_port
-                ) VALUES (?, ?, ?, '', 'remote', 0, ?, ?, ?, ?, ?, ?)
+                    provider_node_id, provider_host, provider_port, uri
+                ) VALUES (?, ?, ?, '', 'remote', 0, ?, ?, ?, ?, ?, ?, ?)
             """, (job_id, skill, "", now, now, expires_at,
-                  provider_node_id, provider_host, provider_port))
+                  provider_node_id, provider_host, provider_port, uri))
             conn.commit()
             return True
         except sqlite3.IntegrityError:
@@ -1532,12 +1624,22 @@ class Storage:
         bucket = self._mail_bucket(msg_type, system)
         logger.debug(f"MAIL_BUCKET_ROUTE msg={message_id[:8]} bucket={bucket} type={msg_type} system={system}")
         conn = self._get_conn()
-        conn.execute(f"""
-            INSERT INTO {bucket} (message_id, from_node, to_node, timestamp, body,
-                              session_id, msg_type, reply_to, ttl_expires, status, created_at, system)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'unread', ?, ?)
-        """, (message_id, from_node, to_node, timestamp, body,
-              session_id, msg_type, reply_to, ttl_expires, timestamp, 1 if system else 0))
+        if bucket == "mail_inbox":
+            conn.execute(f"""
+                INSERT INTO {bucket} (message_id, from_node, to_node, timestamp, body,
+                                  session_id, msg_type, reply_to, ttl_expires, status, created_at, system, uri)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'unread', ?, ?, ?)
+            """, (
+                message_id, from_node, to_node, timestamp, body, session_id, msg_type,
+                reply_to, ttl_expires, timestamp, 1 if system else 0, _mail_uri(to_node, message_id),
+            ))
+        else:
+            conn.execute(f"""
+                INSERT INTO {bucket} (message_id, from_node, to_node, timestamp, body,
+                                  session_id, msg_type, reply_to, ttl_expires, status, created_at, system)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'unread', ?, ?)
+            """, (message_id, from_node, to_node, timestamp, body,
+                  session_id, msg_type, reply_to, ttl_expires, timestamp, 1 if system else 0))
         conn.commit()
 
     def poll_mail(self, to_node: str, since_rowid: int = 0,
@@ -1768,13 +1870,19 @@ class Storage:
 
     # Mail v2 Outbox Methods
 
-    def enqueue_outbox(self, item_id: str, to_node: str, body_json: str, ttl_expires: float) -> int:
+    def enqueue_outbox(self, item_id: str, to_node: str, body_json: str, ttl_expires: float,
+                       from_node: str = "") -> int:
         """Stores item in outbox, returns its batch_seq."""
         # Validate to_node is a 64-char hex string (#21)
         if not to_node or len(to_node) != 64 or not all(c in '0123456789abcdef' for c in to_node):
             raise ValueError(f"Invalid to_node: must be 64-char hex, got '{to_node[:20]}'")
         conn = self._get_conn()
         now = time.time()
+        if not from_node:
+            try:
+                from_node = str(json.loads(body_json).get("from_node", "") or "")
+            except Exception:
+                from_node = ""
         
         # Get next sequence for this peer
         cursor = conn.execute("SELECT next_seq FROM mail_seq WHERE peer_node_id = ?", (to_node,))
@@ -1787,9 +1895,9 @@ class Storage:
             conn.execute("INSERT INTO mail_seq (peer_node_id, next_seq) VALUES (?, 2)", (to_node,))
             
         conn.execute("""
-            INSERT INTO mail_outbox (item_id, to_node, batch_seq, body_json, status, created_at, ttl_expires)
-            VALUES (?, ?, ?, ?, 'pending', ?, ?)
-        """, (item_id, to_node, next_seq, body_json, now, ttl_expires))
+            INSERT INTO mail_outbox (item_id, to_node, batch_seq, body_json, status, created_at, ttl_expires, uri)
+            VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
+        """, (item_id, to_node, next_seq, body_json, now, ttl_expires, _mail_uri(from_node, item_id)))
         conn.commit()
         return next_seq
 
@@ -1925,12 +2033,22 @@ class Storage:
         logger.debug(f"MAIL_SYNC_ROUTE id={item_id[:8]} bucket={bucket} type={msg_type} from={from_node[:16]}")
         conn = self._get_conn()
         try:
-            conn.execute(f"""
-                INSERT INTO {bucket} (message_id, from_node, to_node, timestamp, body,
-                                  session_id, msg_type, reply_to, ttl_expires, status, created_at, system, item_origin)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'unread', ?, ?, 'sync')
-            """, (item_id, from_node, to_node, timestamp, body_json,
-                  session_id, msg_type, reply_to, ttl_expires, time.time(), 1 if system else 0))
+            if bucket == "mail_inbox":
+                conn.execute(f"""
+                    INSERT INTO {bucket} (message_id, from_node, to_node, timestamp, body,
+                                      session_id, msg_type, reply_to, ttl_expires, status, created_at, system, item_origin, uri)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'unread', ?, ?, 'sync', ?)
+                """, (
+                    item_id, from_node, to_node, timestamp, body_json, session_id, msg_type,
+                    reply_to, ttl_expires, time.time(), 1 if system else 0, _mail_uri(to_node, item_id),
+                ))
+            else:
+                conn.execute(f"""
+                    INSERT INTO {bucket} (message_id, from_node, to_node, timestamp, body,
+                                      session_id, msg_type, reply_to, ttl_expires, status, created_at, system, item_origin)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'unread', ?, ?, 'sync')
+                """, (item_id, from_node, to_node, timestamp, body_json,
+                      session_id, msg_type, reply_to, ttl_expires, time.time(), 1 if system else 0))
             conn.commit()
             return True
         except sqlite3.IntegrityError:
@@ -2158,13 +2276,74 @@ class Storage:
         conn.commit()
         return cursor.rowcount > 0
 
-    def queue_settlement(self, item_type: str, from_node: str, body: dict, priority: int = 0):
-        """Add a settlement message to the queue."""
+    def queue_settlement(self, item_type: str, from_node: str, body: dict, priority: int = 0,
+                         counterparty_node_id: str = "", peer_public_key: str = ""):
+        """Add a settlement message to the queue.
+
+        Adversary #11 fix (v0.56.0): populate the dedicated peer_public_key
+        column on insert so has_pending_settlement can exact-match instead of
+        substring-matching the body JSON.
+
+        Post-review fix (v0.56.0, Opus subagent): the column ``peer_public_key``
+        must store the **actual public key**, not a node_id. Both callers of
+        ``has_pending_settlement`` pass the raw pubkey (netting.py from the
+        ledger iteration; node.py from _resolve_settlement_peer_key which
+        extracts body.peer_public_key / peer_key / counterparty_key — all
+        pubkey-semantic fields). The pre-review fix stored sha256(pubkey) via
+        get_node_id_for_public_key, which made exact match always miss. The
+        fix: split ``counterparty`` (used for the URI, node_id semantic) from
+        ``peer_pk`` (used for the dedup column, pubkey semantic). Callers now
+        pass peer_public_key= explicitly; queue_settlement falls back to body
+        keys + reverse lookup via peer_keys table if the kwarg is missing.
+        """
         import json, time
         conn = self._get_conn()
+        # counterparty → URI authority. Stays node_id-semantic for existing URIs.
+        counterparty = (
+            counterparty_node_id
+            or str(body.get("counterparty_node_id", "") or body.get("peer_node_id", "") or "")
+            or from_node
+        )
+        # peer_pk → dedup column. MUST be the actual pubkey (see docstring).
+        peer_pk = peer_public_key or str(
+            body.get("peer_public_key", "")
+            or body.get("peer_key", "")
+            or body.get("counterparty_key", "")
+            or ""
+        )
+        if not peer_pk:
+            # Last-chance reverse lookup: if from_node is a node_id we know,
+            # resolve its public key from peer_keys. This covers the
+            # handle_settle_request / handle_settlement_confirmation paths
+            # where callers don't have the pubkey at hand.
+            try:
+                looked_up = self.get_pubkey_by_node_id(from_node)
+            except Exception:
+                looked_up = None
+            if looked_up:
+                peer_pk = looked_up
+        if not peer_pk:
+            # Worst case: no pubkey available. Log loudly and fall back to
+            # from_node so the row still has SOMETHING unique. This means
+            # dedup won't hit across heterogeneous representations, but the
+            # alternative (empty string) would dedup ALL such rows together.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "SETTLEMENT_QUEUE_NO_PUBKEY item_type=%s from_node=%s "
+                "(dedup column fallback to from_node; no body key or peer_keys lookup)",
+                item_type, (from_node or "")[:16],
+            )
+            peer_pk = from_node or ""
+        cursor = conn.execute(
+            "INSERT INTO settlement_queue "
+            "(item_type, from_node, body, priority, created_at, uri, peer_public_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (item_type, from_node, json.dumps(body), priority, time.time(), "", peer_pk)
+        )
+        settlement_id = cursor.lastrowid
         conn.execute(
-            "INSERT INTO settlement_queue (item_type, from_node, body, priority, created_at) VALUES (?, ?, ?, ?, ?)",
-            (item_type, from_node, json.dumps(body), priority, time.time())
+            "UPDATE settlement_queue SET uri = ? WHERE id = ?",
+            (_settlement_uri(counterparty, settlement_id), settlement_id),
         )
         conn.commit()
 
@@ -2306,13 +2485,26 @@ class Storage:
         return row[0] if row and row[0] is not None else None
 
     def has_pending_settlement(self, peer_public_key: str) -> bool:
-        """Check if there's already a pending settlement for this peer."""
+        """Check if there's already a pending settlement for this peer.
+
+        Adversary #11 fix (v0.56.0): exact-match on the dedicated
+        peer_public_key column instead of substring-matching the JSON body.
+        The previous `body LIKE '%KEY[:32]%'` approach had two attack vectors:
+        (1) vanity-key collision on 32-char prefix (feasible for targeted
+        attacks), (2) substring false positives when the key appeared in
+        unrelated body fields. Both led to false dedups → silent settlement
+        drops → financial reconciliation failures. The schema migration in
+        v0_56_0.sql adds the column and backfills it from body JSON; this
+        helper now uses exact match backed by the composite
+        (peer_public_key, status) index.
+        """
+        if not peer_public_key:
+            return False
         conn = self._get_conn()
-        # B1/S-025: escape LIKE metacharacters to prevent injection
-        escaped_key = self._escape_like(peer_public_key[:32])
         row = conn.execute(
-            "SELECT 1 FROM settlement_queue WHERE status = 'pending' AND body LIKE ? ESCAPE '\\'",
-            (f'%{escaped_key}%',)
+            "SELECT 1 FROM settlement_queue "
+            "WHERE peer_public_key = ? AND status = 'pending' LIMIT 1",
+            (peer_public_key,),
         ).fetchone()
         return row is not None
 

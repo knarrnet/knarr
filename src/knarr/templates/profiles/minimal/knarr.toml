@@ -1,0 +1,8 @@
+[node]
+port = $port
+host = "0.0.0.0"
+storage = "node.db"
+task_slots = 4
+
+[network]
+bootstrap = ["$bootstrap"]

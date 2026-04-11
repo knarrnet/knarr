@@ -3,6 +3,7 @@ import logging
 import time
 from typing import Optional, Dict, Tuple, List
 from ..core.messages import Message
+from ..core.crypto import get_tls_peer_cert_fingerprint
 from .protocol import send_message, receive_message
 
 logger = logging.getLogger(__name__)
@@ -104,13 +105,20 @@ class ConnectionPool:
 
     async def _try_send(self, reader: asyncio.StreamReader,
                         writer: asyncio.StreamWriter, msg: Message,
-                        timeout: float) -> object:
+                        timeout: float, host: str, port: int) -> object:
         """Send + receive on an existing connection. Returns response or _SEND_FAILED."""
         try:
             await send_message(writer, msg)
             response = await asyncio.wait_for(receive_message(reader), timeout=timeout)
             if response is None:
                 return _SEND_FAILED
+            object.__setattr__(
+                response,
+                "_tls_peer_cert_fingerprint",
+                get_tls_peer_cert_fingerprint(writer.get_extra_info("ssl_object")),
+            )
+            object.__setattr__(response, "_tls_peer_host", host)
+            object.__setattr__(response, "_tls_peer_port", int(port))
             return response
         except Exception:
             return _SEND_FAILED
@@ -131,7 +139,7 @@ class ConnectionPool:
             # 1. Try existing connection
             conn = self._pool.get(peer_id)
             if conn is not None and self._is_healthy(conn):
-                result = await self._try_send(conn[0], conn[1], msg, timeout)
+                result = await self._try_send(conn[0], conn[1], msg, timeout, host, port)
                 if result is not _SEND_FAILED:
                     self._last_used[peer_id] = time.monotonic()
                     return result
@@ -146,7 +154,7 @@ class ConnectionPool:
             if conn is None:
                 return None
 
-            result = await self._try_send(conn[0], conn[1], msg, timeout)
+            result = await self._try_send(conn[0], conn[1], msg, timeout, host, port)
             if result is not _SEND_FAILED:
                 self._last_used[peer_id] = time.monotonic()
                 return result
@@ -157,7 +165,7 @@ class ConnectionPool:
             if conn is None:
                 return None
 
-            result = await self._try_send(conn[0], conn[1], msg, timeout)
+            result = await self._try_send(conn[0], conn[1], msg, timeout, host, port)
             if result is not _SEND_FAILED:
                 self._last_used[peer_id] = time.monotonic()
                 return result

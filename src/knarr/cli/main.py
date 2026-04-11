@@ -936,6 +936,24 @@ def cmd_address(args):
 
     storage.close()
 
+
+def cmd_peer(args):
+    """Manage stored peer transport metadata."""
+    storage = Storage(args.storage or "node.db")
+    try:
+        if args.peer_command == "forget-fingerprint":
+            peer = storage.get_peer_by_id(args.node_id)
+            if peer is None:
+                print(
+                    f"Error: peer '{args.node_id}' not found in the peer table.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            storage.clear_peer_cert_fingerprint(args.node_id)
+            print(f"Cleared pinned fingerprint for {args.node_id[:16]}...")
+    finally:
+        storage.close()
+
 async def cmd_request(args):
     logging.basicConfig(level=getattr(logging, args.log_level or "WARNING"), stream=sys.stderr)
     
@@ -1175,6 +1193,7 @@ def main():
     init_parser.add_argument("directory", help="Project directory to create")
     init_parser.add_argument("--port", type=int, default=9000)
     init_parser.add_argument("--bootstrap", default="bootstrap1.knarr.network:9000")
+    init_parser.add_argument("--profile", default="", help="Scaffold from a named init profile")
 
     # serve
     serve_parser = subparsers.add_parser("serve", help="Start a Knarr node")
@@ -1236,6 +1255,16 @@ def main():
     address_rm_parser = address_subparsers.add_parser("remove", help="Remove address entry")
     address_rm_parser.add_argument("node_id", help="Node ID to remove")
     address_rm_parser.add_argument("--storage", default=None)
+
+    # peer
+    peer_parser = subparsers.add_parser("peer", help="Manage stored peer transport state")
+    peer_subparsers = peer_parser.add_subparsers(dest="peer_command", required=True)
+    peer_forget_fp_parser = peer_subparsers.add_parser(
+        "forget-fingerprint",
+        help="Clear a peer's pinned TLS certificate fingerprint",
+    )
+    peer_forget_fp_parser.add_argument("node_id", help="Peer node ID")
+    peer_forget_fp_parser.add_argument("--storage", default=None)
 
     # upgrade
     upgrade_parser = subparsers.add_parser("upgrade", help="Check for and install updates")
@@ -1310,7 +1339,7 @@ def main():
         if args.command == "run":
             asyncio.run(cmd_run(args))
         elif args.command == "init":
-            print(init_project(args.directory, args.port, args.bootstrap))
+            print(init_project(args.directory, args.port, args.bootstrap, profile=args.profile))
         elif args.command == "serve":
             asyncio.run(cmd_serve(args))
         elif args.command == "query":
@@ -1323,6 +1352,8 @@ def main():
             cmd_info(args)
         elif args.command == "address":
             cmd_address(args)
+        elif args.command == "peer":
+            cmd_peer(args)
         elif args.command == "upgrade":
             asyncio.run(cmd_upgrade(args))
         elif args.command == "tls":

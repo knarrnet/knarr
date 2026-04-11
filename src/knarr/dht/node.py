@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Set, Callable
-from ..core.crypto import SigningKey, VerifyKey
+from ..core.crypto import SigningKey, VerifyKey, get_tls_peer_cert_fingerprint
 
 from .. import __version__
 from ..core.models import NodeInfo, SkillSheet, Task, Policy, GroupPolicy, SkillPolicy
@@ -41,6 +41,10 @@ from .eventbus import EventBus
 from . import profiling as _profiling
 
 logger = logging.getLogger(__name__)
+
+
+class CertPinMismatchError(ConnectionError):
+    """Raised when a peer's TLS certificate fingerprint changes after TOFU pinning."""
 
 
 def _is_winerror_10054(exc: BaseException) -> bool:
@@ -862,7 +866,7 @@ class DHTNode:
             )
             await self._enqueue_write(
                 self.storage.log_execution,
-                job_id_for_update, skill_name, caller_node_id, "completed", wall_ms, input_hash, asset_hash, None, skill_price, price_breakdown.to_json()
+                job_id_for_update, skill_name, caller_node_id, "completed", wall_ms, input_hash, asset_hash, None, skill_price, price_breakdown.to_json(), self.node_info.node_id
             )
 
             # v0.33.0: task.completed
@@ -1035,7 +1039,7 @@ class DHTNode:
             await self._enqueue_write(self.storage.update_task_status, job_id_for_update, "failed", None, err, input_size, wall_ms)
             await self._enqueue_write(
                 self.storage.log_execution,
-                job_id_for_update, skill_name, caller_node_id, "failed", wall_ms, input_hash, asset_hash, err["message"]
+                job_id_for_update, skill_name, caller_node_id, "failed", wall_ms, input_hash, asset_hash, err["message"], None, "", self.node_info.node_id
             )
             # v0.33.0: task.failed
             if self.bus:
@@ -1093,7 +1097,7 @@ class DHTNode:
             await self._enqueue_write(self.storage.update_task_status, job_id_for_update, "failed", None, err, input_size, wall_ms)
             await self._enqueue_write(
                 self.storage.log_execution,
-                job_id_for_update, skill_name, caller_node_id, "failed", wall_ms, input_hash, asset_hash, err["message"]
+                job_id_for_update, skill_name, caller_node_id, "failed", wall_ms, input_hash, asset_hash, err["message"], None, "", self.node_info.node_id
             )
             # v0.33.0: task.failed
             if self.bus:
@@ -1155,7 +1159,7 @@ class DHTNode:
             await self._enqueue_write(self.storage.update_task_status, job_id_for_update, "failed", None, err, input_size, wall_ms)
             await self._enqueue_write(
                 self.storage.log_execution,
-                job_id_for_update, skill_name, caller_node_id, "failed", wall_ms, input_hash, asset_hash, str(e)
+                job_id_for_update, skill_name, caller_node_id, "failed", wall_ms, input_hash, asset_hash, str(e), None, "", self.node_info.node_id
             )
             # v0.33.0: task.failed
             if self.bus:
@@ -1334,7 +1338,7 @@ class DHTNode:
             )
             await self._enqueue_write(
                 self.storage.log_execution,
-                job_id, skill_name, caller_node_id, "completed", wall_ms, input_hash, None, None, skill_price, ""
+                job_id, skill_name, caller_node_id, "completed", wall_ms, input_hash, None, None, skill_price, "", self.node_info.node_id
             )
 
             # Emit bus event
@@ -1763,6 +1767,7 @@ class DHTNode:
             timeout_ms=timeout_ms,
             mode="async",
             target_identity=provider_node_id,  # E-01: populate from DHT discovery
+            uri=self._build_task_request_uri(provider_node_id, skill_name),
         ))
         
         # NODE-02: respect caller's timeout_ms rather than a hardcoded 10s.
@@ -1775,9 +1780,9 @@ class DHTNode:
             raise asyncio.TimeoutError(
                 f"Provider {provider_host}:{provider_port} did not acknowledge task within {ack_timeout:.0f}s"
             )
-        if isinstance(resp, TaskStatus) and verify_message(resp):
+        if isinstance(resp, TaskStatus) and self._verify_transport_message(resp):
             return resp
-        elif isinstance(resp, TaskResult) and verify_message(resp):
+        elif isinstance(resp, TaskResult) and self._verify_transport_message(resp):
             # If provider finished it instantly (e.g. dedup)
             return TaskStatus(task_id=resp.task_id, status=resp.status)
         else:
@@ -1851,6 +1856,11 @@ class DHTNode:
         """v0.33.0: Helper to emit task.rejected from all 6 rejection paths."""
         if self.bus:
             self.bus.emit("task.rejected", skill_name=skill, caller_node=caller, task_id=task_id, reason=reason, identity=caller)
+
+    @staticmethod
+    def _build_task_request_uri(authority: str, skill_name: str) -> str:
+        """Build the canonical TaskRequest URI for cross-field validation."""
+        return f"knarr://{authority}/s/{skill_name.lower()}"
 
     def _check_credit_restored(self, peer_public_key: str, old_balance: float, new_balance: float):
         """v0.33.0: Emit credit.restored when peer moves from over-threshold to under-threshold."""
@@ -2174,7 +2184,7 @@ class DHTNode:
                     ephemeral=self._ephemeral,
                 ))
                 resp = await request_response(host, port, req, timeout=3.0, ssl_context=self._client_ssl_ctx)
-                if isinstance(resp, JoinResponse) and verify_message(resp):
+                if isinstance(resp, JoinResponse) and self._verify_transport_message(resp):
                     for peer_dict in resp.peers:
                         try:
                             p = NodeInfo(**peer_dict)
@@ -2190,7 +2200,7 @@ class DHTNode:
                     try:
                         sync_req = self._sign(SyncRequest(since=0.0))
                         sync_resp = await request_response(host, port, sync_req, timeout=10.0, ssl_context=self._client_ssl_ctx)
-                        if isinstance(sync_resp, SyncResponse) and verify_message(sync_resp):
+                        if isinstance(sync_resp, SyncResponse) and self._verify_transport_message(sync_resp):
                             await self._process_sync_response(sync_resp)
                     except Exception as e:
                         logger.warning(f"PEER_CACHE startup sync failed: {e}")
@@ -2240,7 +2250,7 @@ class DHTNode:
                 ))
                 
                 resp = await request_response(host, port, req, ssl_context=self._client_ssl_ctx)
-                if isinstance(resp, JoinResponse) and verify_message(resp):
+                if isinstance(resp, JoinResponse) and self._verify_transport_message(resp):
                     for peer_dict in resp.peers:
                         try:
                             peer = NodeInfo(**peer_dict)
@@ -2258,7 +2268,7 @@ class DHTNode:
                     try:
                         sync_req = self._sign(SyncRequest(since=0.0))
                         sync_resp = await request_response(host, port, sync_req, timeout=10.0, ssl_context=self._client_ssl_ctx)
-                        if isinstance(sync_resp, SyncResponse) and verify_message(sync_resp):
+                        if isinstance(sync_resp, SyncResponse) and self._verify_transport_message(sync_resp):
                             await self._process_sync_response(sync_resp)
                     except Exception as e:
                         logger.warning(f"Startup sync failed: {e}")
@@ -2346,7 +2356,7 @@ class DHTNode:
         """Re-announces all own skills to all known peers."""
         if self._version_gated:
             return
-        peers = self.storage.get_peers()
+        peers = await self._run_in_protocol_pool(self.storage.get_peers)
         if not peers:
             return
 
@@ -2600,7 +2610,7 @@ class DHTNode:
             network_responses = await asyncio.gather(*tasks)
 
             for resp in network_responses:
-                if isinstance(resp, QueryResponse) and verify_message(resp):
+                if isinstance(resp, QueryResponse) and self._verify_transport_message(resp):
                     results.extend(resp.results)
 
         # Deduplication by (node_id, skill_name) — normalized to catch case mismatches
@@ -2973,7 +2983,7 @@ class DHTNode:
                 )
                 await self._enqueue_write(
                     self.storage.log_execution,
-                    job_id, skill_name, self.node_info.node_id, "completed", wall_ms, input_hash, asset_hash, None, skill_price, ""
+                    job_id, skill_name, self.node_info.node_id, "completed", wall_ms, input_hash, asset_hash, None, skill_price, "", self.node_info.node_id
                 )
             except Exception as tel_err:
                 logger.warning(f"Telemetry write failed for {job_id}: {tel_err}")
@@ -2998,7 +3008,7 @@ class DHTNode:
             )
             await self._enqueue_write(
                 self.storage.log_execution,
-                job_id, skill_name, self.node_info.node_id, "failed", wall_ms, input_hash, asset_hash, err_msg, skill_price, ""
+                job_id, skill_name, self.node_info.node_id, "failed", wall_ms, input_hash, asset_hash, err_msg, skill_price, "", self.node_info.node_id
             )
             raise
 
@@ -3031,6 +3041,7 @@ class DHTNode:
             input_data=input_data,
             timeout_ms=timeout_ms,
             target_identity=provider_node_id,  # E-01: populate from DHT discovery
+            uri=self._build_task_request_uri(provider_node_id, skill_name),
         ))
 
         self._task_events[task_id] = asyncio.Event()
@@ -3039,7 +3050,7 @@ class DHTNode:
         try:
             resp = await request_response(provider_host, provider_port, req, timeout=timeout_ms/1000.0, ssl_context=self._client_ssl_ctx)
             
-            if isinstance(resp, TaskResult) and verify_message(resp):
+            if isinstance(resp, TaskResult) and self._verify_transport_message(resp):
                 # F-03: Bind sync response to the expected provider — reject if the
                 # signer does not match provider_node_id to prevent misbilling.
                 resp_node_id = hashlib.sha256(bytes.fromhex(resp.public_key)).hexdigest()
@@ -3164,7 +3175,7 @@ class DHTNode:
                         logger.warning(f"CREDIT_NOTE_ISSUE_FAIL (sync path) job={task_id[:8]}: {_cn_err}")
                 return resp
 
-            if isinstance(resp, TaskStatus) and verify_message(resp):
+            if isinstance(resp, TaskStatus) and self._verify_transport_message(resp):
                 # SA6-01: Bind expected provider identity for async result
                 self._task_expected_provider[task_id] = resp.public_key
 
@@ -3336,6 +3347,8 @@ class DHTNode:
                 return
 
             signer_id = ""  # FIX-02: init before loop; set properly after verify_node_id
+            peername = writer.get_extra_info("peername") or ()
+            tls_fingerprint = get_tls_peer_cert_fingerprint(writer.get_extra_info("ssl_object"))
             # Message loop: handle multiple messages per persistent connection.
             # Connection pooling on the client side keeps connections open for reuse.
             # The loop breaks on: EOF (client closed), timeout (idle), or error.
@@ -3346,6 +3359,11 @@ class DHTNode:
                     msg = await asyncio.wait_for(receive_message(reader), timeout=SERVER_IDLE_TIMEOUT)
                     if not msg:
                         break  # EOF — client closed connection
+
+                    if tls_fingerprint:
+                        object.__setattr__(msg, "_tls_peer_cert_fingerprint", tls_fingerprint)
+                        object.__setattr__(msg, "_tls_peer_host", peer_ip)
+                        object.__setattr__(msg, "_tls_peer_port", int(peername[1]) if len(peername) > 1 else 0)
 
                     if not verify_message(msg):
                         logger.warning(f"Dropping message with invalid signature: type={msg.type}")
@@ -3365,6 +3383,7 @@ class DHTNode:
                     # SA-ML6: Derive sender identity from signer (public_key), not self-asserted fields.
                     # This prevents requester_node_id spoofing in TaskRequest.
                     signer_id = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest() if msg.public_key else ''
+                    self._check_tls_peer_fingerprint(msg)
 
                     # Record peer activity — verified message proves liveness.
                     # PluginMessages (KAD FIND_NODE etc.) are internal to the plugin
@@ -3431,6 +3450,8 @@ class DHTNode:
                     # v0.29.1: Log peer IP for oversized/malformed messages
                     logger.warning(f"PROTOCOL_ERR from={peer_ip}: {e}")
                     break
+                except CertPinMismatchError:
+                    break
                 except Exception as e:
                     if _is_winerror_10054(e):
                         if self._debug:
@@ -3455,6 +3476,119 @@ class DHTNode:
         if not isinstance(port, int) or port < 1 or port > 65535:
             return False
         return True
+
+    def _authenticated_node_id_from_message(self, msg: Message) -> str:
+        """Derive the authenticated node_id from the message signing key."""
+        public_key = getattr(msg, "public_key", "") or ""
+        if not public_key:
+            return ""
+        try:
+            return hashlib.sha256(bytes.fromhex(public_key)).hexdigest()
+        except Exception:
+            return ""
+
+    def _verify_transport_message(self, msg: Message, *, require_node_id: bool = False) -> bool:
+        """Verify message signature, optional node binding, and TLS cert pinning.
+
+        Adversary #2 fix (v0.56.0): catch CertPinMismatchError and return False
+        instead of propagating the exception. Client callers (request_task,
+        join/sync loops, query fan-out) use this as a bool check inside
+        isinstance(...) AND _verify_transport_message(...) — an uncaught
+        exception would crash the caller instead of treating the response as
+        invalid. The bus event is already emitted inside
+        _check_tls_peer_fingerprint before the raise, so observability is
+        preserved. Returning False drops the specific response but the caller
+        continues iterating through fanout responses.
+        """
+        if not verify_message(msg):
+            return False
+        if require_node_id and not verify_node_id(msg):
+            return False
+        try:
+            self._check_tls_peer_fingerprint(msg)
+        except CertPinMismatchError:
+            # Event already emitted inside the helper. Return False so the
+            # caller drops this message without raising.
+            return False
+        return True
+
+    def _check_tls_peer_fingerprint(self, msg: Message) -> None:
+        """Apply TOFU TLS certificate pinning after message authentication succeeds."""
+        if not self._config.get("node", {}).get("tls_pin_certs", True):
+            return
+        fingerprint = str(getattr(msg, "_tls_peer_cert_fingerprint", "") or "")
+        if not fingerprint:
+            return
+
+        node_id = self._authenticated_node_id_from_message(msg)
+        if not node_id:
+            return
+
+        host = str(getattr(msg, "_tls_peer_host", "") or "")
+        port = int(getattr(msg, "_tls_peer_port", 0) or 0)
+        storage = getattr(self, "_base_storage", None) or self.storage
+        stored = (
+            storage.get_peer_cert_fingerprint(node_id)
+            if hasattr(storage, "get_peer_cert_fingerprint")
+            else ""
+        )
+        if not stored:
+            if hasattr(storage, "set_peer_cert_fingerprint"):
+                # Adversary #12 fix (v0.56.0): don't block the async event loop
+                # with a synchronous SQLite write on every new peer connection.
+                # Fire-and-forget via the protocol write queue — matches the
+                # pattern used by nearby code (e.g. upsert_peer at 2195/2261).
+                # Trade-off: the fingerprint isn't durably persisted at the
+                # moment this helper returns, but a crash between "accept
+                # message" and "write fingerprint" just re-triggers TOFU on
+                # next contact, which is harmless.
+                #
+                # Post-review fix (v0.56.0, Sonnet subagent): hold a strong
+                # reference to the task. Per Python asyncio docs, a task
+                # created via create_task with no strong reference can be
+                # garbage-collected mid-flight. Security impact is low here
+                # (TOFU just re-fires on next contact), but durable pinning
+                # is the whole point of the feature — the hold prevents GC
+                # silently undoing it. Auto-discarded on completion.
+                try:
+                    _fp_task = asyncio.create_task(
+                        self._enqueue_write_proto(
+                            storage.set_peer_cert_fingerprint,
+                            node_id, fingerprint, host, port,
+                        )
+                    )
+                    if not hasattr(self, "_fingerprint_write_tasks"):
+                        self._fingerprint_write_tasks = set()
+                    self._fingerprint_write_tasks.add(_fp_task)
+                    _fp_task.add_done_callback(self._fingerprint_write_tasks.discard)
+                except RuntimeError:
+                    # No running loop (unit test or housekeeping path) —
+                    # fall back to the direct sync call.
+                    storage.set_peer_cert_fingerprint(node_id, fingerprint, host=host, port=port)
+            logger.info("CERT_PIN_STORED node_id=%s fingerprint=%s", node_id, fingerprint)
+            return
+        if stored == fingerprint:
+            logger.debug("CERT_PIN_MATCH node_id=%s", node_id)
+            return
+
+        logger.warning(
+            "CERT_PIN_MISMATCH node_id=%s stored=%s got=%s reject=true",
+            node_id,
+            stored,
+            fingerprint,
+        )
+        if self.bus:
+            # T2-amendment: Wave 1 test expects 'presented_fingerprint' not 'got_fingerprint'
+            self.bus.emit(
+                "security.cert_pinning_mismatch",
+                node_id=node_id,
+                stored_fingerprint=stored,
+                presented_fingerprint=fingerprint,
+                identity=node_id,
+            )
+        raise CertPinMismatchError(
+            f"TLS cert fingerprint mismatch for {node_id[:16]}: stored={stored} got={fingerprint}"
+        )
 
     async def _process_message(self, msg: Message, peer_ip: str = "") -> Optional[Message]:
         """Processes a received message and returns a signed response."""
@@ -3482,6 +3616,41 @@ class DHTNode:
             try:
                 skill_sheet = validate_skill_sheet(msg.skill_sheet)
                 skill_ttl = self._get_skill_ttl()
+
+                # Adversary #10 fix (v0.56.0): sample skill+provider binding.
+                # The sample's `skill_name` and `provider_node_id` fields are
+                # required by validate_skill_sheet (schema check), but the
+                # schema check alone doesn't prove they match the CONTAINING
+                # sheet. Here we verify that each sample in the sheet binds
+                # to this specific skill (msg.skill_key) and this specific
+                # provider (msg.node_id, which has been verified upstream).
+                # Any sample that doesn't bind correctly is stripped from the
+                # sheet — the announcement continues, but the mismatched
+                # samples are silently discarded (log at INFO for operators).
+                raw_samples = msg.skill_sheet.get("samples") if isinstance(msg.skill_sheet, dict) else None
+                if raw_samples:
+                    bound_samples = []
+                    for i, s in enumerate(raw_samples):
+                        if not isinstance(s, dict):
+                            continue
+                        sample_skill = str(s.get("skill_name", "") or "").lower()
+                        sample_provider = str(s.get("provider_node_id", "") or "").lower()
+                        expected_skill = str(msg.skill_key or "").lower()
+                        expected_provider = str(msg.node_id or "").lower()
+                        if sample_skill != expected_skill or sample_provider != expected_provider:
+                            logger.info(
+                                "SAMPLE_BINDING_REJECT announce_skill=%s announce_provider=%s "
+                                "sample_skill=%s sample_provider=%s index=%d",
+                                expected_skill[:32], expected_provider[:16],
+                                sample_skill[:32], sample_provider[:16], i,
+                            )
+                            continue
+                        bound_samples.append(s)
+                    # Rebuild sheet with only the correctly-bound samples
+                    # (frozen dataclass — use dataclasses.replace)
+                    if len(bound_samples) != len(raw_samples):
+                        from dataclasses import replace as _dc_replace
+                        skill_sheet = _dc_replace(skill_sheet, samples=bound_samples or None)
 
                 # Create/update peer entry from Announce — ensures nodes discovered
                 # via gossip (not just JoinResponse) are routable for heartbeats,
@@ -3718,6 +3887,7 @@ class DHTNode:
                 timestamp=time.time(),
                 version=__version__,
                 min_protocol_version=self._min_protocol_version,
+                punchhole_epoch=self._get_punchhole_epoch(),
             ))
             
         elif isinstance(msg, TaskRequest):
@@ -3844,6 +4014,93 @@ class DHTNode:
             system=True,
         ))
 
+    def _validate_task_request_uri(self, msg: TaskRequest, skill_name: str) -> Optional[Message]:
+        """Validate the additive TaskRequest URI against the flat routing fields.
+
+        T2-01 (v0.56.0): anonymous-authority URIs
+        are valid (core/uri.py semantics: empty authority = any provider). Resource
+        comparison strips @version suffix (e.g. "llm/chat@1.0" → "llm/chat").
+
+        Adversary #7+#8 fix (v0.56.0): resolve target_identity against the local
+        IdentityRegistry. Previously the validator compared attacker-controlled
+        `msg.target_identity` to attacker-controlled `uri.authority` — pure
+        ceremony with no integrity because both fields are attacker-set. AND when
+        `target_identity` was set but didn't resolve to a local identity, the
+        request fell through to default identity execution (auth bypass for
+        multi-identity billing/routing). The fix: if target_identity is set,
+        it must resolve to a locally-owned identity, and URI authority must
+        match the resolved identity's node_id.
+        """
+        uri = str(getattr(msg, "uri", "") or "")
+        if not uri:
+            return None
+
+        from ..core.uri import parse_knarr_uri
+
+        authority, selector, resource = parse_knarr_uri(uri)
+
+        reason = None
+        if not selector:
+            reason = "invalid_uri"
+        elif selector != "s":
+            reason = "bad_selector"
+        elif not resource:
+            reason = "skill_mismatch"
+        else:
+            # T2-01 amendment: handle @version-suffixed skill names (e.g. "llm/chat@1.0")
+            # Adversary #6 fix (v0.56.0): strip @version SYMMETRICALLY from both
+            # sides. Previously only the URI resource was split, so a skill_name
+            # that contained @ would never match the stripped URI resource.
+            resource_skill = resource.split("@", 1)[0]
+            skill_name_base = skill_name.split("@", 1)[0]
+            if resource_skill.lower() != skill_name_base.lower():
+                reason = "skill_mismatch"
+            else:
+                # Adversary #7+#8 fix: resolve target_identity against the local
+                # registry and require URI authority to match.
+                #
+                # When target_identity is set:
+                #   - MUST resolve to a locally-owned identity (else auth bypass
+                #     to default identity — GPT #8 finding).
+                #   - URI authority, if present, must match the resolved identity's
+                #     node_id (not just the attacker-set target_identity field —
+                #     Opus #7 finding).
+                #
+                # When target_identity is empty:
+                #   - URI authority, if present, must match this node's own node_id
+                #     (legitimate anonymous-provider routing to this specific node).
+                #   - If URI authority is also empty, it's a truly anonymous URI and
+                #     both flat + URI are ambiguous — permit (existing behavior).
+                if msg.target_identity:
+                    registry = getattr(self, "_identity_registry", None)
+                    resolved = registry.resolve(msg.target_identity) if registry is not None else None
+                    if resolved is None:
+                        # GPT #8: foreign target_identity that doesn't resolve locally —
+                        # reject instead of falling through to default identity
+                        reason = "authority_unknown_identity"
+                    elif authority and authority != resolved.node_id:
+                        reason = "authority_mismatch"
+                elif authority and authority != self.node_info.node_id:
+                    reason = "authority_mismatch"
+
+        if reason is None:
+            return None
+
+        if self.bus:
+            self.bus.emit(
+                "security.uri_mismatch",
+                reason=reason,
+                uri=uri,
+                skill_name=skill_name,
+                task_id=msg.task_id,
+                identity=msg.target_identity or self.node_info.node_id,
+            )
+        return self._sign(TaskResult(
+            task_id=msg.task_id,
+            status="failed",
+            error={"code": "URI_MISMATCH", "message": f"TaskRequest URI validation failed: {reason}"},
+        ))
+
     async def _handle_task_request(self, msg: TaskRequest) -> Message:
         """Handles a task request from a consumer."""
         from .mcp_bridge import MCPTimeoutError
@@ -3878,6 +4135,11 @@ class DHTNode:
 
         skill_name = msg.skill_name.lower()
         logger.debug(f"TaskRequest: skill={skill_name} task={msg.task_id[:8]} from={msg.requester_node_id[:16]}")
+
+        uri_error = self._validate_task_request_uri(msg, skill_name)
+        if uri_error is not None:
+            self._emit_task_rejected(skill_name, msg.public_key, msg.task_id, "URI_MISMATCH")
+            return uri_error
 
         if skill_name not in self._handlers:
             self._emit_task_rejected(skill_name, msg.public_key, msg.task_id, "UNKNOWN_SKILL")
@@ -4097,7 +4359,16 @@ class DHTNode:
             # Insert into async_jobs table
             expires_at = time.time() + 86400  # 24h grace period
             position = self._task_queue.qsize() + 1
-            await self._enqueue_write(self.storage.insert_async_job, job_id, skill_name, caller_node_id, input_hash, position, expires_at)
+            await self._enqueue_write(
+                self.storage.insert_async_job,
+                job_id,
+                skill_name,
+                caller_node_id,
+                input_hash,
+                position,
+                expires_at,
+                self.node_info.node_id,
+            )
             
             # Enqueue and return accepted immediately
             input_size = len(json.dumps(msg.input_data)) if msg.input_data else 0
@@ -4288,6 +4559,7 @@ class DHTNode:
             node_id=self.node_info.node_id,
             timestamp=time.time(),
             version=__version__,
+            punchhole_epoch=self._get_punchhole_epoch(),
         ))
         try:
             resp = await self._pool.send(node_id, h, p, msg)
@@ -4295,7 +4567,7 @@ class DHTNode:
             logger.warning(f"FORCE_HB to={node_id[:16]} SEND_FAIL: {e}")
             return {"status": "error", "reason": str(e)}
 
-        if isinstance(resp, Heartbeat) and verify_message(resp) and verify_node_id(resp):
+        if isinstance(resp, Heartbeat) and self._verify_transport_message(resp, require_node_id=True):
             self._peer_last_activity[node_id] = time.monotonic()
             if _debug:
                 logger.info(f"FORCE_HB to={node_id[:16]} OK version={resp.version}")
@@ -4530,8 +4802,13 @@ class DHTNode:
         if future.done():
             return False
 
-        # TP-3: Verify the response comes from the node we sent the request to
-        sender_id = str(getattr(msg, "node_id", "") or "")
+        # TP-3: Verify the response comes from the node we sent the request to.
+        # Adversary #1 fix (v0.56.0): use the authenticated node_id derived from
+        # msg.public_key rather than trusting the self-asserted msg.node_id field.
+        # Defense-in-depth — connection handler already verifies msg.node_id via
+        # verify_node_id, but re-deriving here makes this resolver correct even
+        # if future code paths bypass that check (cockpit API, mail, etc.).
+        sender_id = self._authenticated_node_id_from_message(msg)
         if expected_target and sender_id != expected_target:
             logger.warning(
                 f"RPC_HIJACK_ATTEMPT request_id={request_id} "
@@ -4541,6 +4818,82 @@ class DHTNode:
 
         future.set_result(payload)
         return True
+
+    async def query_plugin(
+        self,
+        node_id,
+        host,
+        port,
+        plugin_name,
+        action,
+        payload,
+        timeout=5.0,
+        trace_id: str = "",
+    ) -> Optional[dict]:
+        """Send a fire-and-forget plugin RPC and await its correlated response."""
+        request_id = str(uuid.uuid4())
+        start = time.monotonic()
+        future = asyncio.get_running_loop().create_future()
+        self._pending_rpcs[request_id] = (future, node_id)
+
+        identity = _current_identity.get()
+        sender_node_id = getattr(identity, "node_id", "") or self.node_info.node_id
+        request_payload = dict(payload or {})
+        trace_id = trace_id or str(request_payload.get("trace_id") or request_id)
+        request_payload["_request_id"] = request_id
+        request_payload["trace_id"] = trace_id
+
+        reply_host = getattr(getattr(self, "node_info", None), "host", "")
+        if not isinstance(reply_host, str):
+            reply_host = ""
+        reply_port = getattr(getattr(self, "node_info", None), "port", 0)
+        if not isinstance(reply_port, int):
+            reply_port = 0
+        request_payload.setdefault("_reply_host", reply_host)
+        request_payload.setdefault("_reply_port", reply_port)
+
+        target = NodeInfo(node_id=node_id, host=host, port=port)
+        outbound = PluginMessage(
+            node_id=sender_node_id,
+            plugin_name=plugin_name,
+            action=action,
+            payload=json.dumps(request_payload),
+            target_node_id=node_id,
+        )
+
+        sender = getattr(self, "_send_fire_forget", None)
+        if sender is None:
+            self._pending_rpcs.pop(request_id, None)
+            return None
+
+        identity_prefix = str(sender_node_id or "")[:8]
+        try:
+            if getattr(self, "_debug", False):
+                logger.info(
+                    f"[{trace_id}] [{identity_prefix}] QUERY_PLUGIN_SEND "
+                    f"plugin={plugin_name} action={action} node={str(node_id)[:8]}"
+                )
+            await sender(target, outbound)
+            result = await asyncio.wait_for(future, timeout=timeout)
+            if isinstance(result, dict):
+                result.setdefault("trace_id", trace_id)
+            if getattr(self, "_debug", False):
+                latency_ms = int((time.monotonic() - start) * 1000)
+                logger.info(
+                    f"[{trace_id}] [{identity_prefix}] QUERY_PLUGIN_RECV "
+                    f"plugin={plugin_name} action={action} latency_ms={latency_ms}"
+                )
+            return result
+        except asyncio.TimeoutError:
+            if getattr(self, "_debug", False):
+                latency_ms = int((time.monotonic() - start) * 1000)
+                logger.info(
+                    f"[{trace_id}] [{identity_prefix}] QUERY_PLUGIN_TIMEOUT "
+                    f"plugin={plugin_name} action={action} latency_ms={latency_ms}"
+                )
+            return None
+        finally:
+            self._pending_rpcs.pop(request_id, None)
 
     async def _process_message_callback(self, msg: Message, peer_ip: str = ""):
         """Callback for plugins to deliver fire-and-forget messages into the node's processing pipeline."""
@@ -4577,6 +4930,7 @@ class DHTNode:
                 node_id=self.node_info.node_id,
                 timestamp=time.time(),
                 version=__version__,
+                punchhole_epoch=self._get_punchhole_epoch(),
             ))
             await self._send_fire_forget(peer, hb)
             logger.debug("KAD_PUSH_TO_PEER node_id=%s", node_id[:16])
@@ -5749,6 +6103,23 @@ class DHTNode:
         except Exception:
             return peer_key
 
+    def _get_punchhole_epoch(self) -> int:
+        """Bridge the backend cache invalidation epoch into outbound heartbeats."""
+        epoch = 0
+        try:
+            plugins = getattr(self, "_plugins", None)
+            backend = plugins.get_plugin_by_name("punchhole-backend") if plugins is not None else None
+            if backend is not None:
+                getter = getattr(backend, "get_punchhole_epoch", None)
+                if callable(getter):
+                    epoch = int(getter())
+                else:
+                    epoch = int(getattr(backend, "_punchhole_epoch", 0) or 0)
+        except Exception:
+            epoch = 0
+        logger.debug("HB_EPOCH_READ epoch=%d", epoch)
+        return epoch
+
     def resolve_did_fragment(self, did_string: str) -> Optional[VerifyKey]:
         """Resolve did:knarr:<node_id>#<fragment> to an Ed25519 verify key."""
         if not isinstance(did_string, str) or not did_string.startswith("did:knarr:") or "#" not in did_string:
@@ -6012,7 +6383,7 @@ class DHTNode:
         if not bootstrap_addrs:
             return
 
-        all_peers = self.storage.get_peers()
+        all_peers = await self._run_in_protocol_pool(self.storage.get_peers)
         non_bootstrap = [p for p in all_peers if (p.host, p.port) not in bootstrap_addrs]
 
         if len(non_bootstrap) < MIN_PEER_FLOOR:
@@ -6192,6 +6563,7 @@ class DHTNode:
                     node_id=self.node_info.node_id,
                     timestamp=time.time(),
                     version=__version__,
+                    punchhole_epoch=self._get_punchhole_epoch(),
                 ))
                 try:
                     h, p = self.resolve_peer(peer.node_id, peer.host, peer.port)
@@ -6199,7 +6571,7 @@ class DHTNode:
                 except Exception:
                     logger.debug(f"HB_SEND_FAIL to={peer.node_id[:16]}", exc_info=True)
                     return
-                if isinstance(resp, Heartbeat) and verify_message(resp) and verify_node_id(resp):
+                if isinstance(resp, Heartbeat) and self._verify_transport_message(resp, require_node_id=True):
                     self._peer_last_activity[peer.node_id] = time.monotonic()
                     logger.debug(f"HB_SEND_OK to={peer.node_id[:16]}")
 

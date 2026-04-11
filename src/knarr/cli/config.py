@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 
 DEFAULT_CONFIG = {
-    "node": {"port": 9000, "host": "0.0.0.0", "storage": "node.db", "task_slots": 4},
+    "node": {
+        "port": 9000,
+        "host": "0.0.0.0",
+        "storage": "node.db",
+        "task_slots": 4,
+        "tls_pin_certs": True,
+    },
     "network": {"bootstrap": []},
     "skills": {},
     "bridges": {},
@@ -17,6 +23,27 @@ DEFAULT_CONFIG = {
     "mail": {"accept_from": "all", "default_ttl_hours": 72, "max_messages": 10000, "whitelist": [], "price": 1.0},
     "cockpit": {"port": 0, "bind": "127.0.0.1", "auth_token": ""},
 }
+
+_KNOWN_SECTIONS = frozenset({
+    "node",
+    "network",
+    "skills",
+    "bridges",
+    "policy",
+    "mail",
+    "cockpit",
+    "economy",
+    "settlement",
+    "pricing",
+    "netting",
+    "prepaid",
+    "sidecar",
+    "warehouse_manager",
+    "token",
+    "static",
+    "peer_overrides",
+    "identities",
+})
 
 def merge_defaults(defaults: dict, overrides: dict) -> dict:
     """Deep-merge overrides into defaults."""
@@ -79,6 +106,7 @@ def load_config(path: Path, explicit: bool = False) -> dict:
     try:
         with open(path, "rb") as f:
             raw = tomllib.load(f)
+        _warn_unknown_sections(raw, path)
         _warn_unknown_keys(raw, path)
         _warn_invalid_types(raw, path)
     except tomllib.TOMLDecodeError as e:
@@ -149,7 +177,7 @@ _KNOWN_KEYS = {
              "event_bus_size", "event_bus_debug", "max_queue_depth",
              "log_retention", "log_retention_hours", "housekeeping_retention_days",
              "startup_jitter", "sweep_interval",
-             "implicit_hb_types", "pools",
+             "implicit_hb_types", "pools", "tls", "tls_required", "tls_pin_certs",
              "identity_bus_size"},
     "economy": {"default_soft_limit", "default_hard_limit", "settlement_min_interval_seconds"},
     "skills": {"minimum_price", "default_timeout"},
@@ -165,8 +193,31 @@ _KNOWN_KEYS = {
     # peer_overrides is a free-form section (node_id -> "host:port"), not validated per-key
 }
 
+
+def _warn_unknown_sections(raw: dict, path: Path):
+    """Warn on unknown top-level sections to catch misplaced config.
+
+    v0.56.0: use logging.warning instead of print(stderr) so
+    operator-facing warnings go through the standard logging pipeline. Tests
+    using pytest's caplog capture this correctly; print-to-stderr was invisible
+    to log assertions.
+    """
+    _log = _logging.getLogger("knarr.cli.config")
+    known = ", ".join(sorted(_KNOWN_SECTIONS))
+    for section in raw:
+        if section not in _KNOWN_SECTIONS:
+            _log.warning(
+                "CONFIG_UNKNOWN_SECTION section=[%s] in %s — may be a typo. Known sections: %s",
+                section, path, known,
+            )
+
 def _warn_unknown_keys(raw: dict, path: Path):
-    """Warn about unrecognized keys in known sections to catch typos."""
+    """Warn about unrecognized keys in known sections to catch typos.
+
+    v0.56.0: use logging.warning instead of print(stderr) for
+    consistency with _warn_unknown_sections and testability via caplog.
+    """
+    _log = _logging.getLogger("knarr.cli.config")
     for section, known in _KNOWN_KEYS.items():
         if section in raw and isinstance(raw[section], dict):
             for key, v in raw[section].items():
@@ -174,7 +225,10 @@ def _warn_unknown_keys(raw: dict, path: Path):
                 if isinstance(v, dict):
                     continue
                 if key not in known:
-                    print(f"Warning: Unknown key '{key}' in [{section}] in {path}", file=sys.stderr)
+                    _log.warning(
+                        "CONFIG_UNKNOWN_KEY key=%s section=[%s] in %s — may be a typo",
+                        key, section, path,
+                    )
 
 
 # E-04: valid keys inside each [identities.<name>] section

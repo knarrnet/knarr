@@ -1,6 +1,6 @@
 [project]
 name = "knarr"
-version = "0.55.0"
+version = "0.56.0"
 description = "Peer-to-peer exchange protocol for autonomous agents"
 requires-python = ">=3.11"
 license = {text = "MIT"}

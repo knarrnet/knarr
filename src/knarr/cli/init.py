@@ -53,14 +53,62 @@ async def handle(input_data: dict) -> dict:
     return {"text": input_data["text"]}
 """
 
-def init_project(directory: str, port: int = 9000, bootstrap: str = "bootstrap1.knarr.network:9000") -> str:
+_PROFILE_ROOT = Path(__file__).resolve().parents[1] / "templates" / "profiles"
+
+
+def _available_profiles() -> list[str]:
+    if not _PROFILE_ROOT.is_dir():
+        return []
+    return sorted(path.name for path in _PROFILE_ROOT.iterdir() if path.is_dir())
+
+
+def _copy_profile(profile: str, target_path: Path, port: int, bootstrap: str) -> str:
+    profile_dir = _PROFILE_ROOT / profile
+    if not profile_dir.is_dir():
+        available = ", ".join(_available_profiles()) or "(none)"
+        print(
+            f"Error: Unknown init profile '{profile}'. Available profiles: {available}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    target_path.mkdir(parents=True, exist_ok=False)
+    written = []
+    for template_path in sorted(profile_dir.rglob("*")):
+        if template_path.is_dir():
+            continue
+        rel_path = template_path.relative_to(profile_dir)
+        dest_path = target_path / rel_path
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        rendered = Template(template_path.read_text(encoding="utf-8")).safe_substitute(
+            port=port,
+            bootstrap=bootstrap,
+            directory=target_path.name,
+        )
+        dest_path.write_text(rendered, encoding="utf-8")
+        written.append(str(rel_path))
+
+    return (
+        f"Created project in {target_path}/ from profile '{profile}'\n\n"
+        + "\n".join(f"  {path}" for path in written)
+        + "\n\nTo start your node:\n"
+        + f"  cd {target_path}\n"
+        + "  knarr serve"
+    )
+
+
+def init_project(directory: str, port: int = 9000, bootstrap: str = "bootstrap1.knarr.network:9000",
+                 profile: str = "") -> str:
     """Scaffolds a new Knarr provider project."""
     target_path = Path(directory)
     
-    if target_path.exists() and any(target_path.iterdir()):
-        print(f"Error: Directory '{directory}' is not empty.", file=sys.stderr)
-        print("Please choose a new directory or an empty one.", file=sys.stderr)
+    if target_path.exists():
+        print(f"Error: Directory '{directory}' already exists.", file=sys.stderr)
+        print("Choose a new directory name; init refuses to overwrite existing paths.", file=sys.stderr)
         sys.exit(1)
+
+    if profile:
+        return _copy_profile(profile, target_path, port, bootstrap)
         
     # Create structure
     skills_path = target_path / "skills"

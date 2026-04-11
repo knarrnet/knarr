@@ -260,8 +260,12 @@ class PunchholeFrontendPlugin(PluginHooks):
         # Gate 2: resolve ACL group
         acl_group = self._acl.get(requester_node_id, "")
         if not acl_group:
-            # Unknown node — default to "all_signed" tier; backend handles full resolution
-            acl_group = "all_signed"
+            log.info(
+                "PUNCHHOLE_ACL_DENY node_id=%s reason=unknown_and_no_public_signed_tier",
+                requester_node_id,
+            )
+            self._log_disclosure(requester_node_id, object_key, "", "rejected")
+            return {"status": "rejected", "error": "access_denied", "object_key": object_key}
 
         # Gate 3: check cache
         cache_key = (object_key, acl_group)
@@ -298,8 +302,42 @@ class PunchholeFrontendPlugin(PluginHooks):
         }
 
     async def _handle_card(self, msg, peer_ip: str, request: dict, trace_id: str) -> bool:
-        """P-02: Handle action=CARD — return ACL-filtered object list via backend's build_card."""
+        """P-02: Handle action=CARD — return ACL-filtered object list via backend's build_card.
+
+        Adversary #9 fix (v0.56.0): apply the same admission checks as
+        _process_request before calling build_card. Previously CARD bypassed
+        both the backend-ready gate AND the C-02 default-deny ACL check,
+        allowing unknown nodes to probe the ACL-filtered object catalog.
+        build_card does internal tier filtering but for unknown requesters
+        would return the default tier, undoing C-02's default-deny promise.
+        """
         self._trace(trace_id, msg.node_id, "CARD_REQUEST")
+
+        # Gate 0: backend must be ready (mirrors _process_request)
+        if not self._backend_ready:
+            self._trace(trace_id, msg.node_id, "CARD_REJECT", reason="backend_not_ready")
+            self._log_disclosure(msg.node_id, "card", "", "not_ready")
+            card = None
+            response_payload = {"status": "not_ready", "error": "backend_not_ready"}
+            await self._send_card_response(msg, peer_ip, request, trace_id, response_payload)
+            return True
+
+        # Gate 1: default-deny ACL check (C-02 default-deny — mirrors _process_request)
+        # Unknown nodes do not see a filtered catalog just because the filter
+        # happens inside build_card. Operators must explicitly grant via
+        # trusted_nodes / known_hosts / peer relationships.
+        acl_group = self._acl.get(msg.node_id, "")
+        if not acl_group:
+            log.info(
+                "PUNCHHOLE_ACL_DENY node_id=%s reason=unknown_and_no_public_signed_tier action=CARD",
+                msg.node_id,
+            )
+            self._log_disclosure(msg.node_id, "card", "", "rejected")
+            response_payload = {"status": "rejected", "error": "access_denied"}
+            await self._send_card_response(msg, peer_ip, request, trace_id, response_payload)
+            return True
+
+        # Gate 2: build card for an authenticated, admitted requester
         card = None
         get_plugin = getattr(self._ctx, "get_plugin", None)
         if callable(get_plugin):
@@ -314,6 +352,17 @@ class PunchholeFrontendPlugin(PluginHooks):
         else:
             response_payload = {"status": "ok", "card": card}
 
+        await self._send_card_response(msg, peer_ip, request, trace_id, response_payload)
+        return True
+
+    async def _send_card_response(
+        self, msg, peer_ip: str, request: dict, trace_id: str, response_payload: dict
+    ) -> None:
+        """Shared CARD response sender.
+
+        Extracted from _handle_card (adversary #9 fix) so both the happy path
+        and the admission-rejection paths use the same outbound logic.
+        """
         request_id = str(request.get("_request_id", "") or "")
         if request_id:
             response_payload["_request_id"] = request_id
@@ -332,7 +381,6 @@ class PunchholeFrontendPlugin(PluginHooks):
                     payload=json.dumps(response_payload),
                 ),
             )
-        return True
 
     async def on_inbound(self, msg, peer_ip: str) -> bool:
         """Handle PluginMessage requests using the generic A-01 query_plugin pattern."""

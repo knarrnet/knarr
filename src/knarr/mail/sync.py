@@ -43,6 +43,12 @@ class SyncEngine:
         """Register a dispatch handler for a system mail msg_type."""
         self._mail_handlers[msg_type] = handler
 
+    async def _run_in_protocol_pool(self, fn, *args):
+        runner = getattr(self._node, "_run_in_protocol_pool", None)
+        if runner is None:
+            return fn(*args)
+        return await runner(fn, *args)
+
     async def _run_mail_admission(self, sender_node_id: str, sender_key: str):
         import hashlib
         from ..commerce.admission_pipeline import AdmissionContext, run_admission
@@ -117,7 +123,7 @@ class SyncEngine:
         # Store in outbox via writer queue for serialization [R-01]
         await self._node._enqueue_write(
             self._node.storage.enqueue_outbox,
-            item_id, to_node, body_json, ttl_expires
+            item_id, to_node, body_json, ttl_expires, self._node.node_info.node_id
         )
         if self._debug:
             self._log.info(f"MAIL_ENQUEUE to={to_node[:16]} type={msg_type} id={item_id[:8]} system={system}")
@@ -144,7 +150,7 @@ class SyncEngine:
 
     async def _self_deliver(self, node_id: str):
         """Deliver outbox items destined for ourselves directly to inbox."""
-        pending = self._node.storage.get_pending_outbox(node_id, limit=50)
+        pending = await self._run_in_protocol_pool(self._node.storage.get_pending_outbox, node_id, 50)
         if not pending:
             return
         item_ids = [item["item_id"] for item in pending]
@@ -230,7 +236,7 @@ class SyncEngine:
             return  # Still in backoff period
         
         # 1. Get pending items (limit 50)
-        pending = self._node.storage.get_pending_outbox(peer_node_id, limit=50)
+        pending = await self._run_in_protocol_pool(self._node.storage.get_pending_outbox, peer_node_id, 50)
         if not pending:
             return
 
@@ -246,7 +252,7 @@ class SyncEngine:
         import base64
         items = []
         # C-03: encrypt ALL mail types (including knarr/ system mail) when peer key available
-        peer_key = self._node.storage.get_peer_encryption_key(peer_node_id)
+        peer_key = await self._run_in_protocol_pool(self._node.storage.get_peer_encryption_key, peer_node_id)
         blocked_ids = []
         for p in pending:
             item = json.loads(p["body_json"])
@@ -668,7 +674,7 @@ class SyncEngine:
             await self._self_deliver(to_node)
             return
         # Try peer table first — direct PK lookup, not full table scan
-        peer_info = self._node.storage.get_peer_by_id(to_node)
+        peer_info = await self._run_in_protocol_pool(self._node.storage.get_peer_by_id, to_node)
         if peer_info:
             self._flush_skip_count.pop(to_node, None)  # reset on route found
             h, p = self._node.resolve_peer(peer_info.node_id, peer_info.host, peer_info.port)
@@ -682,7 +688,7 @@ class SyncEngine:
                 await self.push_to_peer(to_node, h, p)
             else:
                 # Fall back to skill table address (gossip-discovered providers)
-                skill_addr = self._node.storage.get_provider_address(to_node)
+                skill_addr = await self._run_in_protocol_pool(self._node.storage.get_provider_address, to_node)
                 if skill_addr:
                     sh, sp = skill_addr
                     if self._debug:
@@ -693,7 +699,7 @@ class SyncEngine:
                     self._flush_skip_count[to_node] = skip_count
                     if skip_count >= self._flush_skip_max:
                         # Abandon: peer has been unreachable for ~8 minutes
-                        abandoned = self._node.storage.abandon_outbox(to_node)
+                        abandoned = await self._node._enqueue_write(self._node.storage.abandon_outbox, to_node)
                         self._flush_skip_count.pop(to_node, None)
                         self._log.warning(f"MAIL_FLUSH_ABANDON to={to_node[:16]} skips={skip_count} abandoned={abandoned}")
                     else:
@@ -713,7 +719,7 @@ class SyncEngine:
         C-01: Recipients are flushed in parallel via asyncio.gather so that a
         slow or unreachable peer does not stall delivery to all other recipients.
         """
-        recipients = self._node.storage.get_outbox_recipients()
+        recipients = await self._run_in_protocol_pool(self._node.storage.get_outbox_recipients)
         if not recipients:
             return
         if self._debug:

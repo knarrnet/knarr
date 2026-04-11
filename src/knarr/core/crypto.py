@@ -134,6 +134,90 @@ def verify_receipt(receipt_json: str, provider_public_key_hex: str) -> bool:
         return False
 
 
+def verify_skill_sample(sample: dict, rater_pubkey: bytes = None) -> bool:
+    """CR v0.56.0: Verify a skill sample's Ed25519 signature.
+
+    Used by discovery clients to validate quality-rating evidence embedded in
+    a SkillSheet's `samples` field. Validation policy per CR ruling: the node
+    receiving an Announce only checks schema shape (in validation.py); signature
+    + trust verification is the consumer's job, here.
+
+    The signed payload is the JSON canonicalization of the sample dict with the
+    signature field removed. Canonicalization uses sorted keys and the same
+    separators as verify_receipt (``sort_keys=True``, ``separators=(',', ':')``).
+
+    Args:
+        sample: A single sample record dict from a SkillSheet's samples list.
+                Must contain at minimum: rater_pubkey (64-char hex),
+                signature (base64), and rater_node_id (64-char hex).
+        rater_pubkey: Optional 32-byte Ed25519 verify key. If provided, the
+                verification uses this key and the sample's embedded rater_pubkey
+                is checked for consistency. If None, the sample's embedded
+                rater_pubkey is used (client-trust-list pattern).
+
+    Returns:
+        True if the signature is valid against the rater pubkey.
+        False on any error (malformed sample, decoding failure, signature mismatch,
+        or rater_node_id ↔ sha256(rater_pubkey) consistency failure).
+
+    Note:
+        This function does NOT check whether the rater is trusted. Trust is a
+        client-side concern — the caller is responsible for confirming the
+        rater_pubkey appears in their rater trust list before acting on the
+        rating. A True return only confirms the sample is unmodified since the
+        rater signed it. Filed for v0.57.0: CR-rater-trust-list.
+    """
+    try:
+        if not isinstance(sample, dict):
+            return False
+        signature_b64 = sample.get("signature")
+        embedded_pubkey_hex = sample.get("rater_pubkey")
+        if not signature_b64 or not embedded_pubkey_hex:
+            return False
+
+        # Consistency: caller-provided pubkey (if any) must match the embedded one
+        if rater_pubkey is not None:
+            provided_hex = rater_pubkey.hex() if isinstance(rater_pubkey, (bytes, bytearray)) else str(rater_pubkey)
+            if provided_hex.lower() != embedded_pubkey_hex.lower():
+                logger.debug(
+                    "CRYPTO_VERIFY_SAMPLE_FAIL provided_pubkey=%s embedded=%s",
+                    provided_hex[:16], embedded_pubkey_hex[:16],
+                )
+                return False
+
+        # Canonicalize the sample without the signature field
+        unsigned = {k: v for k, v in sample.items() if k != "signature"}
+        payload_bytes = json.dumps(unsigned, sort_keys=True, separators=(',', ':')).encode('utf-8')
+
+        # Signature may be base64 OR raw hex (matches how raters serialize)
+        try:
+            signature_bytes = base64.b64decode(signature_b64)
+            if len(signature_bytes) != 64:
+                # Not valid base64 Ed25519 — try hex
+                signature_bytes = bytes.fromhex(signature_b64)
+        except Exception:
+            signature_bytes = bytes.fromhex(signature_b64)
+
+        verify_key = VerifyKey(bytes.fromhex(embedded_pubkey_hex))
+        verify_key.verify(payload_bytes, signature_bytes)
+
+        # Consistency: rater_node_id MUST be sha256(rater_pubkey) — mirrors
+        # verify_receipt's provider_node_id check
+        rater_node_id = sample.get("rater_node_id", "")
+        expected_node_id = hashlib.sha256(bytes.fromhex(embedded_pubkey_hex)).hexdigest()
+        if rater_node_id != expected_node_id:
+            logger.debug(
+                "CRYPTO_VERIFY_SAMPLE_FAIL rater_node_id=%s expected=%s",
+                rater_node_id[:16], expected_node_id[:16],
+            )
+            return False
+
+        return True
+    except (json.JSONDecodeError, BadSignatureError, ValueError, TypeError) as e:
+        logger.debug("CRYPTO_VERIFY_SAMPLE_FAIL err=%s", e)
+        return False
+
+
 # ── TLS context helpers (delegates to mail/tls) ────────────────────────────────
 
 def create_server_tls_context(cert_path: str, key_path: str):
@@ -163,6 +247,19 @@ def create_client_tls_context():
     ctx.verify_mode = ssl.CERT_NONE
     logger.debug("CRYPTO_TLS_CLIENT_CTX created")
     return ctx
+
+
+def get_tls_peer_cert_fingerprint(ssl_object) -> str:
+    """Return the SHA-256 fingerprint of the peer TLS certificate, or ''."""
+    if ssl_object is None:
+        return ""
+    try:
+        cert_bytes = ssl_object.getpeercert(binary_form=True)
+    except Exception:
+        return ""
+    if not cert_bytes:
+        return ""
+    return hashlib.sha256(cert_bytes).hexdigest()
 
 
 def ensure_node_tls_cert(config: dict, data_dir: str, node_id: str,
@@ -204,6 +301,18 @@ def ensure_node_tls_cert(config: dict, data_dir: str, node_id: str,
 #     }
 #   }
 
+
+def _hybrid_recipient_aad(recipient_x25519_pub_hexes: list[str]) -> bytes:
+    """Canonical AES-GCM AAD for the wrapped recipient set.
+
+    Adversary #5 fix (v0.56.0): normalize to lowercase before sorting.
+    Without the normalization, `"ABCD"` and `"abcd"` produce different AAD
+    even though they represent the same hex key — logically-identical
+    recipient sets would fail AAD validation on decrypt.
+    """
+    recipients = sorted({str(pub_hex).lower() for pub_hex in recipient_x25519_pub_hexes if pub_hex})
+    return json.dumps(recipients, separators=(",", ":")).encode("utf-8")
+
 def hybrid_encrypt(plaintext: bytes, recipient_x25519_pub_hexes: list,
                    trace_id: str = "") -> dict:
     """Encrypt plaintext for multiple recipients.
@@ -222,10 +331,12 @@ def hybrid_encrypt(plaintext: bytes, recipient_x25519_pub_hexes: list,
         raise ValueError("At least one recipient required for hybrid encryption")
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+    recipient_x25519_pub_hexes = sorted({str(pub_hex) for pub_hex in recipient_x25519_pub_hexes if pub_hex})
     session_key = os.urandom(32)
     nonce = os.urandom(12)
     aesgcm = AESGCM(session_key)
-    ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+    aad = _hybrid_recipient_aad(recipient_x25519_pub_hexes)
+    ciphertext = aesgcm.encrypt(nonce, plaintext, aad)
 
     recipient_keys = {}
     for pub_hex in recipient_x25519_pub_hexes:
@@ -271,7 +382,8 @@ def hybrid_decrypt(payload: dict, x25519_private, trace_id: str = "") -> bytes:
     nonce = base64.b64decode(payload["nonce"])
     ciphertext = base64.b64decode(payload["ciphertext"])
     aesgcm = AESGCM(session_key)
-    plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+    aad = _hybrid_recipient_aad(list(recipient_keys.keys()))
+    plaintext = aesgcm.decrypt(nonce, ciphertext, aad)
 
     logger.debug("CRYPTO_HYBRID_DECRYPT pub=%s trace_id=%s", pub_hex[:16], trace_id)
     return plaintext

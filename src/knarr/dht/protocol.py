@@ -2,6 +2,7 @@ import asyncio
 import struct
 from typing import Optional
 from ..core.messages import Message, serialize_message, deserialize_message
+from ..core.crypto import get_tls_peer_cert_fingerprint
 
 class ProtocolError(Exception):
     """Raised for protocol-level errors."""
@@ -38,12 +39,17 @@ async def request_response(host: str, port: int, msg: Message, timeout: float = 
             asyncio.open_connection(host, port, ssl=ssl_context),
             timeout=timeout
         )
+        fingerprint = get_tls_peer_cert_fingerprint(writer.get_extra_info("ssl_object"))
         try:
             await send_message(writer, msg)
             response = await asyncio.wait_for(
                 receive_message(reader),
                 timeout=timeout
             )
+            if response is not None:
+                object.__setattr__(response, "_tls_peer_cert_fingerprint", fingerprint)
+                object.__setattr__(response, "_tls_peer_host", host)
+                object.__setattr__(response, "_tls_peer_port", int(port))
             return response
         finally:
             writer.close()

@@ -10,6 +10,10 @@ from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+# KeyringVault.encrypt_bytes uses PyNaCl SecretBox, which stores a 24-byte
+# nonce plus a 16-byte MAC alongside the ciphertext.
+KNARR_ASSET_ENCRYPTION_OVERHEAD = 40
+
 @dataclass
 class TaskContext:
     """Provides asset operations and cancellation status to handlers. Thread-safe."""
@@ -88,6 +92,11 @@ class AssetSidecar:
     @property
     def port(self) -> int:
         return self._port
+
+    def _stored_size_for_plaintext(self, plaintext_size: int) -> int:
+        if self._vault is None:
+            return plaintext_size
+        return plaintext_size + KNARR_ASSET_ENCRYPTION_OVERHEAD
 
     async def start(self):
         """Start the HTTPS sidecar server (TLS mandatory)."""
@@ -272,7 +281,8 @@ class AssetSidecar:
         if content_length > self._max_asset_size:
             await self._send_response(writer, 413, {"error": f"Exceeds max size {self._max_asset_size}"})
             return
-        if self._total_size + content_length > self._max_total_size:
+        stored_size = self._stored_size_for_plaintext(content_length)
+        if self._total_size + stored_size > self._max_total_size:
             await self._send_response(writer, 507, {"error": "Storage capacity exceeded"})
             return
 
@@ -296,6 +306,11 @@ class AssetSidecar:
                 await self._send_response(writer, 500, {"error": "Encryption failed"})
                 return
 
+        # T3-06 (v0.56.0): track actual on-disk byte
+        # length rather than computed plaintext+OVERHEAD. Self-correcting against any
+        # future change in the vault primitive.
+        actual_stored_size = len(disk_data)
+
         # Atomic write — use asyncio.to_thread to avoid blocking the event loop
         final_path = os.path.join(self._asset_dir, content_hash)
         if not os.path.exists(final_path):
@@ -303,11 +318,11 @@ class AssetSidecar:
             await self._write_file(tmp_path, disk_data)
             os.replace(tmp_path, final_path)
             self._metadata[content_hash] = AssetMetadata(
-                size=content_length,
+                size=actual_stored_size,
                 uploaded_at=time.time(),
                 uploader_key=headers.get("x-knarr-publickey", ""),
             )
-            self._total_size += content_length
+            self._total_size += actual_stored_size
 
         await self._send_response(writer, 200, {"hash": content_hash, "size": content_length})
 

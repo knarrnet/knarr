@@ -845,6 +845,10 @@ class PunchholeBackendPlugin(PluginHooks):
             log.debug("punchhole-backend: private_read key=%s hit=%s", key, signed is not None)
         return signed
 
+    def get_punchhole_epoch(self) -> int:
+        """Return the current cache invalidation epoch for heartbeat bridging."""
+        return int(self._punchhole_epoch)
+
     # ------------------------------------------------------------------
     # Card builder
     # ------------------------------------------------------------------

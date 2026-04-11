@@ -27,6 +27,7 @@ class SkillSheet:
     jurisdiction: Optional[List[str]] = None        # compliance routing ["eu.no", "eu.ch"]
     price: float = 1.0
     max_input_size: int = 65536
+    samples: Optional[List[Dict[str, Any]]] = None  # CR v0.56.0: Argus-style signed quality samples
 
     def __post_init__(self):
         """Normalize name and tags to lowercase and strip whitespace."""
@@ -55,6 +56,8 @@ class SkillSheet:
             d["price"] = self.price
         if self.max_input_size != 65536:
             d["max_input_size"] = self.max_input_size
+        if self.samples is not None:
+            d["samples"] = self.samples
         return d
 
     @classmethod
@@ -73,6 +76,7 @@ class SkillSheet:
             jurisdiction=data.get("jurisdiction"),
             price=data.get("price", 1.0),
             max_input_size=data.get("max_input_size", 65536),
+            samples=data.get("samples"),
         )
 
 @dataclass(frozen=True)

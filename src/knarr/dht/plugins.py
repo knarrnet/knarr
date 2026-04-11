@@ -1,5 +1,6 @@
 import asyncio
 import dataclasses
+import importlib.resources
 import importlib.util
 import json
 import logging
@@ -15,6 +16,7 @@ from knarr.core.messages import Message, PluginMessage
 from knarr.core.models import NodeInfo
 
 log = logging.getLogger(__name__)
+
 
 # A-02: Protocol bus topic prefixes — route to shared bus.
 # Everything else goes to the identity bus.
@@ -334,67 +336,25 @@ class PluginContext:
         node = getattr(self, "_node", None)
         if node is None:
             return None
-
-        request_id = str(uuid.uuid4())
-        start = time.monotonic()
-        future = asyncio.get_running_loop().create_future()
-        node._pending_rpcs[request_id] = (future, node_id)  # TP-3: store target_node_id for response validation
-
-        request_payload = dict(payload or {})
-        trace_id = trace_id or str(request_payload.get("trace_id") or request_id)
-        request_payload["_request_id"] = request_id
-        request_payload["trace_id"] = trace_id
-        reply_host = getattr(getattr(node, "node_info", None), "host", "")
-        if not isinstance(reply_host, str):
-            reply_host = ""
-        reply_port = getattr(getattr(node, "node_info", None), "port", 0)
-        if not isinstance(reply_port, int):
-            reply_port = 0
-        request_payload.setdefault("_reply_host", reply_host)
-        request_payload.setdefault("_reply_port", reply_port)
-        target = NodeInfo(node_id=node_id, host=host, port=port)
-        outbound = PluginMessage(
-            node_id=self.node_id,
-            plugin_name=plugin_name,
-            action=action,
-            payload=json.dumps(request_payload),
-            target_node_id=node_id,  # TP-10: explicit target for multi-identity routing
+        return await node.query_plugin(
+            node_id,
+            host,
+            port,
+            plugin_name,
+            action,
+            payload,
+            timeout=timeout,
+            trace_id=trace_id,
         )
 
-        sender = getattr(self, "send_fire_forget", None) or getattr(node, "_send_fire_forget", None)
-        if sender is None:
-            node._pending_rpcs.pop(request_id, None)
-            return None
-
-        plugin_log = getattr(self, "log", log)
-        identity_prefix = str(self.node_id or "")[:8]
+    def current_identity_name(self) -> Optional[str]:
+        """Return the scoped identity name, or None outside identity context."""
         try:
-            if getattr(self, "_debug", False):
-                plugin_log.info(
-                    f"[{trace_id}] [{identity_prefix}] QUERY_PLUGIN_SEND "
-                    f"plugin={plugin_name} action={action} node={str(node_id)[:8]}"
-                )
-            await sender(target, outbound)
-            result = await asyncio.wait_for(future, timeout=timeout)
-            if isinstance(result, dict):
-                result.setdefault("trace_id", trace_id)
-            if getattr(self, "_debug", False):
-                latency_ms = int((time.monotonic() - start) * 1000)
-                plugin_log.info(
-                    f"[{trace_id}] [{identity_prefix}] QUERY_PLUGIN_RECV "
-                    f"plugin={plugin_name} action={action} latency_ms={latency_ms}"
-                )
-            return result
-        except asyncio.TimeoutError:
-            if getattr(self, "_debug", False):
-                latency_ms = int((time.monotonic() - start) * 1000)
-                plugin_log.info(
-                    f"[{trace_id}] [{identity_prefix}] QUERY_PLUGIN_TIMEOUT "
-                    f"plugin={plugin_name} action={action} latency_ms={latency_ms}"
-                )
+            from .node import _current_identity
+        except Exception:
             return None
-        finally:
-            node._pending_rpcs.pop(request_id, None)
+        identity = _current_identity.get()
+        return getattr(identity, "name", None) if identity is not None else None
 
     def get_economy_stats(self) -> dict:
         """C-06: Return economy stats from node storage directly (local bypass).
@@ -440,33 +400,116 @@ class PluginLoader:
         self.plugins: List[PluginHooks] = []
         self._name_to_plugin: Dict[str, PluginHooks] = {}  # v0.46.0: name → instance
 
-    def load_plugins(self) -> None:
+    def _find_package_plugin_root(self) -> Optional[Path]:
+        """T2-08 (v0.56.0): locate the package-shipped
+        plugins directory via the knarr package's __file__. Avoids importlib.resources
+        namespace-package magic — direct filesystem path is more robust.
         """
-        Scans for and loads plugins. Logs warnings for failures but continues startup.
+        try:
+            import knarr
+            pkg_path = Path(knarr.__file__).resolve().parent / "plugins"
+            if pkg_path.is_dir():
+                return pkg_path
+        except Exception as e:
+            log.debug(f"package plugin root lookup failed: {e}")
+        return None
+
+    def _scan_plugin_source(
+        self,
+        root: Optional[Path],
+        source_label: str,
+        skip_names: Optional[set] = None,
+    ) -> tuple:
+        """Scan a plugin root directory and return ((priority, name, path, cfg), seen_names).
+
+        ``skip_names`` is a set of plugin names already claimed by a
+        higher-precedence source and must not be re-added.
         """
-        if not self._plugin_root.is_dir():
-            log.info(f"Plugin directory not found: {self._plugin_root}. No plugins loaded.")
-            return
-
-        config_dir = self._plugin_root.parent
-        plugin_entries = []
-        failed_required: List[str] = []
-
-        for plugin_path in self._plugin_root.iterdir():
+        entries: list = []
+        seen: set = set()
+        if root is None or not root.is_dir():
+            return entries, seen
+        # Adversary #4 fix (v0.56.0): case-insensitive seen_names comparison
+        # prevents dual loading when the same plugin appears with different
+        # casing in two sources (e.g., `MyPlugin` in node-local and `myplugin`
+        # in the package fallback). Without this, both would load and register
+        # duplicate hooks / corrupt plugin state.
+        skip = {s.lower() for s in (skip_names or set())}
+        for plugin_path in root.iterdir():
             if not plugin_path.is_dir():
                 continue
-
             toml_path = plugin_path / "plugin.toml"
             if not toml_path.is_file():
                 log.warning(f"Skipping {plugin_path.name}: plugin.toml not found.")
                 continue
-
             try:
                 plugin_config = tomllib.loads(toml_path.read_text())
-                priority = int(plugin_config.get("priority", 10))
-                plugin_entries.append((priority, plugin_path.name.lower(), plugin_path, plugin_config))
             except Exception as e:
                 log.warning(f"Failed to parse plugin.toml for {plugin_path.name}: {e}")
+                continue
+            plugin_name = plugin_config.get("name", plugin_path.name)
+            plugin_name_lc = plugin_name.lower()
+            if plugin_name_lc in skip:
+                log.debug(
+                    "PLUGIN_LOADER_FALLBACK source=%s plugin=%s (skipped — node_local wins)",
+                    source_label, plugin_name,
+                )
+                continue
+            # Post-review fix (v0.56.0, Sonnet subagent): guard against
+            # intra-source case-insensitive duplicates. Without this check,
+            # two subdirectories in the SAME source with plugin.toml names
+            # differing only in case (e.g., `Kademlia/` + `kademlia/` on a
+            # case-sensitive filesystem) would BOTH be added to `entries`
+            # because `skip` only tracks cross-source dedup, not intra-source.
+            # `seen` accumulates across this loop but was never consulted
+            # against itself — fix here.
+            if plugin_name_lc in seen:
+                log.warning(
+                    "PLUGIN_LOADER_INTRASOURCE_DUP source=%s plugin=%s (already loaded this scan)",
+                    source_label, plugin_name,
+                )
+                continue
+            seen.add(plugin_name_lc)
+            log.debug(
+                "PLUGIN_LOADER_FALLBACK source=%s plugin=%s",
+                source_label, plugin_name,
+            )
+            priority = int(plugin_config.get("priority", 10))
+            entries.append((priority, plugin_path.name.lower(), plugin_path, plugin_config))
+        return entries, seen
+
+    def load_plugins(self) -> None:
+        """
+        Scans for and loads plugins. Logs warnings for failures but continues startup.
+
+        T2-08 (v0.56.0): When a plugin is not present
+        in the node-local ``plugins/`` directory, fall back to the package-shipped copy
+        under ``knarr/plugins/<name>``. Node-local always takes precedence when both
+        exist. Missing-config errors (KeyError) skip the plugin with a warning instead
+        of crashing the node.
+        """
+        config_dir = self._plugin_root.parent
+        plugin_entries = []
+        failed_required: List[str] = []
+
+        # 1. Node-local plugin directories (operator-supplied, highest precedence)
+        local_entries, seen_names = self._scan_plugin_source(
+            self._plugin_root if self._plugin_root.is_dir() else None,
+            source_label="node_local",
+        )
+        plugin_entries.extend(local_entries)
+
+        # 2. Package fallback — shipped plugins under src/knarr/plugins/
+        pkg_root = self._find_package_plugin_root()
+        if pkg_root is not None and pkg_root != self._plugin_root:
+            pkg_entries, _ = self._scan_plugin_source(
+                pkg_root, source_label="package", skip_names=seen_names,
+            )
+            plugin_entries.extend(pkg_entries)
+
+        if not plugin_entries:
+            log.info(f"No plugins found (node_local={self._plugin_root}, package fallback checked).")
+            return
 
         for _, _, plugin_path, plugin_config in sorted(plugin_entries, key=lambda item: (item[0], item[1])):
             handler_str = plugin_config.get("handler")
@@ -552,6 +595,23 @@ class PluginLoader:
                 self._name_to_plugin[plugin_config["name"]] = plugin_instance  # v0.46.0
                 log.info(f"Loaded plugin: {plugin_config['name']} v{plugin_config.get('version', 'unknown')}")
 
+            except KeyError as key_err:
+                # T2-08: missing config key — warn and skip, do NOT crash the node.
+                # Keeps minimal-template nodes bootable when a package-fallback plugin
+                # needs a key the operator hasn't set.
+                # Adversary #3 fix (v0.56.0): even on missing-config skip, security-critical
+                # plugins marked `required = true` must still fail the startup rather than
+                # silently disable (e.g., punchhole-frontend with C-02 default-deny,
+                # firewall, etc.). Matches the required-flag check used by the other
+                # skip branches above (handler_str missing, handler path escape,
+                # general Exception).
+                missing = str(key_err).strip("'\"")
+                log.warning(
+                    "PLUGIN_SKIPPED name=%s reason=missing_config key=%s",
+                    plugin_config.get("name", plugin_path.name), missing,
+                )
+                if plugin_config.get("required", False):
+                    failed_required.append(plugin_config.get("name", plugin_path.name))
             except Exception as e:
                 log.warning(f"Failed to load handler for {plugin_path.name}: {e}")
                 if plugin_config.get("required", False):

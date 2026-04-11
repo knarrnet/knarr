@@ -11,6 +11,10 @@ class ValidationError(Exception):
 MAX_SKILL_SHEET_SIZE = 4096  # 4KB
 MAX_INPUT_SCHEMA_FULL_SIZE = 65536  # 64KB (SA-03)
 MAX_TASK_INPUT_SIZE = 65536  # 64KB (SA-08)
+# CR v0.56.0 samples field — quality-rating evidence embedded in SkillSheet
+MAX_SAMPLES_SIZE = 32768           # 32 KB total for the samples field (excluded from skill sheet size cap)
+MAX_SAMPLES_ENTRIES = 10           # Max number of sample records per skill
+MAX_SAMPLE_ENTRY_SIZE = 3200       # Max bytes per individual sample record (after JSON serialization)
 
 # ADR-007: URI format — knarr:///category/subcategory/name@major.minor
 # Three-slash = no authority (any provider). Two-slash with hex prefix = specific provider.
@@ -29,8 +33,8 @@ def validate_skill_sheet(data: Dict[str, Any]) -> SkillSheet:
     
     Returns a SkillSheet object if valid, otherwise raises ValidationError.
     """
-    # Size check (WITHOUT input_schema_full per spec)
-    data_to_check = {k: v for k, v in data.items() if k != "input_schema_full"}
+    # Size check (WITHOUT input_schema_full or samples per spec)
+    data_to_check = {k: v for k, v in data.items() if k not in ("input_schema_full", "samples")}
     serialized = json.dumps(data_to_check)
     if len(serialized.encode("utf-8")) > MAX_SKILL_SHEET_SIZE:
         raise ValidationError(f"Skill sheet exceeds maximum size of {MAX_SKILL_SHEET_SIZE} bytes")
@@ -40,6 +44,77 @@ def validate_skill_sheet(data: Dict[str, Any]) -> SkillSheet:
         full_schema_ser = json.dumps(data["input_schema_full"])
         if len(full_schema_ser.encode("utf-8")) > MAX_INPUT_SCHEMA_FULL_SIZE:
             raise ValidationError(f"input_schema_full exceeds maximum size of {MAX_INPUT_SCHEMA_FULL_SIZE} bytes")
+
+    # SA-09 (CR v0.56.0): Validate samples field
+    # Schema shape only — Ed25519 signature verification is deferred to the
+    # consumer via core.crypto.verify_skill_sample(). See REVIEW-CR-skill-sheet-samples-field.md
+    if "samples" in data and data["samples"] is not None:
+        samples = data["samples"]
+        if not isinstance(samples, list):
+            raise ValidationError("samples must be a list")
+        if len(samples) > MAX_SAMPLES_ENTRIES:
+            raise ValidationError(f"samples must contain at most {MAX_SAMPLES_ENTRIES} entries")
+        try:
+            samples_ser = json.dumps(samples)
+        except (TypeError, ValueError) as e:
+            raise ValidationError(f"samples must be JSON-serializable: {e}")
+        if len(samples_ser.encode("utf-8")) > MAX_SAMPLES_SIZE:
+            raise ValidationError(f"samples exceed maximum total size of {MAX_SAMPLES_SIZE} bytes")
+
+        # Adversary #10 fix (v0.56.0): bind sample to the skill + provider it
+        # rates. Without these fields in the signed payload, an attacker can
+        # copy a verified sample from skill X and embed it in skill Y's sheet —
+        # `verify_skill_sample` returns True (same bytes, same signature) and
+        # the consumer trusts a verdict for the wrong skill. Add both fields
+        # to the required-keys check. Since the verify helper signs all
+        # non-signature fields, adding them here automatically makes them part
+        # of the signature coverage. The Announce handler in node.py ALSO
+        # checks that sample.skill_name matches the containing sheet's name
+        # and sample.provider_node_id matches the Announce sender's node_id.
+        _required_sample_keys = (
+            "skill_name", "provider_node_id",
+            "test_input_hash", "test_output_hash", "primary_score",
+            "verdict", "test_timestamp", "rater_pubkey",
+            "rater_node_id", "signature",
+        )
+        _allowed_verdicts = {"pass", "fail", "degraded"}
+
+        for i, sample in enumerate(samples):
+            if not isinstance(sample, dict):
+                raise ValidationError(f"samples[{i}] must be an object")
+            entry_ser = json.dumps(sample)
+            if len(entry_ser.encode("utf-8")) > MAX_SAMPLE_ENTRY_SIZE:
+                raise ValidationError(
+                    f"samples[{i}] exceeds maximum entry size of {MAX_SAMPLE_ENTRY_SIZE} bytes"
+                )
+            for key in _required_sample_keys:
+                if key not in sample:
+                    raise ValidationError(f"samples[{i}] missing required field: {key}")
+            if not isinstance(sample["test_input_hash"], str) or not sample["test_input_hash"].startswith("sha256:"):
+                raise ValidationError(f"samples[{i}].test_input_hash must be a sha256:... string")
+            if not isinstance(sample["test_output_hash"], str) or not sample["test_output_hash"].startswith("sha256:"):
+                raise ValidationError(f"samples[{i}].test_output_hash must be a sha256:... string")
+            if not isinstance(sample["primary_score"], (int, float)):
+                raise ValidationError(f"samples[{i}].primary_score must be a number")
+            if sample["verdict"] not in _allowed_verdicts:
+                raise ValidationError(
+                    f"samples[{i}].verdict must be one of {sorted(_allowed_verdicts)}"
+                )
+            if not isinstance(sample["test_timestamp"], str):
+                raise ValidationError(f"samples[{i}].test_timestamp must be an ISO-8601 string")
+            if not isinstance(sample["rater_pubkey"], str) or not re.match(r"^[a-f0-9]{64}$", sample["rater_pubkey"]):
+                raise ValidationError(f"samples[{i}].rater_pubkey must be a 64-char hex Ed25519 public key")
+            if not isinstance(sample["rater_node_id"], str) or not re.match(r"^[a-f0-9]{64}$", sample["rater_node_id"]):
+                raise ValidationError(f"samples[{i}].rater_node_id must be a 64-char hex node id")
+            if not isinstance(sample["signature"], str) or len(sample["signature"]) < 1:
+                raise ValidationError(f"samples[{i}].signature must be a non-empty string")
+            # Optional fields, type-checked only if present
+            if "primary_score_scale" in sample and not isinstance(sample["primary_score_scale"], str):
+                raise ValidationError(f"samples[{i}].primary_score_scale must be a string")
+            if "test_input" in sample and not isinstance(sample["test_input"], (str, dict, list)):
+                raise ValidationError(f"samples[{i}].test_input must be a string, object, or array")
+            if "test_output" in sample and not isinstance(sample["test_output"], (str, dict, list)):
+                raise ValidationError(f"samples[{i}].test_output must be a string, object, or array")
 
     # Required fields
     required_fields = ["name", "version", "description", "tags", "input_schema", "output_schema"]

@@ -1,0 +1,5 @@
+# Package plugin defaults.
+# Leave node-local plugins/ absent unless you want to override a built-in plugin.
+
+[plugins]
+source = "package"

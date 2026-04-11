@@ -99,6 +99,7 @@ class TaskRequest(Message):
     timeout_ms: int = 30000
     mode: str = "sync"  # "sync" (default) or "async"
     target_identity: str = ""  # E-01: target identity for multi-identity routing
+    uri: str = ""  # T2-01: additive URI cross-check for skill routing
     type: str = "TASK_REQUEST"
 
 @dataclass(frozen=True)
