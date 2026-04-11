@@ -227,6 +227,13 @@ class TorPlugin(PluginHooks):
         # Budget instance (Opus's class), wired into the pool in _configure_pool
         self._budget: Optional[_CircuitBudget] = None
 
+        # Proxy cache keyed by the full SOCKS5 URL. SYNTHESIS §8 bug #2 fix
+        # (Mímir follow-up 1): avoid reconstructing python_socks.Proxy on
+        # every dial. Per-peer circuit isolation is preserved because each
+        # peer_id produces a distinct URL (different username), so the cache
+        # key is just the URL string. Cleared on plugin shutdown.
+        self._proxy_cache: Dict[str, Any] = {}
+
     # ------------------------------------------------------------------
     # Static helpers (API contract)
     # ------------------------------------------------------------------
@@ -644,15 +651,26 @@ class TorPlugin(PluginHooks):
             password = "knarr"
 
         started = time.monotonic()
+        # Build the full SOCKS5 URL — this is our cache key (§8 bug #2 fix).
+        if username:
+            url = f"socks5://{username}:{password}@{socks_host}:{socks_port}"
+        else:
+            url = f"socks5://{socks_host}:{socks_port}"
         try:
-            from python_socks.async_.asyncio import Proxy  # type: ignore
-            if username:
-                url = f"socks5://{username}:{password}@{socks_host}:{socks_port}"
-            else:
-                url = f"socks5://{socks_host}:{socks_port}"
-            proxy = Proxy.from_url(url)
+            # Proxy cache lookup — reuse per (socks_host, socks_port, username)
+            # triple. Each peer_id generates a distinct URL in per-peer mode so
+            # stream isolation is preserved. In "global" sharing mode, all dials
+            # reuse the same unauthenticated proxy.
+            proxy = self._proxy_cache.get(url)
+            if proxy is None:
+                from python_socks.async_.asyncio import Proxy  # type: ignore
+                proxy = Proxy.from_url(url)
+                self._proxy_cache[url] = proxy
             sock = await proxy.connect(dest_host=host, dest_port=int(port), timeout=30)
         except Exception as e:
+            # Invalidate the cached Proxy on dial failure — it may be in a bad
+            # state. The next dial for the same URL will reconstruct.
+            self._proxy_cache.pop(url, None)
             self._emit("tor.circuit_failed", peer_id=peer_id, onion_address=host, error=str(e))
             raise
 
@@ -929,7 +947,7 @@ class TorPlugin(PluginHooks):
                     pass
 
     async def on_shutdown(self) -> None:
-        """Clean shutdown — cancel background tasks, close control port."""
+        """Clean shutdown — cancel background tasks, close control port, clear proxy cache."""
         for task in (self._control_task, self._self_dial_task):
             if task is not None and not task.done():
                 task.cancel()
@@ -942,3 +960,5 @@ class TorPlugin(PluginHooks):
                 await self._control.disconnect()
             except Exception:
                 pass
+        # Clear proxy cache so a subsequent reload starts fresh (§8 bug #2).
+        self._proxy_cache.clear()
