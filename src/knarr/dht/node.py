@@ -4060,8 +4060,17 @@ class DHTNode:
                 # registry and require URI authority to match.
                 #
                 # When target_identity is set:
-                #   - MUST resolve to a locally-owned identity (else auth bypass
-                #     to default identity — GPT #8 finding).
+                #   - If it equals our own node_id → self-target fast path, accept
+                #     (v0.56.1 regression fix: every legitimate inbound TaskRequest
+                #     from v0.55.0 onward sets target_identity=provider_node_id per
+                #     E-01 convention in submit_async_task, and on a single-identity
+                #     node IdentityRegistry._identities is empty, so resolve() would
+                #     return None and reject every legitimate request. The self-
+                #     target case cannot be the adversary #7/#8 attack because those
+                #     attacks route a victim's request through a different node —
+                #     self-target means we ARE the intended recipient.)
+                #   - Otherwise MUST resolve to a locally-hosted identity (multi-
+                #     identity nodes), else auth bypass to default identity — GPT #8.
                 #   - URI authority, if present, must match the resolved identity's
                 #     node_id (not just the attacker-set target_identity field —
                 #     Opus #7 finding).
@@ -4072,14 +4081,22 @@ class DHTNode:
                 #   - If URI authority is also empty, it's a truly anonymous URI and
                 #     both flat + URI are ambiguous — permit (existing behavior).
                 if msg.target_identity:
-                    registry = getattr(self, "_identity_registry", None)
-                    resolved = registry.resolve(msg.target_identity) if registry is not None else None
-                    if resolved is None:
-                        # GPT #8: foreign target_identity that doesn't resolve locally —
-                        # reject instead of falling through to default identity
-                        reason = "authority_unknown_identity"
-                    elif authority and authority != resolved.node_id:
-                        reason = "authority_mismatch"
+                    if msg.target_identity == self.node_info.node_id:
+                        # Self-target fast path — we are the intended recipient.
+                        # Still enforce URI authority consistency.
+                        if authority and authority != self.node_info.node_id:
+                            reason = "authority_mismatch"
+                    else:
+                        # Foreign target — must be a locally-hosted multi-identity.
+                        registry = getattr(self, "_identity_registry", None)
+                        resolved = registry.resolve(msg.target_identity) if registry is not None else None
+                        if resolved is None:
+                            # GPT #8: foreign target_identity that doesn't resolve
+                            # locally — reject instead of falling through to default
+                            # identity.
+                            reason = "authority_unknown_identity"
+                        elif authority and authority != resolved.node_id:
+                            reason = "authority_mismatch"
                 elif authority and authority != self.node_info.node_id:
                     reason = "authority_mismatch"
 
