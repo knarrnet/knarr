@@ -188,9 +188,14 @@ def cmd_upgrade(args: argparse.Namespace) -> None:
     async def _run() -> None:
         upgrader = Upgrader(cfg, supervisor)
         tag = getattr(args, "tag", None) or None
-        success = await upgrader.run_upgrade(tag=tag)
+        # BR-WM-02 fix: don't spawn from standalone manual upgrade.
+        # On Windows, the proactor event loop closing after asyncio.run()
+        # terminates any subprocess tracked by the loop. Install only;
+        # operator must restart watchman manually (or the persistent
+        # supervisor loop will pick up the new version on next start).
+        success = await upgrader.run_upgrade(tag=tag, spawn_after=False)
         if success:
-            print("Upgrade complete.")
+            print("Upgrade complete. Restart knarr-watchman to activate the new version.")
         else:
             print("Upgrade failed — rolled back.")
             sys.exit(1)

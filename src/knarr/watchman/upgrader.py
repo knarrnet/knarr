@@ -133,9 +133,20 @@ class Upgrader:
         log.debug("UPGRADE_CURRENT current=%s latest=%s — no update needed", current, latest)
         return None
 
-    async def run_upgrade(self, tag: Optional[str] = None) -> bool:
+    async def run_upgrade(self, tag: Optional[str] = None, spawn_after: bool = True) -> bool:
         """
         Execute the full staged upgrade flow. Returns True on success, False on rollback.
+
+        Args:
+            tag: Optional specific version tag to upgrade to.
+            spawn_after: Whether to spawn the new node after installation.
+                True (default) when called from the persistent supervisor loop
+                — the supervisor needs the new node running to verify health.
+                False when called from standalone `knarr-watchman upgrade`
+                (BR-WM-02 fix) — on Windows the proactor event loop closing
+                after the command exits kills any subprocess spawned inside
+                the loop, so standalone upgrades must NOT spawn. The operator
+                restarts watchman manually to activate the new version.
         If tag is None, checks for latest and upgrades to it.
         """
         source = self._upgrade_cfg["source"]
@@ -238,6 +249,19 @@ class Upgrader:
             log.error("UPGRADE_SWAP_FAIL error=%s — rolling back", e)
             await self._rollback(org, repo, current_version, backup_dir)
             return False
+
+        # BR-WM-02: standalone manual upgrade (cmd_upgrade) does NOT spawn
+        # because the proactor event loop closing after asyncio.run() kills
+        # any subprocess tracked by the loop. Spawn only when called from the
+        # persistent supervisor loop where the event loop stays alive.
+        if not spawn_after:
+            log.info(
+                "UPGRADE_SUCCESS from=%s to=%s (standalone — not spawning, operator must restart)",
+                current_version, new_version,
+            )
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            shutil.rmtree(backup_dir, ignore_errors=True)
+            return True
 
         # Start new version — WM-04: tracked spawn (not detached), proc reference restored
         await self._supervisor._spawn()
