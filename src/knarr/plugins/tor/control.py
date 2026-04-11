@@ -103,6 +103,21 @@ class AsyncControlPort:
         # previously in the lost state.
         self._consensus_lost = False
 
+        # Phase 6 O-3 fix: reader-race elimination via command/event demux.
+        # Before the background event loop starts (_event_loop_active=False),
+        # `_send_command` reads the reply directly from the stream — there is
+        # no other reader. Once `run_event_loop` starts, it becomes the SOLE
+        # reader: it classifies each line as 650-prefixed async event (dispatch)
+        # or 2xx/5xx synchronous reply (push into the pending-command queue).
+        # `_send_command` in event-loop-active mode installs a Future, awaits
+        # it, and trusts `run_event_loop` to resolve it with the accumulated
+        # reply. A command lock ensures only one command is in flight at a
+        # time.
+        self._event_loop_active: bool = False
+        self._cmd_lock: asyncio.Lock = asyncio.Lock()
+        self._pending_reply: Optional[asyncio.Future] = None
+        self._pending_reply_lines: List[str] = []
+
         # Exposed state for handler consumption / tests
         self.version: str = ""
         self.auth_methods: List[str] = []
@@ -131,15 +146,44 @@ class AsyncControlPort:
         return True
 
     async def _send_command(self, command: str) -> List[str]:
-        """Send a command line and read the reply block."""
-        if self._writer is None:
-            raise ControlPortError("control port not connected")
-        self._writer.write(command.encode("ascii") + b"\r\n")
-        try:
-            await asyncio.wait_for(self._writer.drain(), timeout=self._connect_timeout)
-        except asyncio.TimeoutError as e:
-            raise TimeoutError(f"control port write timeout") from e
-        return await self._read_reply()
+        """Send a command line and read the reply block.
+
+        Two modes (Phase 6 O-3 fix):
+          - Event-loop inactive: direct read from stream (used for connect-time
+            handshake: PROTOCOLINFO, AUTHENTICATE, SETEVENTS).
+          - Event-loop active: install a Future, await the demux-pushed reply.
+
+        The command lock serializes callers — only one command is in flight at
+        a time regardless of mode, so `_pending_reply` is safe without further
+        coordination.
+        """
+        async with self._cmd_lock:
+            if self._writer is None:
+                raise ControlPortError("control port not connected")
+            self._writer.write(command.encode("ascii") + b"\r\n")
+            try:
+                await asyncio.wait_for(
+                    self._writer.drain(), timeout=self._connect_timeout
+                )
+            except asyncio.TimeoutError as e:
+                raise TimeoutError("control port write timeout") from e
+
+            if not self._event_loop_active:
+                return await self._read_reply()
+
+            # Event loop is the sole reader — install a Future and wait for
+            # `run_event_loop` to fulfill it with the accumulated reply.
+            loop = asyncio.get_event_loop()
+            fut: asyncio.Future = loop.create_future()
+            self._pending_reply = fut
+            self._pending_reply_lines = []
+            try:
+                return await asyncio.wait_for(fut, timeout=self._connect_timeout)
+            except asyncio.TimeoutError as e:
+                raise TimeoutError("control port reply timeout") from e
+            finally:
+                self._pending_reply = None
+                self._pending_reply_lines = []
 
     async def _read_reply(self) -> List[str]:
         """Read one Tor control-protocol reply block.
@@ -341,45 +385,174 @@ class AsyncControlPort:
     # Event loop
     # ------------------------------------------------------------------
 
+    def start_event_loop(self) -> asyncio.Task:
+        """Schedule `run_event_loop` and synchronously set the active flag.
+
+        Callers MUST use this helper instead of `create_task(run_event_loop())`
+        directly. The flag must flip to True BEFORE the task is scheduled so
+        that any `_send_command` caller racing on the main event loop takes
+        the demux path (futures) rather than trying to read the stream
+        directly in parallel with the background reader.
+        """
+        self._event_loop_active = True
+        return asyncio.create_task(self.run_event_loop())
+
     async def run_event_loop(self) -> None:
-        """Persistent read loop with 30s keepalive.
+        """Persistent read loop — SOLE reader of the control stream.
 
-        Reads async event lines (650-prefix) and dispatches to bus_emit via
-        the §2.2.1 event → bus mapping table.
+        Sonnet's contribution: the 30s keepalive wait_for. Without it,
+        readline() would hang forever on a silent disconnect.
 
-        Sonnet's contribution: the wait_for keepalive. Without it, readline()
-        would hang forever on a silent disconnect (no EOF, no data). The 30s
-        timeout catches the disconnect, breaks the loop, and returns — the
-        caller can schedule a reconnect via on_tick.
+        Phase 6 O-2 + O-3 fix: this loop now handles the `650+` multi-line
+        async event format (NEWCONSENSUS in particular — Tor delivers it as
+        `650+NEWCONSENSUS\\r\\n<body>\\r\\n.\\r\\n650 OK` per control-spec.txt
+        §4.1.1). It also demultiplexes synchronous command replies onto
+        `_pending_reply`, so there is no longer any race between this task
+        and `_send_command` calling readline() on the same StreamReader.
 
-        Exits on EOF or connection error. Caller handles reconnect.
+        Exits on EOF / connection error / cancel. On exit, any in-flight
+        pending reply is failed so callers wake up with an error instead of
+        hanging.
         """
         if self._reader is None:
             return
-        while True:
-            try:
-                raw = await asyncio.wait_for(
-                    self._reader.readline(), timeout=_EVENT_LOOP_KEEPALIVE
-                )
-            except asyncio.TimeoutError:
-                # Keepalive tick — check if socket is still open
-                if self._writer is None or self._writer.is_closing():
+        # Flag may already be True (set by start_event_loop before scheduling),
+        # but set it here too for the out-of-band `create_task(run_event_loop())`
+        # call path and to document the state transition.
+        self._event_loop_active = True
+        try:
+            while True:
+                try:
+                    raw = await asyncio.wait_for(
+                        self._reader.readline(), timeout=_EVENT_LOOP_KEEPALIVE
+                    )
+                except asyncio.TimeoutError:
+                    # Keepalive tick — check if socket is still open
+                    if self._writer is None or self._writer.is_closing():
+                        return
+                    continue
+                except (ConnectionError, OSError, asyncio.IncompleteReadError,
+                        RuntimeError):
+                    # Phase 6 O-15 fix: RuntimeError covers the historic
+                    # "readuntil() called while another coroutine is already
+                    # waiting" case so a regression can't silently crash the
+                    # task via a never-retrieved exception.
                     return
-                continue
-            except (ConnectionError, OSError, asyncio.IncompleteReadError):
-                return
-            except asyncio.CancelledError:
-                return
-            if not raw:
-                return
-            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-            if not (line.startswith("650 ") or line.startswith("650-")):
-                continue  # synchronous reply for some other command — ignore
-            payload = line[4:]
-            try:
-                self._dispatch_event(payload)
-            except Exception as e:
-                log.debug("TOR_CTRL_DISPATCH_ERR err=%s line=%s", e, line)
+                except asyncio.CancelledError:
+                    return
+                if not raw:
+                    return
+                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+
+                # Classify the line. All valid control-port lines start with
+                # a 3-digit code followed by ' ', '-', or '+'.
+                if len(line) < 4 or not line[:3].isdigit():
+                    continue  # ignore garbage — don't tear down the stream
+                code = line[:3]
+                sep = line[3]
+
+                if code.startswith("6"):
+                    # Async event (650). sep: ' ' single-line, '-' continuation,
+                    # '+' multi-line data block terminated by '.'
+                    payload = line[4:]
+                    if sep == "+":
+                        # Phase 6 O-2 fix: accumulate until a bare "." line.
+                        # Real Tor delivers NEWCONSENSUS as 650+NEWCONSENSUS
+                        # + router body lines + "." + trailing "650 OK".
+                        body_lines: List[str] = [payload]
+                        try:
+                            while True:
+                                block_raw = await asyncio.wait_for(
+                                    self._reader.readline(),
+                                    timeout=_EVENT_LOOP_KEEPALIVE,
+                                )
+                                if not block_raw:
+                                    return
+                                block_line = block_raw.decode(
+                                    "utf-8", errors="replace"
+                                ).rstrip("\r\n")
+                                if block_line == ".":
+                                    break
+                                body_lines.append(block_line)
+                        except (asyncio.TimeoutError, ConnectionError,
+                                OSError, asyncio.IncompleteReadError,
+                                RuntimeError):
+                            return
+                        # Dispatch the block. We pass the header payload so
+                        # _dispatch_event's NEWCONSENSUS-vs-CONSENSUS=
+                        # classification still works; body content is the
+                        # signal of "consensus present" vs empty.
+                        full_payload = body_lines[0]
+                        if full_payload.startswith("NEWCONSENSUS") and len(body_lines) > 1:
+                            # Force the "full body" branch in _dispatch_event
+                            # by appending a non-empty marker.
+                            full_payload = "NEWCONSENSUS CONSENSUS=present"
+                        try:
+                            self._dispatch_event(full_payload)
+                        except Exception as e:
+                            log.debug("TOR_CTRL_DISPATCH_ERR err=%s line=%s",
+                                      e, line)
+                    elif sep in (" ", "-"):
+                        try:
+                            self._dispatch_event(payload)
+                        except Exception as e:
+                            log.debug("TOR_CTRL_DISPATCH_ERR err=%s line=%s",
+                                      e, line)
+                    # else: bad separator — skip
+                    continue
+
+                # Synchronous command reply (2xx/4xx/5xx). Push onto the
+                # pending reply buffer if there is one, else drop.
+                if self._pending_reply is None:
+                    continue
+                self._pending_reply_lines.append(line)
+                if sep == "+":
+                    # Multi-line data block on a command reply — accumulate
+                    # until "." line, stay in the same command.
+                    try:
+                        while True:
+                            block_raw = await asyncio.wait_for(
+                                self._reader.readline(),
+                                timeout=_EVENT_LOOP_KEEPALIVE,
+                            )
+                            if not block_raw:
+                                self._fail_pending_reply(
+                                    ControlPortError(
+                                        "control port closed during data block"
+                                    )
+                                )
+                                return
+                            block_line = block_raw.decode(
+                                "utf-8", errors="replace"
+                            ).rstrip("\r\n")
+                            self._pending_reply_lines.append(block_line)
+                            if block_line == ".":
+                                break
+                    except (asyncio.TimeoutError, ConnectionError,
+                            OSError, asyncio.IncompleteReadError,
+                            RuntimeError) as exc:
+                        self._fail_pending_reply(exc)
+                        return
+                    continue
+                if sep == " ":
+                    # End of reply — resolve the pending future
+                    if self._pending_reply is not None and not self._pending_reply.done():
+                        self._pending_reply.set_result(
+                            list(self._pending_reply_lines)
+                        )
+                    continue
+                # sep == "-" means continuation, buffer and keep reading
+        finally:
+            self._event_loop_active = False
+            self._fail_pending_reply(
+                ControlPortError("control port event loop exited")
+            )
+
+    def _fail_pending_reply(self, exc: BaseException) -> None:
+        """Wake any in-flight _send_command caller with an error."""
+        fut = self._pending_reply
+        if fut is not None and not fut.done():
+            fut.set_exception(exc)
 
     def _dispatch_event(self, payload: str) -> None:
         """Map a Tor event payload line to a bus event.

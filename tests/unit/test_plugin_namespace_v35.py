@@ -85,26 +85,38 @@ def _make_loader(config_dir):
     )
 
 
+def _fixture_plugins(loader):
+    """Return only the test-fixture plugins, not package-fallback plugins.
+
+    PluginLoader falls back to the package plugin root when a node-local dir
+    has gaps, so `loader.plugins` contains real shipped plugins (BCW, tor,
+    punchhole-*) in addition to whatever the fixture builds. The namespace
+    tests only care about the alpha/beta/bravo/charlie fixtures, which
+    uniquely expose a `source` attribute set by their handler.
+    """
+    return [p for p in loader.plugins if hasattr(p, "source")]
+
+
 class TestNamespaceCollision:
     def test_two_plugins_same_module_name(self, plugin_dir):
         """Both plugins load their OWN actions.py, not the other's."""
         loader = _make_loader(plugin_dir)
         loader.load_plugins()
 
-        assert len(loader.plugins) == 2, f"Expected 2 plugins, got {len(loader.plugins)}"
+        fixture = _fixture_plugins(loader)
+        assert len(fixture) == 2, f"Expected 2 fixture plugins, got {len(fixture)}"
 
-        alpha = loader.plugins[0]
-        beta = loader.plugins[1]
-
-        assert alpha.source == "alpha", f"Alpha got source={alpha.source!r}, expected 'alpha'"
-        assert beta.source == "beta", f"Beta got source={beta.source!r}, expected 'beta'"
+        by_source = {p.source: p for p in fixture}
+        assert "alpha" in by_source
+        assert "beta" in by_source
 
     def test_beta_constructor_args(self, plugin_dir):
         """Beta's ActionExecutor accepts db= kwarg (alpha's does not)."""
         loader = _make_loader(plugin_dir)
         loader.load_plugins()
 
-        beta = loader.plugins[1]
+        fixture = _fixture_plugins(loader)
+        beta = next(p for p in fixture if p.source == "beta")
         assert hasattr(beta.executor, "db")
         assert beta.executor.db == "test.db"
 
@@ -142,10 +154,10 @@ class TestNamespaceCollision:
         loader = _make_loader(config_dir)
         loader.load_plugins()
 
-        assert len(loader.plugins) == 3
-        assert loader.plugins[0].source == "aaa"
-        assert loader.plugins[1].source == "bbb"
-        assert loader.plugins[2].source == "ccc"
+        fixture = _fixture_plugins(loader)
+        assert len(fixture) == 3
+        sources = {p.source for p in fixture}
+        assert sources == {"aaa", "bbb", "ccc"}
 
 
 class TestSinglePlugin:
@@ -157,5 +169,6 @@ class TestSinglePlugin:
         loader = _make_loader(plugin_dir)
         loader.load_plugins()
 
-        assert len(loader.plugins) == 1
-        assert loader.plugins[0].source == "alpha"
+        fixture = _fixture_plugins(loader)
+        assert len(fixture) == 1
+        assert fixture[0].source == "alpha"

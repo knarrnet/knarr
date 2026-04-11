@@ -95,11 +95,40 @@ class ConnectionPool:
         self._derived_onion_fallback_window: float = 300.0
         self._derived_onion_fallback_ts: Dict[str, float] = {}
 
+        # Phase 6 O-4 fix: sticky-clearnet cache. When a derived-onion dial
+        # fails and the clearnet fallback succeeds, record an expiry for this
+        # peer_id so subsequent sends skip the onion attempt entirely until
+        # the fallback window ends. Without this, every send in the window
+        # re-pays the full 10s dial timeout on a known-failing onion before
+        # the rate-limiter denies it (livelock: 300s message loss + resource
+        # amplification). Map: peer_id -> monotonic expiry.
+        self._sticky_clearnet: Dict[str, float] = {}
+
+        # Phase 6 O-9 fix: strong references to pubkey refill tasks so
+        # Python's GC can't drop them mid-flight. Same pattern as
+        # node.py:_fingerprint_write_tasks (v0.56.0 C-01 fix). Without this,
+        # fire-and-forget create_task on a hot-path cache miss can be
+        # garbage-collected between the schedule and the first await point.
+        self._pubkey_refill_tasks: set = set()
+        # Phase 6 G-6 fix: in-flight dedupe. Multiple concurrent sends to the
+        # same cold peer must not schedule duplicate executor lookups. The
+        # set is guarded by the pool's coroutine-single-threaded model.
+        self._pubkey_refill_inflight: set = set()
+
         # Pool-level bus emit (injected by node startup; None tolerated).
         self._bus: Any = None
 
         # Pre-Tor peer skip state (§9.3, O-10) — log once per peer.
+        # Phase 6 O-5 fix: bounded FIFO cap to prevent unbounded growth
+        # under peer_id churn.
         self._pre_tor_skip_logged: set = set()
+        self._pre_tor_skip_logged_max: int = 1024
+
+        # Phase 6 O-5: periodic sweep counter for opportunistic eviction of
+        # expired sticky_clearnet / fallback_ts entries. Runs every N dial
+        # attempts to amortize the cost.
+        self._tor_state_cleanup_counter: int = 0
+        self._tor_state_cleanup_interval: int = 128
 
     def set_tls_context(self, ctx, tls_required: bool = True):
         """C-02: Set TLS context for outbound connections."""
@@ -210,9 +239,12 @@ class ConnectionPool:
           3. key_mode != "shared" → F-1: return ``host`` unchanged
              (separate mode cannot derive peer onions from pubkeys).
           4. host already ends in ``.onion`` → return unchanged (pass-through).
-          5. Pubkey cache miss → return ``host`` unchanged; fire async refill
+          5. Phase 6 O-4 sticky-clearnet: if the peer has an active sticky
+             entry (recent fallback succeeded), return ``host`` (clearnet) —
+             do NOT re-attempt the known-failing derived onion for the TTL.
+          6. Pubkey cache miss → return ``host`` unchanged; fire async refill
              for next time. Preserves the O-4 invariant: no blocking SQLite.
-          6. Pubkey cache hit → derive onion via ``onion_address_from_pubkey``.
+          7. Pubkey cache hit → derive onion via ``onion_address_from_pubkey``.
         """
         if self._tor_dialer is None:
             return host
@@ -223,15 +255,42 @@ class ConnectionPool:
         if self._is_onion_host(host):
             return host
 
+        # Phase 6 O-4: sticky-clearnet short-circuit. An entry here means a
+        # prior derived-onion dial failed AND the clearnet fallback succeeded,
+        # so the peer is known-reachable via clearnet for the remainder of the
+        # fallback window. Skipping the onion attempt avoids the 10s-per-send
+        # livelock.
+        sticky_expiry = self._sticky_clearnet.get(peer_id)
+        if sticky_expiry is not None:
+            if time.monotonic() < sticky_expiry:
+                return host
+            # Expired — drop the stale entry so the next send is free to try
+            # the derived onion again.
+            self._sticky_clearnet.pop(peer_id, None)
+
         pubkey = self._peer_pubkey_cache.get(peer_id)
         pubkey = self._normalize_pubkey(pubkey)
         if pubkey is None:
             # Cache miss → dial clearnet now, refill async for next time.
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._refill_peer_pubkey_async(peer_id))
-            except RuntimeError:
-                pass
+            # Phase 6 G-6: skip scheduling if a refill is already in flight
+            # for this peer_id (bursts of concurrent sends to the same cold
+            # peer previously queued N identical executor lookups).
+            # Phase 6 O-9: hold a strong reference so the task can't be GC'd.
+            if peer_id not in self._pubkey_refill_inflight:
+                try:
+                    loop = asyncio.get_running_loop()
+                    self._pubkey_refill_inflight.add(peer_id)
+                    task = loop.create_task(
+                        self._refill_peer_pubkey_async(peer_id)
+                    )
+                    self._pubkey_refill_tasks.add(task)
+                    task.add_done_callback(self._pubkey_refill_tasks.discard)
+                    task.add_done_callback(
+                        lambda _t, pid=peer_id:
+                        self._pubkey_refill_inflight.discard(pid)
+                    )
+                except RuntimeError:
+                    self._pubkey_refill_inflight.discard(peer_id)
             return host
 
         # Derive onion — import locally to avoid a circular dep on module load
@@ -241,6 +300,34 @@ class ConnectionPool:
             return onion_address_from_pubkey(pubkey)
         except Exception:
             return host
+
+    def _sweep_tor_state_if_due(self) -> None:
+        """Phase 6 O-5: opportunistic eviction of expired Tor-related state.
+
+        Runs every `_tor_state_cleanup_interval` calls from `_open`. Evicts
+        expired `_sticky_clearnet` entries and `_derived_onion_fallback_ts`
+        entries older than 2x the fallback window. Amortized O(n) per sweep,
+        bounded by the number of distinct peers ever dialed.
+        """
+        self._tor_state_cleanup_counter += 1
+        if self._tor_state_cleanup_counter < self._tor_state_cleanup_interval:
+            return
+        self._tor_state_cleanup_counter = 0
+        now = time.monotonic()
+        # Sticky entries: TTL is the expiry, evict if past
+        stale_sticky = [
+            k for k, exp in self._sticky_clearnet.items() if exp <= now
+        ]
+        for k in stale_sticky:
+            self._sticky_clearnet.pop(k, None)
+        # Fallback timestamps: evict if older than 2x window (plenty of slack)
+        fallback_horizon = now - (self._derived_onion_fallback_window * 2)
+        stale_fb = [
+            k for k, ts in self._derived_onion_fallback_ts.items()
+            if ts <= fallback_horizon
+        ]
+        for k in stale_fb:
+            self._derived_onion_fallback_ts.pop(k, None)
 
     async def _refill_peer_pubkey_async(self, peer_id: str) -> None:
         """Fire-and-forget async refill of the pubkey cache via run_in_executor."""
@@ -298,6 +385,18 @@ class ConnectionPool:
 
         Used by the circuit budget check to collapse Sybil aliases to pubkey
         when shared mode is active (spec §3 pattern rule).
+
+        Phase 6 O-11 (documented gap): this returns None for any peer whose
+        pubkey has not yet been warmed into cache. Consequence for the Sybil
+        alias defense: fresh peer_ids on their very first send bypass
+        pubkey-collapse because the budget check runs BEFORE the async
+        refill has populated the cache. The global circuit budget is the
+        backstop here — it caps the total aggregate even when per-pubkey
+        collapse misses. Once the cache entry is populated (typically on the
+        second send after ~1 SQLite round-trip), collapse activates normally.
+        This gap is acceptable for the v1.1 moonshot; the alternative would
+        be a synchronous SQLite hit on the hot dial path, which O-4 declared
+        out of bounds. See ADVERSARY-dev-tor-plugin-opus.md O-11.
         """
         pub = self._peer_pubkey_cache.get(peer_id)
         pub = self._normalize_pubkey(pub)
@@ -324,12 +423,21 @@ class ConnectionPool:
         if len(self._pool) >= self._max:
             self._evict_lifo()
 
+        # Phase 6 O-5: periodic Tor state eviction (no-op 127/128 calls)
+        self._sweep_tor_state_if_due()
+
         is_onion = self._is_onion_host(host)
 
         # Pre-Tor peer skip (O-10 §9.3) — peer advertises .onion but we don't
         # have Tor. Log once per peer, emit bus event once, return None.
+        # Phase 6 O-5 fix: bounded FIFO cap on the skip log set so a peer_id
+        # churn (Sybil floods of distinct IDs all on .onion) can't grow the
+        # set unboundedly.
         if is_onion and self._tor_dialer is None:
             if peer_id not in self._pre_tor_skip_logged:
+                if len(self._pre_tor_skip_logged) >= self._pre_tor_skip_logged_max:
+                    # Simple reset when full — log message re-emits fine
+                    self._pre_tor_skip_logged.clear()
                 self._pre_tor_skip_logged.add(peer_id)
                 logger.info(
                     "TOR_PEER_SKIPPED peer_id=%s host=%s (Tor not enabled locally)",
@@ -580,6 +688,20 @@ class ConnectionPool:
             await self._close_conn(peer_id)
             return None
         self._last_used[peer_id] = time.monotonic()
+        # Phase 6 O-4 fix: record sticky-clearnet entry so subsequent sends
+        # skip the derived-onion attempt for the duration of the fallback
+        # window. Keyed by peer_id (not rl_key) because the sticky decision
+        # applies to this specific peer's transport choice, not to the Sybil-
+        # collapsed rate-limit bucket.
+        self._sticky_clearnet[peer_id] = (
+            time.monotonic() + self._derived_onion_fallback_window
+        )
+        self._emit(
+            "tor.sticky_clearnet_engaged",
+            peer_id=peer_id,
+            ttl_seconds=self._derived_onion_fallback_window,
+            derived_onion=transport_host,
+        )
         return result
 
     # ------------------------------------------------------------------

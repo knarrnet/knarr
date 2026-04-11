@@ -631,6 +631,42 @@ class PluginLoader:
             names = ", ".join(sorted(set(failed_required)))
             raise RuntimeError(f"Required plugin(s) failed to load: {names}")
 
+    async def dispatch_init(self, node: Any) -> None:
+        """v0.57.0: run the plugin on_init lifecycle phase.
+
+        PluginLoader constructs instances during ``load_plugins`` but never
+        drove an init phase, so transport plugins that need to wire pool seams
+        at startup (Tor) had nowhere to plug in. This method:
+
+        1. Backfills ``ctx._node`` on every plugin context that was built via
+           the legacy path (which sets ``_node=None``).  This gives plugins a
+           handle onto the live DHTNode — they read ``node._pool``,
+           ``node.node_info``, ``node._sidecar_port`` from it.
+        2. Calls ``await plugin.on_init(ctx=plugin._ctx)`` on every plugin
+           that defines ``on_init``. Failures are logged and swallowed; one
+           plugin's init must not take down the node.
+
+        Must be invoked AFTER the post-load context backfill in
+        ``DHTNode.start`` (storage_path, sign_document, bus, group_engine)
+        and BEFORE background loops start, so plugin-registered seams are in
+        place when heartbeat/writer/pool loops begin using them.
+        """
+        for plugin in self.plugins:
+            ctx = getattr(plugin, "_ctx", None)
+            if ctx is not None and getattr(ctx, "_node", None) is None:
+                ctx._node = node
+        for plugin in self.plugins:
+            on_init_fn = getattr(plugin, "on_init", None)
+            if not callable(on_init_fn):
+                continue
+            try:
+                await on_init_fn(ctx=getattr(plugin, "_ctx", None))
+            except Exception as exc:
+                log.warning(
+                    "PLUGIN_ON_INIT_FAILED plugin=%s err=%s",
+                    plugin.__class__.__name__, exc, exc_info=True,
+                )
+
     async def on_connect(self, peer_ip: str) -> bool:
         for plugin in self.plugins:
             try:

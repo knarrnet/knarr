@@ -2079,7 +2079,16 @@ class DHTNode:
         for skill in own_skills:
             self._own_skills[skill.name] = skill
         logger.info(f"Reloaded {len(self._own_skills)} own skills from storage")
-        
+
+        # v0.57.0: Plugin on_init lifecycle dispatch.
+        # PluginLoader constructs plugin instances but never drove an init
+        # phase, so transport plugins that need to wire pool seams at startup
+        # (Tor) had nowhere to plug in. Runs AFTER context backfill
+        # (storage_path, sign_document, bus, group_engine) and BEFORE background
+        # loops start, so plugin wiring is in place when heartbeat/writer/pool
+        # loops begin using the seams. Plugins opt in by defining on_init.
+        await self._plugins.dispatch_init(self)
+
         self.background_tasks.append(asyncio.create_task(self._heartbeat_loop()))
         self.background_tasks.append(asyncio.create_task(self._settlement_consumer_loop()))
         self.background_tasks.append(asyncio.create_task(self._republish_loop()))
