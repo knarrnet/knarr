@@ -43,6 +43,7 @@ _KNOWN_SECTIONS = frozenset({
     "static",
     "peer_overrides",
     "identities",
+    "tor",  # v1.1 Tor plugin (SPEC-tor-plugin.md §4)
 })
 
 def merge_defaults(defaults: dict, overrides: dict) -> dict:
