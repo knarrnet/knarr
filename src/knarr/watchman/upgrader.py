@@ -77,6 +77,31 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+def _rename_watchman_exe_for_upgrade() -> Optional[str]:
+    """B-03: On Windows, rename the locked knarr-watchman.exe before pip reinstall.
+
+    pip --force-reinstall cannot overwrite a locked .exe on Windows. Renaming
+    a locked file IS allowed on Windows — the OS deletes the renamed file once
+    the last handle closes (on process exit). The new .exe is written cleanly
+    by pip into the original path.
+
+    Returns the backup path if renamed, None if not Windows or exe not found.
+    """
+    if sys.platform != "win32":
+        return None
+    exe = shutil.which("knarr-watchman")
+    if not exe or not exe.lower().endswith(".exe"):
+        return None
+    backup = exe + ".old"
+    try:
+        os.rename(exe, backup)
+        log.info("UPGRADE_WIN_EXE_RENAME src=%s dst=%s", exe, backup)
+        return backup
+    except OSError as e:
+        log.warning("UPGRADE_WIN_EXE_RENAME_FAIL exe=%s error=%s — pip may fail on Windows", exe, e)
+        return None
+
+
 def _install_from_tarball(tarball_path: str) -> None:
     """Install knarr from a source tarball using pip."""
     log.info("UPGRADE_INSTALL tarball=%s", tarball_path)
@@ -238,6 +263,10 @@ class Upgrader:
         # --- SWAP ---
         log.info("UPGRADE_SWAP stopping_node")
         await self._supervisor._terminate()
+
+        # B-03: rename locked knarr-watchman.exe before pip on Windows.
+        # pip --force-reinstall cannot overwrite a locked exe; rename allows it.
+        _rename_watchman_exe_for_upgrade()
 
         try:
             loop = asyncio.get_running_loop()

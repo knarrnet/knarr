@@ -52,6 +52,9 @@ def _is_winerror_10054(exc: BaseException) -> bool:
     return isinstance(exc, OSError) and getattr(exc, "winerror", None) == 10054
 
 
+# Identity ContextVar: set once per inbound request at the connection handler entry
+# point; reset to None in the finally block. Access via DHTNode accessors or
+# PluginContext helpers only — never import this directly from outside dht/node.py.
 _current_identity: ContextVar[Optional[Any]] = ContextVar("identity", default=None)
 
 
@@ -1883,6 +1886,8 @@ class DHTNode:
         self._write_event = asyncio.Event()
         # Share node's 32+ thread pool as default executor — prevents asyncio.to_thread
         # and run_in_executor(None) from starving on the default 5-8 thread pool at scale.
+        # Do not remove until all call sites use explicit to_protocol_thread /
+        # to_handler_thread — the default pool (5-8 threads) is too small for production.
         self._main_loop.set_default_executor(self._handler_pool)
 
         # C-02: Resolve and generate TLS cert BEFORE starting server
