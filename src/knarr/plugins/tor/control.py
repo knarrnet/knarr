@@ -547,6 +547,15 @@ class AsyncControlPort:
             self._fail_pending_reply(
                 ControlPortError("control port event loop exited")
             )
+            # CR-TOR-2: emit bus event on control port disconnect (abrupt kill or
+            # EOF). Callers subscribed to tor.daemon_unreachable can react (e.g.
+            # stop accepting new .onion tasks, alert operator). Same event as the
+            # SOCKS5 connect-failure path — daemon is gone either way.
+            if self._bus_emit:
+                try:
+                    self._bus_emit("tor.daemon_unreachable")
+                except Exception:
+                    pass
 
     def _fail_pending_reply(self, exc: BaseException) -> None:
         """Wake any in-flight _send_command caller with an error."""

@@ -1778,7 +1778,35 @@ class DHTNode:
         # that explicitly so callers receive a retriable asyncio.TimeoutError
         # instead of a RuntimeError("Unexpected response type: NoneType") → HTTP 500.
         ack_timeout = min(60.0, timeout_ms / 1000.0)
-        resp = await request_response(provider_host, provider_port, req, timeout=ack_timeout, ssl_context=self._client_ssl_ctx)
+        # CR-TOR-1: route .onion task submissions through pool's SOCKS5 dialer.
+        # Zero impact on clearnet: endswith('.onion') short-circuits to False.
+        # Zero impact if Tor plugin absent: getattr returns None → falls through.
+        _pool_tor_dialer = getattr(self._pool, '_tor_dialer', None) if provider_host.endswith('.onion') else None
+        if _pool_tor_dialer is not None:
+            resp = None
+            try:
+                _pair = await asyncio.wait_for(
+                    _pool_tor_dialer(provider_host, provider_port, self._client_ssl_ctx, peer_id=provider_node_id),
+                    timeout=ack_timeout + 5.0,
+                )
+                if _pair is not None:
+                    _reader, _writer = _pair
+                    logger.info("TOR_DIAL_CONNECT host=%s", provider_host)
+                    try:
+                        await send_message(_writer, req)
+                        resp = await asyncio.wait_for(receive_message(_reader), timeout=ack_timeout)
+                    except Exception:
+                        resp = None
+                    finally:
+                        try:
+                            _writer.close()
+                            await _writer.wait_closed()
+                        except Exception:
+                            pass
+            except Exception:
+                resp = None
+        else:
+            resp = await request_response(provider_host, provider_port, req, timeout=ack_timeout, ssl_context=self._client_ssl_ctx)
         if resp is None:
             raise asyncio.TimeoutError(
                 f"Provider {provider_host}:{provider_port} did not acknowledge task within {ack_timeout:.0f}s"

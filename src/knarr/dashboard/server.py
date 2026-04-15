@@ -910,6 +910,14 @@ class CockpitServer:
                 provider["host"] = peer.host
                 provider["port"] = peer.port
             if not provider.get("host"):
+                # G18: peer_overrides fallback before 404 — onion-only peers may not
+                # be in the peer table but can be operator-configured via [peer_overrides].
+                _h, _p = self._node.resolve_peer(target_id, "", 0)
+                if _h:
+                    logger.debug("G18_PEER_OVERRIDE_NOTINTABLE node_id=%s host=%s", target_id[:16], _h)
+                    provider["host"] = _h
+                    provider["port"] = _p
+            if not provider.get("host"):
                 self._respond_error(writer, 404, f"Cannot resolve address for node {target_id[:16]}...")
                 return
 
