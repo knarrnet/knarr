@@ -3344,9 +3344,9 @@ class Storage:
         """SA-02: Async fallback for get_peer_by_id. No thread offload."""
         return self.get_peer_by_id(node_id)
 
-    async def async_query_all_active_skills(self, skill_name=None, tag=None, limit=None):
+    async def async_query_all_active_skills(self, peer_timeout: float = 300, limit: int = 2000):
         """SA-02: Async fallback for query_all_active_skills. No thread offload."""
-        return self.query_all_active_skills(skill_name, tag, limit)
+        return self.query_all_active_skills(peer_timeout, limit)
 
     async def async_get_own_skills(self):
         """SA-02: Async fallback for get_own_skills. No thread offload."""

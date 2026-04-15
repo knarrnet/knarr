@@ -97,22 +97,17 @@ class StorageCacheProxy:
         key = f"peers:id:{node_id}"
         return self._cached_read(key, lambda: self._storage.get_peer_by_id(node_id), self._peers_ttl)
 
-    def query_all_active_skills(self, skill_name=None, tag=None, limit=None):
-        cache_key = f"skills:all:{skill_name}:{tag}:{limit}"
+    def query_all_active_skills(self, peer_timeout: float = 300, limit: int = 2000):
+        cache_key = f"skills:all:{peer_timeout}:{limit}"
         return self._cached_read(
             cache_key,
-            lambda: self._storage.query_all_active_skills(skill_name, tag, limit),
+            lambda: self._storage.query_all_active_skills(peer_timeout, limit),
             self._skills_ttl,
         )
 
     def get_own_skills(self):
         return self._cached_read(
             "skills:own", self._storage.get_own_skills, self._own_skills_ttl
-        )
-
-    def get_economy_stats(self):
-        return self._cached_read(
-            "economy:stats", self._storage.get_economy_stats, self._economy_ttl
         )
 
     def get_ledger_balance(self, peer_key: str):
@@ -144,12 +139,9 @@ class StorageCacheProxy:
 
     def upsert_skill(self, *args, **kwargs):
         result = self._storage.upsert_skill(*args, **kwargs)
-        # Granular: only invalidate specific skill entries, not the full catalog.
-        # skills:all expires via TTL (60s). At 150 nodes × 8 skills, prefix
-        # invalidation fires 1200 times during join — cache never gets a hit.
-        skill_key = args[0] if args else None
-        if skill_key:
-            self._invalidate_key(f"skills:all:{skill_key}:None:None")
+        # skills:all catalog entry refreshes via 60s TTL — prefix invalidation
+        # here caused cache thrashing at 150 nodes × 8 skills = 1200 invalidations
+        # during join burst. Trade-off: up to 60s staleness for new skills.
         self._invalidate_key("skills:own")
         return result
 

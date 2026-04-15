@@ -70,19 +70,31 @@ def test_cache_miss_hits_db():
 # ──────────────────────────────────────────────────────────────────────────────
 
 def test_write_invalidates_cache():
-    """upsert_peer must invalidate all peers:* cache entries."""
+    """upsert_peer uses granular invalidation — only peers:id:<node_id> is
+    invalidated, peers:all refreshes via 30s TTL. Avoids cache thrashing
+    at 150 nodes × 15 upserts/sec (v0.53.0 regression fix)."""
     proxy, mock_storage = make_proxy()
+    mock_storage.get_peer_by_id.return_value = {"node_id": "b" * 64}
 
+    # Seed peers:all and peers:id:<b*64>
+    _ = proxy.get_peers()
+    _ = proxy.get_peer_by_id("b" * 64)
+    assert mock_storage.get_peers.call_count == 1
+    assert mock_storage.get_peer_by_id.call_count == 1
+
+    # Upsert with a NodeInfo-shaped object (current API: upsert_peer(node))
+    peer_obj = MagicMock()
+    peer_obj.node_id = "b" * 64
+    proxy.upsert_peer(peer_obj)
+    mock_storage.upsert_peer.assert_called_once_with(peer_obj)
+
+    # peers:id:<b*64> invalidated — next lookup hits DB
+    _ = proxy.get_peer_by_id("b" * 64)
+    assert mock_storage.get_peer_by_id.call_count == 2
+
+    # peers:all NOT invalidated (TTL-only) — next get_peers still cached
     _ = proxy.get_peers()
     assert mock_storage.get_peers.call_count == 1
-
-    # Write invalidates
-    proxy.upsert_peer("b" * 64, "1.2.3.4", 9001, time.time())
-    mock_storage.upsert_peer.assert_called_once()
-
-    # Next read should hit DB again
-    _ = proxy.get_peers()
-    assert mock_storage.get_peers.call_count == 2
 
 
 # ──────────────────────────────────────────────────────────────────────────────

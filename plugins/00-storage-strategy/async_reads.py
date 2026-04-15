@@ -53,9 +53,9 @@ class AsyncStorageMixin:
         self._misses += 1
         return result
 
-    async def async_query_all_active_skills(self, skill_name=None, tag=None, limit=None):
+    async def async_query_all_active_skills(self, peer_timeout: float = 300, limit: int = 2000):
         """SA-02: Offload query_all_active_skills to thread on cache miss."""
-        key = f"skills:all:{skill_name}:{tag}:{limit}"
+        key = f"skills:all:{peer_timeout}:{limit}"
         entry = self._cache.get(key)
         if entry is not None:
             value, expires_at = entry
@@ -63,7 +63,7 @@ class AsyncStorageMixin:
                 self._hits += 1
                 return value
         result = await asyncio.to_thread(
-            self._storage.query_all_active_skills, skill_name, tag, limit
+            self._storage.query_all_active_skills, peer_timeout, limit
         )
         self._cache[key] = (result, time.monotonic() + self._skills_ttl)
         self._misses += 1
