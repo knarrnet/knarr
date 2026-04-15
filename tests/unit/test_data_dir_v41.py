@@ -150,4 +150,7 @@ def test_plugin_state_writes_to_plugin_dir_when_data_dir_is_unset(tmp_path):
     loader.load_plugins()
 
     assert (plugin_dir / "state.txt").exists()
-    assert loader.plugins[0]._ctx.state_dir == plugin_dir
+    # Filter out package-fallback plugins (tor, bcw, punchhole-*) — we only
+    # care about the fixture's demo-plugin.
+    demo = next(p for p in loader.plugins if p.__class__.__name__ == "DemoPlugin")
+    assert demo._ctx.state_dir == plugin_dir

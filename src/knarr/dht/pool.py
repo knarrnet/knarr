@@ -87,8 +87,6 @@ class ConnectionPool:
         # Synchronous lookup callable — only invoked via run_in_executor.
         self._peer_pubkey_lookup: Optional[Callable[[str], Optional[str]]] = None
         # T1-57-04 (v0.57.0): named pool for pubkey async refill — never use None executor.
-        # max_workers=2: prevents deadlock if a lookup callback submits back to this pool.
-        # Callbacks must not chain more than one level deep on this pool.
         self._pubkey_lookup_pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="knarr-pool-pubkey"
         )
