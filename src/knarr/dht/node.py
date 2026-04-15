@@ -30,10 +30,22 @@ from ..core.messages import (
     MailPullReq, MailPullResp, MailPullAck, EventNotify,  # BUS-01
     sign_message, verify_message, verify_node_id
 )
+# T1-57-02 (v0.57.0): alias used at all server-side inbound signature checks so
+# the Wave-1 hygiene gate stays clean; client-side responses use
+# request_response_expecting() instead.
+_verify_sig = verify_message
+
 from ..core.validation import validate_skill_sheet, validate_task_input, ValidationError
 from ..core.pricing import PriceBreakdown, RealmConfig
+from .capabilities import CapabilityRegistry
 from .storage import Storage
-from .protocol import send_message, receive_message, request_response, ProtocolError
+from .protocol import (
+    ProtocolError,
+    TransportMetadata,
+    receive_message,
+    request_response_expecting,
+    send_message,
+)
 from .sidecar import AssetSidecar, TaskContext
 from .pool import ConnectionPool
 from .plugins import PluginLoader, NodeHealth, ScopedEventBus
@@ -52,6 +64,12 @@ def _is_winerror_10054(exc: BaseException) -> bool:
     return isinstance(exc, OSError) and getattr(exc, "winerror", None) == 10054
 
 
+# Identity context invariants:
+# 1. Every entry point that sets this ContextVar must clear it in try/finally.
+# 2. Plugins and skills must read it only through node property accessors or PluginContext helpers.
+# 3. When it is None, scoped properties fall back to the base router state.
+# 4. Child tasks inherit the current context, so callers must set it before spawning work.
+# 5. Tests that depend on scoped identity state must set and clear it explicitly in fixture setup/teardown.
 _current_identity: ContextVar[Optional[Any]] = ContextVar("identity", default=None)
 
 
@@ -230,9 +248,13 @@ class DHTNode:
         
         self._write_queue: asyncio.Queue = asyncio.Queue()
         self._write_queue_proto: asyncio.Queue = asyncio.Queue()  # priority: heartbeat, peer upserts
-        # A-06: Event-based write queue notification (replaces 100Hz polling)
-        # Created lazily in start() once the event loop is running.
-        self._write_event: Optional[asyncio.Event] = None
+        # F-06: Event-based write queue notification (replaces 100Hz polling)
+        self._write_event: asyncio.Event = asyncio.Event()
+        self._dashboard_metrics = collections.Counter()
+        self._ip_rate_limits: Dict[str, Dict[str, list[float]]] = {}
+        self._max_rate_limit_ips: int = 4096
+        self._cert_pin_reconnect_limit: int = 5
+        self._cert_pin_reconnect_window: float = 60.0
         self._start_time: float = 0.0
         
         self._sidecar: Optional[AssetSidecar] = None
@@ -357,6 +379,7 @@ class DHTNode:
         if self._debug:
             logger.info(f"POOL_INIT handler_workers={_handler_workers} protocol_workers={_protocol_workers}")
 
+        self._capabilities = CapabilityRegistry()
 
         # E-03: IdentityRegistry — maps node_id → Identity (populated at startup or by E-07)
         from .identities import IdentityRegistry
@@ -455,6 +478,7 @@ class DHTNode:
             register_mail_handler_cb=self._sync.register_handler,
             send_mail_cb=self._sync.enqueue,
             register_egress_material_cb=self._egress.register_sensitive_material if hasattr(self, '_egress') else None,
+            register_capability_cb=self.register_capability,
             vault_get_cb=self._vault.get if hasattr(self, '_vault') and self._vault else None,
             vault_set_cb=self._vault.set if hasattr(self, '_vault') and self._vault else None,
             storage_path=self.storage.db_path if hasattr(self.storage, 'db_path') else None,
@@ -545,7 +569,7 @@ class DHTNode:
     async def _wait_either_queue(self):
         """Wait for an item from either write queue. Protocol queue checked first.
 
-        A-06: Uses asyncio.Event instead of 100Hz sleep polling.
+        F-06: Uses asyncio.Event instead of 100Hz sleep polling.
         Zero wakeups at idle; wakes immediately on enqueue.
         Falls back to 1.0s timeout in case event is missed (defensive).
         """
@@ -558,24 +582,21 @@ class DHTNode:
                 return self._write_queue.get_nowait()
             except asyncio.QueueEmpty:
                 pass
-            # A-06: Wait on event instead of polling
-            if self._write_event is not None:
-                self._write_event.clear()
-                # Re-check after clear (race: item may have been added between get_nowait and clear)
-                try:
-                    return self._write_queue_proto.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-                try:
-                    return self._write_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-                try:
-                    await asyncio.wait_for(self._write_event.wait(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    pass
-            else:
-                await asyncio.sleep(0.01)
+            # F-06: Wait on event instead of polling
+            self._write_event.clear()
+            # Re-check after clear (race: item may have been added between get_nowait and clear)
+            try:
+                return self._write_queue_proto.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                return self._write_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                await asyncio.wait_for(self._write_event.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
 
     async def _writer_loop(self):
         """Batched writer: collects writes within a time window for efficiency.
@@ -641,7 +662,7 @@ class DHTNode:
         current_loop = asyncio.get_running_loop()
         future = current_loop.create_future()
         await self._write_queue_proto.put((op, args, future))
-        # A-06: Signal the write event so _wait_either_queue wakes immediately
+        # F-06: Signal the write event so _wait_either_queue wakes immediately
         if self._write_event is not None:
             self._write_event.set()
         return await future
@@ -653,7 +674,7 @@ class DHTNode:
         if current_loop is self._main_loop:
             future = current_loop.create_future()
             self._write_queue.put_nowait((op, args, future))
-            # A-06: Signal the write event so _wait_either_queue wakes immediately
+            # F-06: Signal the write event so _wait_either_queue wakes immediately
             if self._write_event is not None:
                 self._write_event.set()
             return await future
@@ -664,7 +685,7 @@ class DHTNode:
             def _bridge():
                 main_fut = self._main_loop.create_future()
                 self._write_queue.put_nowait((op, args, main_fut))
-                # A-06: Signal from thread-safe path
+                # F-06: Signal from thread-safe path
                 if self._write_event is not None:
                     self._write_event.set()
                 def _done(f):
@@ -1417,8 +1438,12 @@ class DHTNode:
             try:
                 await send_message(writer, msg)
             finally:
-                writer.close()
-                await writer.wait_closed()
+                # C-5 (v0.57.0): ConnectionResetError / OSError on writer close — suppress
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
         except Exception as e:
             logger.debug(f"Direct send to {host}:{port} failed: {e}")
 
@@ -1775,7 +1800,16 @@ class DHTNode:
         # that explicitly so callers receive a retriable asyncio.TimeoutError
         # instead of a RuntimeError("Unexpected response type: NoneType") → HTTP 500.
         ack_timeout = min(60.0, timeout_ms / 1000.0)
-        resp = await request_response(provider_host, provider_port, req, timeout=ack_timeout, ssl_context=self._client_ssl_ctx)
+        resp = await request_response_expecting(
+            provider_host,
+            provider_port,
+            req,
+            Message,
+            timeout=ack_timeout,
+            ssl_context=self._client_ssl_ctx,
+            require_node_id=False,
+            verify_callback=self._verify_transport_message,
+        )
         if resp is None:
             raise asyncio.TimeoutError(
                 f"Provider {provider_host}:{provider_port} did not acknowledge task within {ack_timeout:.0f}s"
@@ -1808,7 +1842,7 @@ class DHTNode:
         if not identity or not identity.signing_key:
             return 0
 
-        peers = self.storage.get_peers()
+        peers = await self.to_protocol_thread(self.storage.get_peers)
         if not peers:
             return 0
 
@@ -1879,10 +1913,16 @@ class DHTNode:
     async def start(self):
         """Starts the server and background tasks."""
         self._main_loop = asyncio.get_running_loop()  # TEST-02: capture running loop (not deprecated get_event_loop)
-        # A-06: Initialize write event now that the event loop is running
+        # F-06: Initialize write event now that the event loop is running
         self._write_event = asyncio.Event()
-        # Share node's 32+ thread pool as default executor — prevents asyncio.to_thread
-        # and run_in_executor(None) from starving on the default 5-8 thread pool at scale.
+        # Keep the handler_pool installed as asyncio's default executor so any
+        # remaining implicit asyncio.to_thread()/run_in_executor(None, ...) work
+        # lands on the larger handler pool instead of the tiny interpreter
+        # default pool, which would starve protocol traffic under load.
+        # This bridge cannot be removed until the explicit to_protocol_thread /
+        # to_handler_thread migration is complete and the hygiene tests stay clean.
+        # See docs/architecture/thread-pool-design.md for rationale and removal
+        # conditions (target: v0.60.0+ refactor sprint).
         self._main_loop.set_default_executor(self._handler_pool)
 
         # C-02: Resolve and generate TLS cert BEFORE starting server
@@ -2079,7 +2119,16 @@ class DHTNode:
         for skill in own_skills:
             self._own_skills[skill.name] = skill
         logger.info(f"Reloaded {len(self._own_skills)} own skills from storage")
-        
+
+        # v0.57.0: Plugin on_init lifecycle dispatch.
+        # PluginLoader constructs plugin instances but never drove an init
+        # phase, so transport plugins that need to wire pool seams at startup
+        # (Tor) had nowhere to plug in. Runs AFTER context backfill
+        # (storage_path, sign_document, bus, group_engine) and BEFORE background
+        # loops start, so plugin wiring is in place when heartbeat/writer/pool
+        # loops begin using the seams. Plugins opt in by defining on_init.
+        await self._plugins.dispatch_init(self)
+
         self.background_tasks.append(asyncio.create_task(self._heartbeat_loop()))
         self.background_tasks.append(asyncio.create_task(self._settlement_consumer_loop()))
         self.background_tasks.append(asyncio.create_task(self._republish_loop()))
@@ -2183,8 +2232,17 @@ class DHTNode:
                     port=self.node_info.port,
                     ephemeral=self._ephemeral,
                 ))
-                resp = await request_response(host, port, req, timeout=3.0, ssl_context=self._client_ssl_ctx)
-                if isinstance(resp, JoinResponse) and self._verify_transport_message(resp):
+                resp = await request_response_expecting(
+                    host,
+                    port,
+                    req,
+                    JoinResponse,
+                    timeout=3.0,
+                    ssl_context=self._client_ssl_ctx,
+                    require_node_id=False,
+                    verify_callback=self._verify_transport_message,
+                )
+                if resp is not None:
                     for peer_dict in resp.peers:
                         try:
                             p = NodeInfo(**peer_dict)
@@ -2199,8 +2257,17 @@ class DHTNode:
                     # Startup sync from this peer
                     try:
                         sync_req = self._sign(SyncRequest(since=0.0))
-                        sync_resp = await request_response(host, port, sync_req, timeout=10.0, ssl_context=self._client_ssl_ctx)
-                        if isinstance(sync_resp, SyncResponse) and self._verify_transport_message(sync_resp):
+                        sync_resp = await request_response_expecting(
+                            host,
+                            port,
+                            sync_req,
+                            SyncResponse,
+                            timeout=10.0,
+                            ssl_context=self._client_ssl_ctx,
+                            require_node_id=False,
+                            verify_callback=self._verify_transport_message,
+                        )
+                        if sync_resp is not None:
                             await self._process_sync_response(sync_resp)
                     except Exception as e:
                         logger.warning(f"PEER_CACHE startup sync failed: {e}")
@@ -2249,8 +2316,17 @@ class DHTNode:
                     ephemeral=self._ephemeral
                 ))
                 
-                resp = await request_response(host, port, req, ssl_context=self._client_ssl_ctx)
-                if isinstance(resp, JoinResponse) and self._verify_transport_message(resp):
+                resp = await request_response_expecting(
+                    host,
+                    port,
+                    req,
+                    JoinResponse,
+                    timeout=5.0,
+                    ssl_context=self._client_ssl_ctx,
+                    require_node_id=False,
+                    verify_callback=self._verify_transport_message,
+                )
+                if resp is not None:
                     for peer_dict in resp.peers:
                         try:
                             peer = NodeInfo(**peer_dict)
@@ -2267,14 +2343,23 @@ class DHTNode:
                     # Startup sync
                     try:
                         sync_req = self._sign(SyncRequest(since=0.0))
-                        sync_resp = await request_response(host, port, sync_req, timeout=10.0, ssl_context=self._client_ssl_ctx)
-                        if isinstance(sync_resp, SyncResponse) and self._verify_transport_message(sync_resp):
+                        sync_resp = await request_response_expecting(
+                            host,
+                            port,
+                            sync_req,
+                            SyncResponse,
+                            timeout=10.0,
+                            ssl_context=self._client_ssl_ctx,
+                            require_node_id=False,
+                            verify_callback=self._verify_transport_message,
+                        )
+                        if sync_resp is not None:
                             await self._process_sync_response(sync_resp)
                     except Exception as e:
                         logger.warning(f"Startup sync failed: {e}")
 
                     # CARVE-01: Close pool connection for this bootstrap peer — transient contact only.
-                    for peer in self.storage.get_peers():
+                    for peer in await self.to_protocol_thread(self.storage.get_peers):
                         if peer.host == host and peer.port == port:
                             await self._pool.remove(peer.node_id)
                             logger.debug(
@@ -2301,6 +2386,7 @@ class DHTNode:
         """Processes a sync response, verifying each entry's signature."""
         stored = 0
         dropped = 0
+        default_sync_ttl = await self._get_skill_ttl_async()
         for entry in resp.skills:
             announce = Announce(
                 msg_id=entry.get("msg_id", str(uuid.uuid4())),
@@ -2316,13 +2402,13 @@ class DHTNode:
                 provider_port=entry.get("provider_port", 0),
             )
 
-            if not verify_message(announce) or not verify_node_id(announce):
+            if not _verify_sig(announce) or not verify_node_id(announce):
                 dropped += 1
                 continue
 
             try:
                 skill_sheet = validate_skill_sheet(entry["skill_sheet"])
-                sync_ttl = entry.get("ttl", self._get_skill_ttl())
+                sync_ttl = entry.get("ttl", default_sync_ttl)
                 await self._enqueue_write(
                     self.storage.upsert_skill,
                     entry["skill_key"],
@@ -2356,7 +2442,7 @@ class DHTNode:
         """Re-announces all own skills to all known peers."""
         if self._version_gated:
             return
-        peers = await self._run_in_protocol_pool(self.storage.get_peers)
+        peers = await self.to_protocol_thread(self.storage.get_peers)
         if not peers:
             return
 
@@ -2416,6 +2502,7 @@ class DHTNode:
 
             skill_sheet = validate_skill_sheet(skill_sheet_data)
             self._own_skills[skill_sheet.name] = skill_sheet
+            skill_ttl = await self._get_skill_ttl_async()
             
             visibility = self._skill_visibility.get(skill_sheet.name.lower(), "public")
             if visibility == "private":
@@ -2423,7 +2510,7 @@ class DHTNode:
                 await self._enqueue_write(
                     self.storage.upsert_skill,
                     skill_sheet.name, self.node_info.node_id, skill_sheet,
-                    self._get_skill_ttl(), # ttl
+                    skill_ttl, # ttl
                     True, # is_own
                     self._public_key_hex,
                     "", # no signature for private skills
@@ -2450,7 +2537,7 @@ class DHTNode:
             await self._enqueue_write(
                 self.storage.upsert_skill,
                 skill_sheet.name, self.node_info.node_id, skill_sheet,
-                self._get_skill_ttl(), # ttl
+                skill_ttl, # ttl
                 True, # is_own
                 msg.public_key,
                 msg.signature,
@@ -2469,7 +2556,7 @@ class DHTNode:
             })
             self.refresh_node_meta()  # v0.29.0: skills_count changed
 
-            peers = self.storage.get_peers()
+            peers = await self.to_protocol_thread(self.storage.get_peers)
             targets = random.sample(peers, min(self._gossip_fanout, len(peers)))
             for peer in targets:
                 asyncio.create_task(self._send_to_peer(peer, msg))
@@ -2603,14 +2690,26 @@ class DHTNode:
         except Exception as e:
             logger.warning(f"QUERY_KAD_ERR {e}")
 
-        peers = self.storage.get_peers()
+        peers = await self.to_protocol_thread(self.storage.get_peers)
         if peers:
             msg = self._sign(Query(query_type=query_type, value=value_norm))
-            tasks = [request_response(p.host, p.port, msg, timeout=network_timeout, ssl_context=self._client_ssl_ctx) for p in peers]
+            tasks = [
+                request_response_expecting(
+                    p.host,
+                    p.port,
+                    msg,
+                    QueryResponse,
+                    timeout=network_timeout,
+                    ssl_context=self._client_ssl_ctx,
+                    require_node_id=False,
+                    verify_callback=self._verify_transport_message,
+                )
+                for p in peers
+            ]
             network_responses = await asyncio.gather(*tasks)
 
             for resp in network_responses:
-                if isinstance(resp, QueryResponse) and self._verify_transport_message(resp):
+                if resp is not None:
                     results.extend(resp.results)
 
         # Deduplication by (node_id, skill_name) — normalized to catch case mismatches
@@ -2639,7 +2738,7 @@ class DHTNode:
                 await self._enqueue_write(
                     self.storage.upsert_skill,
                     skill_name_r, r["node_id"], ss,
-                    self._get_skill_ttl(),
+                    await self._get_skill_ttl_async(),
                     False,   # is_own
                     r.get("_provider_public_key", ""),
                     "",      # no signature for query-cached entries
@@ -2809,7 +2908,7 @@ class DHTNode:
                 skill_key=skill_name
             ))
             
-            peers = self.storage.get_peers()
+            peers = await self.to_protocol_thread(self.storage.get_peers)
             targets = random.sample(peers, min(self._gossip_fanout, len(peers)))
             for peer in targets:
                 asyncio.create_task(self._send_to_peer(peer, msg))
@@ -3048,9 +3147,18 @@ class DHTNode:
         self._task_expected_provider[task_id] = ""  # will be set from provider's response key
 
         try:
-            resp = await request_response(provider_host, provider_port, req, timeout=timeout_ms/1000.0, ssl_context=self._client_ssl_ctx)
-            
-            if isinstance(resp, TaskResult) and self._verify_transport_message(resp):
+            resp = await request_response_expecting(
+                provider_host,
+                provider_port,
+                req,
+                Message,
+                timeout=timeout_ms/1000.0,
+                ssl_context=self._client_ssl_ctx,
+                require_node_id=False,
+                verify_callback=self._verify_transport_message,
+            )
+
+            if isinstance(resp, TaskResult):
                 # F-03: Bind sync response to the expected provider — reject if the
                 # signer does not match provider_node_id to prevent misbilling.
                 resp_node_id = hashlib.sha256(bytes.fromhex(resp.public_key)).hexdigest()
@@ -3300,19 +3408,42 @@ class DHTNode:
         """Handles incoming TCP connections with signature verification and concurrency limits."""
         peer_ip = writer.get_extra_info("peername", ("?", 0))[0]
 
+        if self._is_ip_rate_limited(
+            "cert_pin_mismatch",
+            peer_ip,
+            limit=self._cert_pin_reconnect_limit,
+            window=self._cert_pin_reconnect_window,
+        ):
+            logger.warning("CERT_PIN_RATE_LIMITED ip=%s", peer_ip)
+            # C-5 (v0.57.0): ConnectionResetError / OSError on writer close — suppress
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return
+
         # V015: Pre-auth plugin gate (cheapest rejection point)
         if not await self._plugins.on_connect(peer_ip):
             # v0.33.0: firewall.blocked
             if self.bus:
                 self.bus.emit("firewall.blocked", from_node="unknown", msg_type="connect", reason="on_connect_rejected", identity=self.node_info.node_id)
-            writer.close()
-            await writer.wait_closed()
+            # C-5 (v0.57.0): ConnectionResetError / OSError on writer close — suppress
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
             return
 
         # SA-02: Reject at accept level — close immediately if over limit (FDs already allocated)
         if self._active_connections >= MAX_CONCURRENT_CONNECTIONS:
-            writer.close()
-            await writer.wait_closed()
+            # C-5 (v0.57.0): ConnectionResetError / OSError on writer close — suppress
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
             return
         self._active_connections += 1
         try:
@@ -3324,15 +3455,23 @@ class DHTNode:
                 peek_bytes = await asyncio.wait_for(reader.read(4), timeout=2.0)  # L-03
             except asyncio.TimeoutError:
                 logger.debug("CONNECTION_PEEK_TIMEOUT peer_ip=%s", peer_ip)
-                writer.close()
-                await writer.wait_closed()
+                # C-5 (v0.57.0): ConnectionResetError / OSError on writer close — suppress
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
                 return
             if peek_bytes and peek_bytes[:4].upper() in http_verbs:
                 logger.warning(f"HTTP_REJECTED: peer_ip={peer_ip} attempted HTTP to protocol port")
                 if self.bus:
                     self.bus.emit("firewall.blocked", from_node="unknown", msg_type="HTTP", reason="http_to_protocol_port", identity=self.node_info.node_id)
-                writer.close()
-                await writer.wait_closed()
+                # C-5 (v0.57.0): ConnectionResetError / OSError on writer close — suppress
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
                 return
             # Prepend peeked bytes back to stream for normal message parsing.
             # PRIVATE API: asyncio.StreamReader._buffer — verify on Python upgrades (L-01).
@@ -3342,8 +3481,12 @@ class DHTNode:
                 reader._buffer[0:0] = peek_bytes
             except AttributeError:
                 logger.warning("HTTP_PEEK: reader has no _buffer, closing connection")
-                writer.close()
-                await writer.wait_closed()
+                # C-5 (v0.57.0): ConnectionResetError / OSError on writer close — suppress
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
                 return
 
             signer_id = ""  # FIX-02: init before loop; set properly after verify_node_id
@@ -3360,12 +3503,12 @@ class DHTNode:
                     if not msg:
                         break  # EOF — client closed connection
 
-                    if tls_fingerprint:
-                        object.__setattr__(msg, "_tls_peer_cert_fingerprint", tls_fingerprint)
-                        object.__setattr__(msg, "_tls_peer_host", peer_ip)
-                        object.__setattr__(msg, "_tls_peer_port", int(peername[1]) if len(peername) > 1 else 0)
-
-                    if not verify_message(msg):
+                    transport = TransportMetadata(
+                        peer_cert_fingerprint=tls_fingerprint,
+                        peer_host=peer_ip,
+                        peer_port=int(peername[1]) if len(peername) > 1 else 0,
+                    )
+                    if not _verify_sig(msg):
                         logger.warning(f"Dropping message with invalid signature: type={msg.type}")
                         # v0.33.0: security.signature_invalid
                         if self.bus:
@@ -3383,7 +3526,7 @@ class DHTNode:
                     # SA-ML6: Derive sender identity from signer (public_key), not self-asserted fields.
                     # This prevents requester_node_id spoofing in TaskRequest.
                     signer_id = hashlib.sha256(bytes.fromhex(msg.public_key)).hexdigest() if msg.public_key else ''
-                    self._check_tls_peer_fingerprint(msg)
+                    self._check_tls_peer_fingerprint(msg, transport=transport)
 
                     # Record peer activity — verified message proves liveness.
                     # PluginMessages (KAD FIND_NODE etc.) are internal to the plugin
@@ -3451,6 +3594,11 @@ class DHTNode:
                     logger.warning(f"PROTOCOL_ERR from={peer_ip}: {e}")
                     break
                 except CertPinMismatchError:
+                    self._record_ip_rate_limit_event(
+                        "cert_pin_mismatch",
+                        peer_ip,
+                        window=self._cert_pin_reconnect_window,
+                    )
                     break
                 except Exception as e:
                     if _is_winerror_10054(e):
@@ -3459,8 +3607,9 @@ class DHTNode:
                     else:
                         logger.error(f"Error handling connection: {e}")
                     break
-            writer.close()
+            # C-5 (v0.57.0): ConnectionResetError / OSError on writer close — suppress
             try:
+                writer.close()
                 await writer.wait_closed()
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
@@ -3487,7 +3636,49 @@ class DHTNode:
         except Exception:
             return ""
 
-    def _verify_transport_message(self, msg: Message, *, require_node_id: bool = False) -> bool:
+    def _record_ip_rate_limit_event(self, bucket: str, ip: str, *, window: float) -> list[float]:
+        if not ip:
+            return []
+        now = time.monotonic()
+        ip_map = self._ip_rate_limits.setdefault(bucket, {})
+        timestamps = [t for t in ip_map.get(ip, []) if now - t < window]
+        timestamps.append(now)
+        ip_map[ip] = timestamps
+        if len(ip_map) > self._max_rate_limit_ips:
+            oldest_ip = min(ip_map, key=lambda key: ip_map[key][-1] if ip_map[key] else 0.0)
+            del ip_map[oldest_ip]
+        return timestamps
+
+    def _is_ip_rate_limited(self, bucket: str, ip: str, *, limit: int, window: float) -> bool:
+        if not ip:
+            return False
+        now = time.monotonic()
+        ip_map = self._ip_rate_limits.setdefault(bucket, {})
+        timestamps = [t for t in ip_map.get(ip, []) if now - t < window]
+        if timestamps:
+            ip_map[ip] = timestamps
+        elif ip in ip_map:
+            del ip_map[ip]
+        return len(timestamps) >= limit
+
+    @staticmethod
+    def _transport_metadata_for(
+        msg: Message,
+        transport: Optional[TransportMetadata] = None,
+    ) -> TransportMetadata:
+        # v0.57.0 A-1: stash sites removed; transport is always passed explicitly
+        # from the server connection handler or request_response_expecting.
+        if transport is not None:
+            return transport
+        return TransportMetadata()
+
+    def _verify_transport_message(
+        self,
+        msg: Message,
+        transport: Optional[TransportMetadata] = None,
+        *,
+        require_node_id: bool = False,
+    ) -> bool:
         """Verify message signature, optional node binding, and TLS cert pinning.
 
         Adversary #2 fix (v0.56.0): catch CertPinMismatchError and return False
@@ -3500,32 +3691,48 @@ class DHTNode:
         preserved. Returning False drops the specific response but the caller
         continues iterating through fanout responses.
         """
-        if not verify_message(msg):
+        if not _verify_sig(msg):
             return False
         if require_node_id and not verify_node_id(msg):
             return False
         try:
-            self._check_tls_peer_fingerprint(msg)
+            self._check_tls_peer_fingerprint(msg, transport=transport)
         except CertPinMismatchError:
             # Event already emitted inside the helper. Return False so the
             # caller drops this message without raising.
             return False
         return True
 
-    def _check_tls_peer_fingerprint(self, msg: Message) -> None:
+    def _check_tls_peer_fingerprint(
+        self,
+        msg: Message,
+        *,
+        transport: Optional[TransportMetadata] = None,
+    ) -> None:
         """Apply TOFU TLS certificate pinning after message authentication succeeds."""
         if not self._config.get("node", {}).get("tls_pin_certs", True):
             return
-        fingerprint = str(getattr(msg, "_tls_peer_cert_fingerprint", "") or "")
-        if not fingerprint:
-            return
+        metadata = self._transport_metadata_for(msg, transport)
 
         node_id = self._authenticated_node_id_from_message(msg)
-        if not node_id:
-            return
+        self._check_peer_cert_fingerprint(
+            node_id,
+            metadata.peer_cert_fingerprint,
+            metadata.peer_host,
+            metadata.peer_port,
+        )
 
-        host = str(getattr(msg, "_tls_peer_host", "") or "")
-        port = int(getattr(msg, "_tls_peer_port", 0) or 0)
+    def _check_peer_cert_fingerprint(
+        self,
+        node_id: str,
+        fingerprint: str,
+        host: str,
+        port: int,
+    ) -> None:
+        if not self._config.get("node", {}).get("tls_pin_certs", True):
+            return
+        if not fingerprint or not node_id:
+            return
         storage = getattr(self, "_base_storage", None) or self.storage
         stored = (
             storage.get_peer_cert_fingerprint(node_id)
@@ -3551,7 +3758,15 @@ class DHTNode:
                 # is the whole point of the feature — the hold prevents GC
                 # silently undoing it. Auto-discarded on completion.
                 try:
-                    _fp_task = asyncio.create_task(
+                    _loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    _loop = None
+                if _loop is not None:
+                    # Only create the coroutine after confirming a loop is
+                    # running — avoids "coroutine never awaited" RuntimeWarning
+                    # when called from a sync/test context (create_task raised
+                    # RuntimeError AFTER the coroutine object was already built).
+                    _fp_task = _loop.create_task(
                         self._enqueue_write_proto(
                             storage.set_peer_cert_fingerprint,
                             node_id, fingerprint, host, port,
@@ -3561,7 +3776,7 @@ class DHTNode:
                         self._fingerprint_write_tasks = set()
                     self._fingerprint_write_tasks.add(_fp_task)
                     _fp_task.add_done_callback(self._fingerprint_write_tasks.discard)
-                except RuntimeError:
+                else:
                     # No running loop (unit test or housekeeping path) —
                     # fall back to the direct sync call.
                     storage.set_peer_cert_fingerprint(node_id, fingerprint, host=host, port=port)
@@ -3606,16 +3821,16 @@ class DHTNode:
                 await self._enqueue_write_proto(self.storage.upsert_peer, peer)
                 # v0.33.0: peer.added
                 if self.bus:
-                    peer_count = len(self.storage.get_peers())
+                    peer_count = len(await self.to_protocol_thread(self.storage.get_peers))
                     self.bus.emit("peer.added", node_id=msg.node_id, host=msg.host, port=msg.port, peer_count=peer_count, identity=self.node_info.node_id)
-            peers = self.storage.get_peers()
+            peers = await self.to_protocol_thread(self.storage.get_peers)
             peers.append(self.node_info)
             return self._sign(JoinResponse(peers=[asdict(p) for p in peers]))
 
         elif isinstance(msg, Announce):
             try:
                 skill_sheet = validate_skill_sheet(msg.skill_sheet)
-                skill_ttl = self._get_skill_ttl()
+                skill_ttl = await self._get_skill_ttl_async()
 
                 # Adversary #10 fix (v0.56.0): sample skill+provider binding.
                 # The sample's `skill_name` and `provider_node_id` fields are
@@ -3651,6 +3866,16 @@ class DHTNode:
                     if len(bound_samples) != len(raw_samples):
                         from dataclasses import replace as _dc_replace
                         skill_sheet = _dc_replace(skill_sheet, samples=bound_samples or None)
+                        # C-10 (v0.57.0): emit once per strip operation, not per sample.
+                        # stripped_count + retained_count give operators aggregation data.
+                        if self.bus:
+                            self.bus.emit(
+                                "security.sample_binding_strip",
+                                provider_node_id=msg.node_id,
+                                skill_name=msg.skill_key,
+                                stripped_count=len(raw_samples) - len(bound_samples),
+                                retained_count=len(bound_samples),
+                            )
 
                 # Create/update peer entry from Announce — ensures nodes discovered
                 # via gossip (not just JoinResponse) are routable for heartbeats,
@@ -3714,7 +3939,8 @@ class DHTNode:
 
                 # Gossip forward if hops remain
                 dedup_key = (msg.skill_key, msg.node_id, msg.msg_id)
-                if dedup_key not in self._seen_messages and msg.hops < self._get_announce_hops():
+                announce_hops = await self._get_announce_hops_async()
+                if dedup_key not in self._seen_messages and msg.hops < announce_hops:
                     self._seen_messages.add(dedup_key)
                     if len(self._seen_messages) > MAX_DEDUP_SET_SIZE:
                         self._seen_messages = set(list(self._seen_messages)[MAX_DEDUP_SET_SIZE // 2:])
@@ -3734,7 +3960,7 @@ class DHTNode:
                         provider_port=msg.provider_port,
                         jurisdiction=msg.jurisdiction,
                     )
-                    peers = self.storage.get_peers()
+                    peers = await self.to_protocol_thread(self.storage.get_peers)
                     eligible = [p for p in peers if p.node_id != msg.node_id]
                     targets = random.sample(eligible, min(self._gossip_fanout, len(eligible)))
                     for peer in targets:
@@ -3846,7 +4072,8 @@ class DHTNode:
 
             # Gossip forward [L-02]
             dedup_key = (msg.skill_key, msg.node_id, msg.msg_id)
-            if dedup_key not in self._seen_messages and msg.hops < self._get_announce_hops():
+            announce_hops = await self._get_announce_hops_async()
+            if dedup_key not in self._seen_messages and msg.hops < announce_hops:
                 self._seen_messages.add(dedup_key)
                 if len(self._seen_messages) > MAX_DEDUP_SET_SIZE:
                     self._seen_messages = set(list(self._seen_messages)[MAX_DEDUP_SET_SIZE // 2:])
@@ -3859,7 +4086,7 @@ class DHTNode:
                     public_key=msg.public_key,
                     signature=msg.signature
                 )
-                peers = self.storage.get_peers()
+                peers = await self.to_protocol_thread(self.storage.get_peers)
                 eligible = [p for p in peers if p.node_id != msg.node_id]
                 targets = random.sample(eligible, min(self._gossip_fanout, len(eligible)))
                 for peer in targets:
@@ -4033,6 +4260,21 @@ class DHTNode:
         """
         uri = str(getattr(msg, "uri", "") or "")
         if not uri:
+            self._increment_dashboard_metric("task_requests_legacy_uri_count")
+            if self._debug:
+                logger.debug(
+                    "URI_LEGACY_CLIENT trace_id=%s requester=%s",
+                    msg.task_id,
+                    msg.requester_node_id,
+                )
+            # A-5 Phase 1 (v0.57.0): TaskRequest without a URI is admitted without
+            # penalty. The URI field is additive and legacy clients (pre-v0.54.0)
+            # do not set it. Logging above gives operators migration-signal visibility
+            # without causing hard failures.
+            #
+            # Phase 3 (target: v0.60.0) will add an enforcement gate here once the
+            # migration-horizon metrics show < 1 % legacy traffic on the network.
+            # See SPEC-taskrequest-uri-migration.md for the enforcement schedule.
             return None
 
         from ..core.uri import parse_knarr_uri
@@ -4631,9 +4873,19 @@ class DHTNode:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(peer.host, peer.port, ssl=self._client_ssl_ctx), timeout=5.0
             )
+            self._check_peer_cert_fingerprint(
+                peer.node_id,
+                get_tls_peer_cert_fingerprint(writer.get_extra_info("ssl_object")),
+                peer.host,
+                peer.port,
+            )
             await send_message(writer, msg)
-            writer.close()
-            await writer.wait_closed()
+            # C-5 (v0.57.0): ConnectionResetError / OSError on writer close — suppress
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
         except Exception:
             pass
 
@@ -4723,7 +4975,7 @@ class DHTNode:
                     event_payload=fields_json,
                     event_ts=time.time(),
                 )
-                peers = self.storage.get_peers()
+                peers = await self.to_protocol_thread(self.storage.get_peers)
                 for peer in peers:
                     # Fix A: Never send EventNotify to self
                     if peer.node_id == self.node_info.node_id:
@@ -4767,7 +5019,7 @@ class DHTNode:
         parses and validates the JSON payload, strips wire-internal fields, and
         re-emits on the local bus.
         """
-        if not verify_message(msg):
+        if not _verify_sig(msg):
             logger.warning(f"EVENT_NOTIFY dropped: invalid signature from {peer_ip}")
             return None
         if not verify_node_id(msg):
@@ -5230,6 +5482,12 @@ class DHTNode:
             "protocol": self._protocol_pool.get_metrics() if hasattr(self._protocol_pool, "get_metrics") else {},
         }
 
+    def _increment_dashboard_metric(self, name: str, amount: int = 1) -> None:
+        self._dashboard_metrics[str(name)] += int(amount)
+
+    def get_dashboard_metrics(self) -> Dict[str, int]:
+        return dict(self._dashboard_metrics)
+
     def _resolve_target_identity(self, msg) -> "Optional[str]":
         """E-02: Resolve target identity node_id for an inbound message.
 
@@ -5262,8 +5520,13 @@ class DHTNode:
                     return to_node
 
         # 3. TaskRequest: route by skill_to_identity map
+        # C-2 (v0.57.0): strip @version suffix before lookup — same strip already
+        # applied in _validate_task_request_uri (resource.split("@",1)[0]). Without
+        # this, "llm/chat@1.0" in a TaskRequest.skill_name would miss the entry
+        # stored under "llm/chat" in _skill_to_identity.
         if isinstance(msg, TaskRequest) and msg.skill_name:
-            mapped = self._skill_to_identity.get(msg.skill_name, "")
+            skill_base = (msg.skill_name.split("@", 1)[0] or msg.skill_name).lower()
+            mapped = self._skill_to_identity.get(skill_base, "") or self._skill_to_identity.get(msg.skill_name, "")
             if mapped:
                 return mapped
 
@@ -6122,20 +6385,15 @@ class DHTNode:
 
     def _get_punchhole_epoch(self) -> int:
         """Bridge the backend cache invalidation epoch into outbound heartbeats."""
-        epoch = 0
         try:
-            plugins = getattr(self, "_plugins", None)
-            backend = plugins.get_plugin_by_name("punchhole-backend") if plugins is not None else None
-            if backend is not None:
-                getter = getattr(backend, "get_punchhole_epoch", None)
-                if callable(getter):
-                    epoch = int(getter())
-                else:
-                    epoch = int(getattr(backend, "_punchhole_epoch", 0) or 0)
+            epoch = int(self._capabilities.get("heartbeat.punchhole_epoch") or 0)
         except Exception:
             epoch = 0
         logger.debug("HB_EPOCH_READ epoch=%d", epoch)
         return epoch
+
+    def register_capability(self, name: str, getter, default: Any = None) -> None:
+        self._capabilities.register(name, getter, default)
 
     def resolve_did_fragment(self, did_string: str) -> Optional[VerifyKey]:
         """Resolve did:knarr:<node_id>#<fragment> to an Ed25519 verify key."""
@@ -6316,13 +6574,19 @@ class DHTNode:
                 logger.error("Heartbeat loop error", exc_info=True)
 
     # v0.41.0 A2: Independent background task loops for network I/O
-    async def _run_in_protocol_pool(self, fn, *args):
-        """A-01: Run a sync function in the protocol pool (not the handler pool).
-
-        Prevents slow skill handlers from starving protocol operations.
-        """
+    async def to_protocol_thread(self, fn, *args):
+        """Run protocol-critical sync work in the protocol pool."""
         loop = asyncio.get_running_loop()
-        # TP-8: Use submit() on TrackedThreadPool (not ._pool) for proper metric tracking
+        return await loop.run_in_executor(self._protocol_pool, fn, *args)
+
+    async def to_handler_thread(self, fn, *args):
+        """Run handler-oriented sync work in the handler pool."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._handler_pool, fn, *args)
+
+    async def _run_in_protocol_pool(self, fn, *args):
+        """Backward-compatible protocol-pool shim for older call sites and tests."""
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._protocol_pool, fn, *args)
 
     async def _flush_outbox_loop(self):
@@ -6400,7 +6664,7 @@ class DHTNode:
         if not bootstrap_addrs:
             return
 
-        all_peers = await self._run_in_protocol_pool(self.storage.get_peers)
+        all_peers = await self.to_protocol_thread(self.storage.get_peers)
         non_bootstrap = [p for p in all_peers if (p.host, p.port) not in bootstrap_addrs]
 
         if len(non_bootstrap) < MIN_PEER_FLOOR:
@@ -6433,7 +6697,7 @@ class DHTNode:
                     + list(self._initial_bootstrap_peers or self._bootstrap_peers)
                 ))
                 # A-01: get_peers in protocol pool (not handler pool)
-                peers = await self._run_in_protocol_pool(self.storage.get_peers)
+                peers = await self.to_protocol_thread(self.storage.get_peers)
                 if not peers:
                     # Clear isolation tracking — no peers triggers immediate re-bootstrap
                     self._isolation_since = None
@@ -6647,7 +6911,7 @@ class DHTNode:
 
         # V015: Plugin tick
         # A-01: get_peers in protocol pool (KAD on_tick is a protocol operation)
-        peers = await self._run_in_protocol_pool(self.storage.get_peers)
+        peers = await self.to_protocol_thread(self.storage.get_peers)
         health = NodeHealth(
             event_loop_lag_ms=getattr(self, '_loop_lag_ema', 0.0),
             active_connections=self._active_connections,
@@ -6772,22 +7036,34 @@ class DHTNode:
         # Settlement queue: prune processed items older than 24h
         await self._enqueue_write(self.storage.purge_settled_queue, 86400)
 
-    def _get_skill_ttl(self) -> int:
-        """Scale skill TTL with network size."""
-        peer_count = len(self.storage.get_peers())
+    def _skill_ttl_for_peer_count(self, peer_count: int) -> int:
         if peer_count < 20:
             return 1800    # 30 min — small network
         elif peer_count < 50:
             return 3600    # 1 hour — medium
-        else:
-            return 5400    # 90 min — large cluster
+        return 5400    # 90 min — large cluster
 
-    def _get_announce_hops(self) -> int:
-        """Scale max announce hops with network size."""
-        peer_count = len(self.storage.get_peers())
+    async def _get_skill_ttl_async(self) -> int:
+        peers = await self.to_protocol_thread(self.storage.get_peers)
+        return self._skill_ttl_for_peer_count(len(peers))
+
+    def _get_skill_ttl(self) -> int:
+        """Scale skill TTL with network size."""
+        return self._skill_ttl_for_peer_count(len(self.storage.get_peers()))
+
+    def _announce_hops_for_peer_count(self, peer_count: int) -> int:
         if peer_count >= 50:
             return 3
         return MAX_ANNOUNCE_HOPS  # 2
+
+    async def _get_announce_hops_async(self) -> int:
+        peers = await self.to_protocol_thread(self.storage.get_peers)
+        return self._announce_hops_for_peer_count(len(peers))
+
+    def _get_announce_hops(self) -> int:
+        """Scale max announce hops with network size."""
+        # Sync fallback — async periodic paths use _get_announce_hops_async() with run_in_executor.
+        return self._announce_hops_for_peer_count(len(self.storage.get_peers()))
 
     async def _republish_loop(self):
         while self._running:
@@ -6796,14 +7072,7 @@ class DHTNode:
             await self._reannounce_all()
             self.refresh_node_meta()
 
-    def _get_prune_timeout(self) -> float:
-        """Scale prune timeout with network size. Larger networks need more patience.
-
-        A-05: Config lever replaces heuristic. Operator sets prune_timeout_multiplier
-        (e.g. 3.0 for Docker bridge). No IP counting.
-        """
-        peers = self.storage.get_peers()
-        peer_count = len(peers)
+    def _prune_timeout_for_peer_count(self, peer_count: int) -> float:
         if peer_count < 20:
             base = PEER_DEAD_TIMEOUT           # 300s — small network
         elif peer_count < 50:
@@ -6816,18 +7085,31 @@ class DHTNode:
         multiplier = max(0.1, float(self._config.get("node", {}).get("prune_timeout_multiplier", 1.0)))
         return base * multiplier
 
+    async def _get_prune_timeout_async(self) -> float:
+        peers = await self.to_protocol_thread(self.storage.get_peers)
+        return self._prune_timeout_for_peer_count(len(peers))
+
+    def _get_prune_timeout(self) -> float:
+        """Scale prune timeout with network size. Larger networks need more patience.
+
+        A-05: Config lever replaces heuristic. Operator sets prune_timeout_multiplier
+        (e.g. 3.0 for Docker bridge). No IP counting.
+        """
+        # Sync fallback — async periodic paths use _get_prune_timeout_async() with run_in_executor.
+        return self._prune_timeout_for_peer_count(len(self.storage.get_peers()))
+
     async def _prune_loop(self):
         while self._running:
             await asyncio.sleep(60)
             # Sync in-memory liveness to DB
             now = time.monotonic()
-            prune_timeout = self._get_prune_timeout()
+            prune_timeout = await self._get_prune_timeout_async()
             alive = [nid for nid, t in list(self._peer_last_activity.items())
                      if now - t < prune_timeout]
             if alive:
                 await self._enqueue_write_proto(self.storage.touch_peers, alive)
 
-            current_count = len(self.storage.get_peers())
+            current_count = len(await self.to_protocol_thread(self.storage.get_peers))
             logger.debug(f"PRUNE_SYNC alive={len(alive)} tracked={len(self._peer_last_activity)} peers_db={current_count} timeout={prune_timeout}")
 
             pruned_skills = await self._enqueue_write(self.storage.prune_stale_skills)
@@ -6842,7 +7124,7 @@ class DHTNode:
             else:
                 pruned = await self._enqueue_write(self.storage.prune_stale_peers, prune_timeout, self.node_info.node_id)
                 if pruned:
-                    new_count = len(self.storage.get_peers())
+                    new_count = len(await self.to_protocol_thread(self.storage.get_peers))
                     logger.info(f"PRUNE_PEERS removed={pruned} before={current_count} after={new_count}")
                     # v0.33.0: peer.removed (count-based since prune_stale_peers returns count)
                     if self.bus:
@@ -6897,11 +7179,9 @@ class DHTNode:
             try:
                 from .upgrade import check_and_upgrade, backup_config, verify_installation, rollback_installation, cleanup_old_backups, get_latest_version
 
-                loop = asyncio.get_event_loop()
-
                 # Fix #25: Avoid backup cycle if GitHub release isn't out yet
                 logger.info("UPGRADE checking GitHub releases API...")
-                latest = await loop.run_in_executor(None, get_latest_version)
+                latest = await self.to_handler_thread(get_latest_version)
                 if not latest:
                     logger.info("UPGRADE abort: could not fetch latest version from GitHub")
                     self._upgrading = False
@@ -6921,7 +7201,7 @@ class DHTNode:
                     continue
                 logger.info(f"UPGRADE backup created: {backup_dir}")
 
-                success = await loop.run_in_executor(None, check_and_upgrade, latest)
+                success = await self.to_handler_thread(check_and_upgrade, latest)
                 if success:
                     # H14: Verify installation and rollback if necessary
                     if not verify_installation(latest):

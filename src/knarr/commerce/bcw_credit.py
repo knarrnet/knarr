@@ -32,6 +32,22 @@ def make_payment_finalized_handler(node):
         if not event_type.startswith("payment.finalized."):
             return
 
+        # Guard against spoofed mint — check configured mint before crediting
+        expected_mint = str(
+            (getattr(node, '_config', None) or {}).get("economy", {}).get("knarr_mint", "")
+        )
+        if expected_mint:
+            event_mint = str(
+                event.get("mint_address") or event.get("mint") or event.get("token_mint") or ""
+            )
+            if event_mint != expected_mint:
+                logger.warning(
+                    f"BCW_CREDIT_SKIP_WRONG_MINT event={event_type} "
+                    f"tx={str(event.get('tx_hash', ''))[:16]} "
+                    f"expected={expected_mint[:16]} got={event_mint[:16]}"
+                )
+                return
+
         from_address = str(event.get("from_address", "") or "")
         raw_amount = event.get("amount", 0)
         chain_id = str(event.get("chain_id", "") or "")

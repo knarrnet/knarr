@@ -228,6 +228,7 @@ class PluginContext:
         register_mail_handler=None,
         send_mail=None,
         register_egress_material=None,
+        register_capability=None,
         vault_get=None,
         vault_set=None,
         update_cache=None,
@@ -267,6 +268,7 @@ class PluginContext:
             self.register_mail_handler = register_mail_handler
             self.send_mail = send_mail
             self.register_egress_material = register_egress_material
+            self._register_capability_cb = register_capability or getattr(node, "register_capability", None)
             self.vault_get = vault_get
             self.vault_set = vault_set
             self.update_cache = update_cache
@@ -302,6 +304,7 @@ class PluginContext:
             self.register_mail_handler = register_mail_handler
             self.send_mail = send_mail
             self.register_egress_material = register_egress_material
+            self._register_capability_cb = register_capability
             self.vault_get = vault_get
             self.vault_set = vault_set
             self.update_cache = update_cache
@@ -320,6 +323,11 @@ class PluginContext:
         # Set to None here; wired in node.py after plugin load.
         if not hasattr(self, "sign_bytes"):
             self.sign_bytes = None  # Callable: (bytes) -> (signature_bytes, pubkey_hex)
+
+    def register_capability(self, name: str, getter, default: Any = None) -> None:
+        callback = getattr(self, "_register_capability_cb", None)
+        if callable(callback):
+            callback(name, getter, default)
 
     async def query_plugin(
         self,
@@ -379,7 +387,7 @@ class PluginLoader:
     """
     Discovers, loads, and manages Knarr plugins from the specified plugin directories.
     """
-    def __init__(self, config_dir: Path, get_peers_cb: Callable, send_to_peer_cb: Callable, node_id: str, delivery_cb: Optional[Callable] = None, send_fire_forget_cb: Optional[Callable] = None, register_mail_handler_cb: Optional[Callable] = None, send_mail_cb: Optional[Callable] = None, register_egress_material_cb: Optional[Callable] = None, vault_get_cb: Optional[Callable] = None, vault_set_cb: Optional[Callable] = None, storage_path: Optional[str] = None, update_cache_cb: Optional[Callable] = None, subscribe_events_cb: Optional[Callable] = None, emit_event_cb: Optional[Callable] = None, bus: Optional[Any] = None, data_dir: Optional[Path] = None):
+    def __init__(self, config_dir: Path, get_peers_cb: Optional[Callable] = None, send_to_peer_cb: Optional[Callable] = None, node_id: str = "", delivery_cb: Optional[Callable] = None, send_fire_forget_cb: Optional[Callable] = None, register_mail_handler_cb: Optional[Callable] = None, send_mail_cb: Optional[Callable] = None, register_egress_material_cb: Optional[Callable] = None, register_capability_cb: Optional[Callable] = None, vault_get_cb: Optional[Callable] = None, vault_set_cb: Optional[Callable] = None, storage_path: Optional[str] = None, update_cache_cb: Optional[Callable] = None, subscribe_events_cb: Optional[Callable] = None, emit_event_cb: Optional[Callable] = None, bus: Optional[Any] = None, data_dir: Optional[Path] = None):
         self._plugin_root = config_dir / "plugins"
         self._state_root = data_dir / "plugin_state" if data_dir else None
         self._get_peers_cb = get_peers_cb
@@ -388,6 +396,7 @@ class PluginLoader:
         self._register_mail_handler_cb = register_mail_handler_cb
         self._send_mail_cb = send_mail_cb
         self._register_egress_material_cb = register_egress_material_cb
+        self._register_capability_cb = register_capability_cb
         self._vault_get_cb = vault_get_cb
         self._vault_set_cb = vault_set_cb
         self._storage_path = storage_path
@@ -519,6 +528,15 @@ class PluginLoader:
                     failed_required.append(plugin_config.get("name", plugin_path.name))
                 continue
 
+            missing_keys = self._missing_required_config_keys(plugin_config)
+            if missing_keys:
+                log.warning(
+                    "PLUGIN_SKIPPED name=%s reason=missing_config keys=%s",
+                    plugin_config.get("name", plugin_path.name),
+                    ",".join(missing_keys),
+                )
+                continue
+
             module_name, class_name = handler_str.split(":")
 
             # V015-008: Confine handler path to plugin directory
@@ -581,6 +599,7 @@ class PluginLoader:
                     register_mail_handler=self._register_mail_handler_cb,
                     send_mail=self._send_mail_cb,
                     register_egress_material=self._register_egress_material_cb,
+                    register_capability=self._register_capability_cb,
                     vault_get=self._vault_get_cb,
                     vault_set=self._vault_set_cb,
                     storage_path=self._storage_path,
@@ -630,6 +649,60 @@ class PluginLoader:
         if failed_required:
             names = ", ".join(sorted(set(failed_required)))
             raise RuntimeError(f"Required plugin(s) failed to load: {names}")
+
+    @staticmethod
+    def _missing_required_config_keys(plugin_config: dict) -> list[str]:
+        schema = plugin_config.get("config_schema", {})
+        if not isinstance(schema, dict):
+            return []
+        required = schema.get("required", [])
+        if not isinstance(required, list):
+            return []
+        config = plugin_config.get("config", {})
+        if not isinstance(config, dict):
+            config = {}
+        missing = []
+        for key in required:
+            key_text = str(key or "").strip()
+            if key_text and key_text not in config:
+                missing.append(key_text)
+        return missing
+
+    async def dispatch_init(self, node: Any) -> None:
+        """v0.57.0: run the plugin on_init lifecycle phase.
+
+        PluginLoader constructs instances during ``load_plugins`` but never
+        drove an init phase, so transport plugins that need to wire pool seams
+        at startup (Tor) had nowhere to plug in. This method:
+
+        1. Backfills ``ctx._node`` on every plugin context that was built via
+           the legacy path (which sets ``_node=None``).  This gives plugins a
+           handle onto the live DHTNode — they read ``node._pool``,
+           ``node.node_info``, ``node._sidecar_port`` from it.
+        2. Calls ``await plugin.on_init(ctx=plugin._ctx)`` on every plugin
+           that defines ``on_init``. Failures are logged and swallowed; one
+           plugin's init must not take down the node.
+
+        Must be invoked AFTER the post-load context backfill in
+        ``DHTNode.start`` (storage_path, sign_document, bus, group_engine)
+        and BEFORE background loops start, so plugin-registered seams are in
+        place when heartbeat/writer/pool loops begin using them.
+        """
+        for plugin in self.plugins:
+            ctx = getattr(plugin, "_ctx", None)
+            if ctx is not None and getattr(ctx, "_node", None) is None:
+                ctx._node = node
+        for plugin in self.plugins:
+            on_init_fn = getattr(plugin, "on_init", None)
+            if not callable(on_init_fn):
+                continue
+            try:
+                await on_init_fn(ctx=getattr(plugin, "_ctx", None))
+            except Exception as exc:
+                log.warning(
+                    "PLUGIN_ON_INIT_FAILED plugin=%s err=%s",
+                    plugin.__class__.__name__, exc, exc_info=True,
+                )
 
     async def on_connect(self, peer_ip: str) -> bool:
         for plugin in self.plugins:

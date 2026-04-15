@@ -20,3 +20,7 @@ tokens = ["KNARR"]
 token_mints = { KNARR = "KNRRmint111111111111111111111111111111111111" }
 commitment = "finalized"
 min_amount_lamports = 10000
+
+[config_schema]
+required = []
+optional = ["enabled", "poll_interval_seconds", "chains", "sol_min_balance", "economy"]

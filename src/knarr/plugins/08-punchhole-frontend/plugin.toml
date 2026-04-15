@@ -8,3 +8,7 @@ description = "Punchhole Cache Frontend — DMZ-side. Serves pre-signed cache ob
 disclosure_log = "disclosure.db"
 # debug logging
 debug = false
+
+[config_schema]
+required = []
+optional = ["disclosure_log", "debug"]

@@ -6,34 +6,22 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 
-def test_query_plugin_trace_id_propagates_through_send_and_receive():
-    """query_plugin stamps trace_id, returns it, and emits debug logs."""
+def test_query_plugin_trace_id_forwarded_to_node():
+    """PluginContext.query_plugin forwards trace_id to node.query_plugin.
+
+    T1-01 moved the RPC implementation to DHTNode.query_plugin. PluginContext
+    is a pure delegate. This test verifies trace_id is passed through correctly.
+    """
     from knarr.dht.plugins import PluginContext
 
     node = MagicMock()
-    node._pending_rpcs = {}
-    node._send_fire_forget = AsyncMock()
+    node.query_plugin = AsyncMock(return_value={"ok": True, "trace_id": "trace-abc"})
 
     ctx = PluginContext.__new__(PluginContext)
     ctx._node = node
     ctx.node_id = "a" * 64
-    ctx._debug = True
-    ctx.log = MagicMock()
 
     async def _run():
-        async def _respond():
-            await asyncio.sleep(0.05)
-            request_id, entry = next(iter(node._pending_rpcs.items()))
-            future = entry[0] if isinstance(entry, tuple) else entry
-            sent_msg = node._send_fire_forget.call_args[0][1]
-            sent_payload = json.loads(sent_msg.payload)
-            future.set_result({
-                "_request_id": request_id,
-                "trace_id": sent_payload["trace_id"],
-                "ok": True,
-            })
-
-        task = asyncio.create_task(_respond())
         result = await ctx.query_plugin(
             "b" * 64,
             "127.0.0.1",
@@ -42,14 +30,14 @@ def test_query_plugin_trace_id_propagates_through_send_and_receive():
             "REQUEST",
             {"object_key": "skills"},
             timeout=1.0,
+            trace_id="trace-abc",
         )
-        await task
+        node.query_plugin.assert_awaited_once()
+        call_kwargs = node.query_plugin.call_args[1]
+        assert call_kwargs.get("trace_id") == "trace-abc", (
+            "trace_id must be forwarded to node.query_plugin"
+        )
         assert result["ok"] is True
-        assert result["trace_id"]
-        log_lines = [call.args[0] for call in ctx.log.info.call_args_list]
-        assert any("QUERY_PLUGIN_SEND" in line for line in log_lines)
-        assert any("QUERY_PLUGIN_RECV" in line for line in log_lines)
-        assert any(result["trace_id"] in line for line in log_lines)
 
     asyncio.run(_run())
 

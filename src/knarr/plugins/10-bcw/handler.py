@@ -492,7 +492,7 @@ class BCWPlugin(PluginHooks):
         subscribe = getattr(ctx, "subscribe_events", None)
         if callable(subscribe):
             try:
-                self._sub = subscribe("bcw.watch_request", "bcw.unwatch", "bcw.poll", "peer.removed")
+                self._sub = subscribe("bcw.watch_request", "bcw.unwatch", "bcw.poll", "peer.removed", "payment.finalized.*")
             except Exception as exc:
                 self._log_warning("BCW event subscription failed: %s", exc)
 
@@ -595,6 +595,10 @@ class BCWPlugin(PluginHooks):
 
     def _handle_bus_event(self, event: dict) -> None:
         etype = event.get("event")
+        # A-6 (v0.57.0): mint guard — validate payment.finalized.* events
+        if isinstance(etype, str) and etype.startswith("payment.finalized."):
+            self._handle_payment_finalized(event)
+            return
         if etype == "bcw.watch_request":
             self._handle_watch_request(event)
             return
@@ -1086,6 +1090,17 @@ class BCWPlugin(PluginHooks):
 
     def _handle_payment_finalized(self, event: dict) -> None:
         if not str(event.get("event", "")).startswith("payment.finalized."):
+            return
+        mint_address = str(
+            event.get("mint_address")
+            or event.get("mint")
+            or event.get("token_mint")
+            or ""
+        )
+        if not mint_address:
+            return
+        if mint_address != self._knarr_mint():
+            self._log_warning("BCW: rejected payment with wrong mint %s", mint_address)
             return
         return
 

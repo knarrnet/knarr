@@ -21,12 +21,22 @@ def _run(coro):
 
 def _make_firewall(gateway_exempt=None, base_limit=5, window_seconds=60):
     """Create FirewallPlugin with minimal mocked context."""
-    import sys
-    import os
+    import sys, os, importlib.util
+    # Use spec_from_file_location with a unique module name to avoid sys.modules['handler']
+    # collision with other plugins (BCW, etc.) that also export a module named 'handler'.
     plugin_dir = os.path.join(os.path.dirname(__file__), "../../plugins/01-firewall")
-    if plugin_dir not in sys.path:
-        sys.path.insert(0, plugin_dir)
-    from handler import FirewallPlugin
+    _fw_mod = sys.modules.get("firewall_handler")
+    if _fw_mod is None:
+        spec = importlib.util.spec_from_file_location(
+            "firewall_handler", os.path.join(plugin_dir, "handler.py")
+        )
+        _fw_mod = importlib.util.module_from_spec(spec)
+        sys.modules["firewall_handler"] = _fw_mod
+        spec.loader.exec_module(_fw_mod)
+    FirewallPlugin = _fw_mod.FirewallPlugin
+    HistoryBuffer = _fw_mod.HistoryBuffer
+    SlidingWindow = _fw_mod.SlidingWindow
+    OutboundManager = _fw_mod.OutboundManager
     from knarr.dht.plugins import PluginContext
 
     ctx = MagicMock()
@@ -47,8 +57,6 @@ def _make_firewall(gateway_exempt=None, base_limit=5, window_seconds=60):
     fw._config = config
     fw._log = ctx.log
     fw._running = True
-
-    from handler import HistoryBuffer, SlidingWindow, OutboundManager
     import collections
     fw._pending = collections.OrderedDict()
     fw._history = HistoryBuffer(300)

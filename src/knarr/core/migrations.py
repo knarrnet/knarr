@@ -14,16 +14,26 @@ log = logging.getLogger(__name__)
 
 
 def _split_statements(sql: str) -> list:
-    """Split SQL file into individual statements, ignoring comments and blanks."""
+    """Split SQL file into individual statements, ignoring comments and blanks.
+
+    C-1 (v0.57.0): Strip ``--`` comment lines BEFORE splitting on ``;`` so
+    that a semicolon inside a comment does not create a phantom statement.
+    Previously the split happened first, which caused ``-- foo; bar`` to
+    produce two entries where the second was the stray ``bar`` fragment.
+    """
+    # Strip comment lines first, then split on the statement terminator.
+    uncommented_lines = [
+        line for line in sql.splitlines()
+        if line.strip() and not line.strip().startswith("--")
+    ]
+    uncommented = "\n".join(uncommented_lines)
     stmts = []
-    for raw in sql.split(";"):
-        # Strip comments and whitespace
-        lines = [l for l in raw.strip().splitlines()
-                 if l.strip() and not l.strip().startswith("--")]
-        stmt = "\n".join(lines).strip()
+    for raw in uncommented.split(";"):
+        stmt = raw.strip()
         if stmt:
             stmts.append(stmt)
     return stmts
+
 
 
 def run_migrations(conn: sqlite3.Connection, migrations_dir: str) -> int:

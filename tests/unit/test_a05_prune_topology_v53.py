@@ -24,6 +24,9 @@ def _make_node_with_peers(peers_list, multiplier=None):
         node._config = {}
     node.storage = MagicMock()
     node.storage.get_peers.return_value = peers_list
+    # A-05 extracted _prune_timeout_for_peer_count as a helper; bind the real
+    # implementation so MagicMock(spec=...) doesn't shadow it with a stub return.
+    node._prune_timeout_for_peer_count = lambda n: DHTNode._prune_timeout_for_peer_count(node, n)
     return node
 
 

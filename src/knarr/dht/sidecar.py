@@ -13,6 +13,9 @@ logger = logging.getLogger(__name__)
 # KeyringVault.encrypt_bytes uses PyNaCl SecretBox, which stores a 24-byte
 # nonce plus a 16-byte MAC alongside the ciphertext.
 KNARR_ASSET_ENCRYPTION_OVERHEAD = 40
+KNARR_ASSET_ENCRYPTION_CHUNK_SIZE = 65536
+CHUNK_SIZE = KNARR_ASSET_ENCRYPTION_CHUNK_SIZE  # B-1 (v0.57.0): explicit alias for streaming hygiene
+KNARR_ASSET_STREAM_MAGIC = b"KNARRAS1"
 
 @dataclass
 class TaskContext:
@@ -96,7 +99,12 @@ class AssetSidecar:
     def _stored_size_for_plaintext(self, plaintext_size: int) -> int:
         if self._vault is None:
             return plaintext_size
-        return plaintext_size + KNARR_ASSET_ENCRYPTION_OVERHEAD
+        chunk_count = max(1, (plaintext_size + KNARR_ASSET_ENCRYPTION_CHUNK_SIZE - 1) // KNARR_ASSET_ENCRYPTION_CHUNK_SIZE)
+        return (
+            plaintext_size
+            + (chunk_count * (KNARR_ASSET_ENCRYPTION_OVERHEAD + 4))
+            + len(KNARR_ASSET_STREAM_MAGIC)
+        )
 
     async def start(self):
         """Start the HTTPS sidecar server (TLS mandatory)."""
@@ -286,43 +294,64 @@ class AssetSidecar:
             await self._send_response(writer, 507, {"error": "Storage capacity exceeded"})
             return
 
-        data = await asyncio.wait_for(reader.readexactly(content_length), timeout=300.0)
-        content_hash = hashlib.sha256(data).hexdigest()
+        upload_tmp_path = os.path.join(
+            self._asset_dir,
+            f".upload-{time.time_ns()}-{os.getpid()}.tmp",
+        )
+        hasher = hashlib.sha256()
+        remaining = content_length
+        actual_stored_size = 0
+        try:
+            with open(upload_tmp_path, "wb") as fh:
+                if self._vault is not None:
+                    fh.write(KNARR_ASSET_STREAM_MAGIC)
+                while remaining > 0:
+                    chunk = await asyncio.wait_for(
+                        reader.read(CHUNK_SIZE),
+                        timeout=300.0,
+                    )
+                    if not chunk:
+                        raise asyncio.IncompleteReadError(partial=b"", expected=remaining)
+                    # Trim to remaining to avoid consuming bytes from the next request
+                    if len(chunk) > remaining:
+                        chunk = chunk[:remaining]
+                    hasher.update(chunk)
+                    if self._vault is None:
+                        fh.write(chunk)
+                    else:
+                        encrypted_chunk = self._vault.encrypt_bytes(chunk)
+                        fh.write(len(encrypted_chunk).to_bytes(4, "big"))
+                        fh.write(encrypted_chunk)
+                    remaining -= len(chunk)
+                actual_stored_size = fh.tell()
+        except Exception:
+            if os.path.exists(upload_tmp_path):
+                os.remove(upload_tmp_path)
+            raise
+        content_hash = hasher.hexdigest()
 
         # Verify content hash matches header (integrity check — hash of plaintext)
         declared_hash = headers.get("x-knarr-content-hash", "")
         if declared_hash and declared_hash != "empty" and declared_hash != content_hash:
+            if os.path.exists(upload_tmp_path):
+                os.remove(upload_tmp_path)
             await self._send_response(writer, 400, {"error": "Content hash mismatch"})
             return
 
-        # C-04: Encrypt asset before writing to disk — fail-closed on error (TP-C04)
-        disk_data = data
         if self._vault is not None:
-            try:
-                disk_data = self._vault.encrypt_bytes(data)
-                logger.debug("ASSET_ENCRYPT hash=%s len=%d", content_hash[:16], len(data))
-            except Exception as e:
-                logger.error("ASSET_ENCRYPT_FAIL hash=%s err=%s", content_hash[:16], e)
-                await self._send_response(writer, 500, {"error": "Encryption failed"})
-                return
+            logger.debug("ASSET_ENCRYPT hash=%s len=%d", content_hash[:16], content_length)
 
-        # T3-06 (v0.56.0): track actual on-disk byte
-        # length rather than computed plaintext+OVERHEAD. Self-correcting against any
-        # future change in the vault primitive.
-        actual_stored_size = len(disk_data)
-
-        # Atomic write — use asyncio.to_thread to avoid blocking the event loop
         final_path = os.path.join(self._asset_dir, content_hash)
         if not os.path.exists(final_path):
-            tmp_path = final_path + ".tmp"
-            await self._write_file(tmp_path, disk_data)
-            os.replace(tmp_path, final_path)
+            os.replace(upload_tmp_path, final_path)
             self._metadata[content_hash] = AssetMetadata(
                 size=actual_stored_size,
                 uploaded_at=time.time(),
                 uploader_key=headers.get("x-knarr-publickey", ""),
             )
             self._total_size += actual_stored_size
+        elif os.path.exists(upload_tmp_path):
+            os.remove(upload_tmp_path)
 
         await self._send_response(writer, 200, {"hash": content_hash, "size": content_length})
 
@@ -343,7 +372,21 @@ class AssetSidecar:
         data = disk_data
         if self._vault is not None:
             try:
-                data = self._vault.decrypt_bytes(disk_data)
+                if disk_data.startswith(KNARR_ASSET_STREAM_MAGIC):
+                    offset = len(KNARR_ASSET_STREAM_MAGIC)
+                    plaintext = bytearray()
+                    while offset < len(disk_data):
+                        if offset + 4 > len(disk_data):
+                            raise ValueError("truncated encrypted asset frame")
+                        frame_len = int.from_bytes(disk_data[offset:offset + 4], "big")
+                        offset += 4
+                        if frame_len <= 0 or offset + frame_len > len(disk_data):
+                            raise ValueError("invalid encrypted asset frame length")
+                        plaintext.extend(self._vault.decrypt_bytes(disk_data[offset:offset + frame_len]))
+                        offset += frame_len
+                    data = bytes(plaintext)
+                else:
+                    data = self._vault.decrypt_bytes(disk_data)
                 logger.debug("ASSET_DECRYPT hash=%s len=%d", asset_hash[:16], len(data))
             except Exception:
                 # Not encrypted (pre-C-04 asset) — serve raw

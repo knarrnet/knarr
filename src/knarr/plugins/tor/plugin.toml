@@ -1,0 +1,26 @@
+# Tor transport plugin — SPEC-tor-plugin.md v1.1
+# Synthesized from blind parallel dev panel (Opus + Sonnet + GPT-5.4) 2026-04-11.
+# See F:\thing\specs\SYNTHESIS-tor-plugin.md for per-component picks.
+
+name = "knarr-tor"
+version = "1.1.0"
+priority = 11
+handler = "handler:TorPlugin"
+description = "Tor v3 hidden service transport — SOCKS5 routing + identity-derived onion"
+required = false
+
+# Optional runtime dependency gated via [project.optional-dependencies] tor.
+# Operators install via `pip install knarr[tor]`. If python-socks is missing,
+# plugin becomes a silent no-op and emits tor.dependency_missing on init.
+requires_package = "python_socks"
+
+[config]
+# Master enable gate — default off, operators opt in.
+enabled = false
+# key_mode default is "separate" (v1.1 F-1 + O-1 + O-2 safety flip).
+# See SPEC-tor-plugin.md §5.1 for the shared-mode identity linkage warning.
+key_mode = "separate"
+
+[config_schema]
+required = []
+optional = ["enabled", "key_mode"]

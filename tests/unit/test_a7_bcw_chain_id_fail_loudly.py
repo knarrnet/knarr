@@ -33,12 +33,18 @@ def _make_ctx():
 
 
 def _import_bcw():
-    import sys, pathlib
-    plugin_path = str(pathlib.Path(__file__).parents[4] / "knarr.clean" / "src" / "knarr" / "plugins" / "10-bcw")
-    if plugin_path not in sys.path:
-        sys.path.insert(0, plugin_path)
-    from handler import BCWHandler
-    return BCWHandler
+    import sys, pathlib, importlib.util
+    plugin_dir = pathlib.Path(__file__).parents[2] / "src" / "knarr" / "plugins" / "10-bcw"
+    # sys.path.insert needed so BCW's `from solana import ...` fallback finds the local solana.py
+    # (not the PyPI solana package). spec_from_file_location with a unique name avoids the
+    # sys.modules['handler'] collision with 01-firewall when tests run in the same session.
+    if str(plugin_dir) not in sys.path:
+        sys.path.insert(0, str(plugin_dir))
+    spec = importlib.util.spec_from_file_location("bcw_handler_a7", plugin_dir / "handler.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["bcw_handler_a7"] = mod
+    spec.loader.exec_module(mod)
+    return mod.BCWPlugin
 
 
 def test_invalid_chain_id_disables_bcw():

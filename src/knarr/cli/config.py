@@ -8,6 +8,8 @@ import tomllib
 from pathlib import Path
 from typing import Dict, Any, Optional
 
+from .config_schema import NODE_CONFIG_SCHEMA, SectionSchema
+
 DEFAULT_CONFIG = {
     "node": {
         "port": 9000,
@@ -24,26 +26,9 @@ DEFAULT_CONFIG = {
     "cockpit": {"port": 0, "bind": "127.0.0.1", "auth_token": ""},
 }
 
-_KNOWN_SECTIONS = frozenset({
-    "node",
-    "network",
-    "skills",
-    "bridges",
-    "policy",
-    "mail",
-    "cockpit",
-    "economy",
-    "settlement",
-    "pricing",
-    "netting",
-    "prepaid",
-    "sidecar",
-    "warehouse_manager",
-    "token",
-    "static",
-    "peer_overrides",
-    "identities",
-})
+_SECTION_SCHEMAS: dict[str, SectionSchema] = {
+    schema.name: schema for schema in NODE_CONFIG_SCHEMA
+}
 
 def merge_defaults(defaults: dict, overrides: dict) -> dict:
     """Deep-merge overrides into defaults."""
@@ -89,13 +74,14 @@ import logging as _logging
 _cfg_log = _logging.getLogger(__name__)
 
 
-def load_config(path: Path, explicit: bool = False) -> dict:
+def load_config(path, explicit: bool = False) -> dict:
     """Load and validate knarr.toml, then deep-merge optional tier files.
 
     Tier files (knarr.economy.toml, knarr.skills.toml, knarr.mail.toml) are
     loaded from the same directory as knarr.toml.  Missing tier files are
     silently skipped.  Returns merged config with defaults applied.
     """
+    path = Path(path)
     if not path.exists():
         if explicit:
             print(f"Error: Config file not found: {path}", file=sys.stderr)
@@ -171,27 +157,24 @@ def load_config(path: Path, explicit: bool = False) -> dict:
     return merge_defaults(DEFAULT_CONFIG, raw)
 
 _KNOWN_KEYS = {
-    "node": {"port", "host", "storage", "advertise_host", "sidecar_port", "max_asset_size",
-             "max_task_timeout", "task_slots", "min_protocol_version",
-             "auto_upgrade", "backup_retention_days", "wallet", "jurisdiction",
-             "event_bus_size", "event_bus_debug", "max_queue_depth",
-             "log_retention", "log_retention_hours", "housekeeping_retention_days",
-             "startup_jitter", "sweep_interval",
-             "implicit_hb_types", "pools", "tls", "tls_required", "tls_pin_certs",
-             "identity_bus_size"},
-    "economy": {"default_soft_limit", "default_hard_limit", "settlement_min_interval_seconds"},
-    "skills": {"minimum_price", "default_timeout"},
-    "settlement": {"tab_reminder_auto_netting", "tab_reminder_threshold", "netting_interval", "consumer_interval"},
-    "network": {"bootstrap", "upnp", "tls_cert", "tls_key", "max_connections", "connection_idle_timeout", "gossip_fanout", "heartbeat_silence_threshold", "peer_dead_timeout", "min_peers"},
-    "sidecar": {"asset_dir"},
-    "policy": {"initial_credit", "min_balance", "tit_for_tat", "group", "skill"},
-    "mail": {"accept_from", "default_ttl_hours", "max_messages", "whitelist", "price", "debug", "stale_inbox_hours", "max_inbox", "pull_interval", "max_pull_batch", "accept_groups"},
-    "cockpit": {"port", "bind", "auth_token", "tls", "tls_cert", "tls_key", "allowed_ips"},
-    "warehouse_manager": {"enabled", "debug", "rules"},
-    "token": {"mint", "rpc_url"},
-    "static": {"enabled", "max_deployments", "max_extracted_size"},
-    # peer_overrides is a free-form section (node_id -> "host:port"), not validated per-key
+    schema.name: set(schema.known_keys)
+    for schema in NODE_CONFIG_SCHEMA
+    if schema.known_keys
 }
+
+
+def _section_schema_for(section: str) -> Optional[SectionSchema]:
+    section = str(section or "")
+    schema = _SECTION_SCHEMAS.get(section)
+    if schema is not None:
+        return schema
+    if "." not in section:
+        return None
+    root, _ = section.split(".", 1)
+    schema = _SECTION_SCHEMAS.get(root)
+    if schema is not None and schema.allow_namespaced:
+        return schema
+    return None
 
 
 def _warn_unknown_sections(raw: dict, path: Path):
@@ -203,9 +186,9 @@ def _warn_unknown_sections(raw: dict, path: Path):
     to log assertions.
     """
     _log = _logging.getLogger("knarr.cli.config")
-    known = ", ".join(sorted(_KNOWN_SECTIONS))
+    known = ", ".join(sorted(_SECTION_SCHEMAS))
     for section in raw:
-        if section not in _KNOWN_SECTIONS:
+        if _section_schema_for(section) is None:
             _log.warning(
                 "CONFIG_UNKNOWN_SECTION section=[%s] in %s — may be a typo. Known sections: %s",
                 section, path, known,

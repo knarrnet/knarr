@@ -261,7 +261,7 @@ class PunchholeFrontendPlugin(PluginHooks):
         acl_group = self._acl.get(requester_node_id, "")
         if not acl_group:
             log.info(
-                "PUNCHHOLE_ACL_DENY node_id=%s reason=unknown_and_no_public_signed_tier",
+                "PUNCHHOLE_ACL_DENY node_id=%s reason=unknown_not_in_trusted_nodes_or_peer",
                 requester_node_id,
             )
             self._log_disclosure(requester_node_id, object_key, "", "rejected")
@@ -329,7 +329,7 @@ class PunchholeFrontendPlugin(PluginHooks):
         acl_group = self._acl.get(msg.node_id, "")
         if not acl_group:
             log.info(
-                "PUNCHHOLE_ACL_DENY node_id=%s reason=unknown_and_no_public_signed_tier action=CARD",
+                "PUNCHHOLE_ACL_DENY node_id=%s reason=unknown_not_in_trusted_nodes_or_peer action=CARD",
                 msg.node_id,
             )
             self._log_disclosure(msg.node_id, "card", "", "rejected")

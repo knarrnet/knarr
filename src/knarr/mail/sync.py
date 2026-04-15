@@ -30,6 +30,14 @@ class SyncEngine:
         self._receipt_skip_warned = False  # FIX-10: warn once if _write_receipt missing
         # M-018: Per-peer delivery state tracking
         self._peer_delivery_state: Dict[str, Dict[str, Any]] = {}  # node_id -> {last_attempt, consecutive_failures, next_retry_after, circuit_open}
+        self._cb_start_time = time.monotonic()  # C-9 (v0.57.0): monotonic for grace window
+        try:
+            self._cb_grace_seconds = float(
+                node._config.get("mail", {}).get("delivery_startup_grace_seconds", 30.0)
+            )
+        except (TypeError, ValueError):
+            logger.warning("mail.delivery_startup_grace_seconds: invalid value, defaulting to 30.0")
+            self._cb_grace_seconds = 30.0
 
         # v0.51.3: Dispatch failure tracking — cap retries to prevent memory leak
         self._dispatch_failures: Dict[str, int] = {}  # item_id -> failure count
@@ -44,6 +52,9 @@ class SyncEngine:
         self._mail_handlers[msg_type] = handler
 
     async def _run_in_protocol_pool(self, fn, *args):
+        runner = getattr(self._node, "to_protocol_thread", None)
+        if runner is not None:
+            return await runner(fn, *args)
         runner = getattr(self._node, "_run_in_protocol_pool", None)
         if runner is None:
             return fn(*args)
@@ -222,7 +233,7 @@ class SyncEngine:
         M-018: Implements exponential backoff and circuit breaker for dead peers.
         """
         # M-018: Check circuit breaker and backoff before attempting delivery
-        now = time.time()
+        now = time.monotonic()
         state = self._peer_delivery_state.get(peer_node_id)
         if state and state.get("circuit_open"):
             if now < state.get("next_retry_after", 0):
@@ -336,7 +347,7 @@ class SyncEngine:
             await self._node._enqueue_write(self._node.storage.mark_outbox_pending, item_ids)
 
         # M-018: Update delivery state and write receipt
-        elapsed_ms = int((time.time() - batch_start) * 1000)
+        elapsed_ms = int((time.monotonic() - batch_start) * 1000)
         attempt = consecutive_failures + 1  # 1-indexed: first attempt = 1
 
         # Initialize or update state
@@ -355,6 +366,17 @@ class SyncEngine:
             state["next_retry_after"] = None
             state["circuit_open"] = False
             state["last_attempt"] = now
+        elif time.monotonic() - self._cb_start_time < self._cb_grace_seconds:
+            state["consecutive_failures"] = 0
+            state["next_retry_after"] = None
+            state["circuit_open"] = False
+            state["last_attempt"] = now
+            if self._debug:
+                self._log.info(
+                    "MAIL_DELIVERY_STARTUP_GRACE peer=%s error=%s",
+                    peer_node_id[:16],
+                    error_string or "unknown",
+                )
         else:
             # Increment failures and compute backoff
             state["consecutive_failures"] = consecutive_failures + 1

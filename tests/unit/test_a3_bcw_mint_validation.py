@@ -24,12 +24,18 @@ from unittest.mock import MagicMock, patch, call
 
 def _make_bcw_handler(knarr_mint="So11111111111111111111111111111111111111112"):
     """Build a minimal BCWHandler with a mocked store and watchlist."""
-    import sys, pathlib
-    # 10-bcw dir name is not a valid Python identifier — import via sys.path
-    plugin_path = str(pathlib.Path(__file__).parents[2] / "src" / "knarr" / "plugins" / "10-bcw")
-    if plugin_path not in sys.path:
-        sys.path.insert(0, plugin_path)
-    from handler import BCWHandler as _BCW
+    import sys, pathlib, importlib.util
+    plugin_dir = pathlib.Path(__file__).parents[2] / "src" / "knarr" / "plugins" / "10-bcw"
+    # sys.path.insert needed so BCW's `from solana import ...` fallback finds the local solana.py
+    # (not the PyPI solana package). spec_from_file_location with a unique name avoids the
+    # sys.modules['handler'] collision with 01-firewall when tests run in the same session.
+    if str(plugin_dir) not in sys.path:
+        sys.path.insert(0, str(plugin_dir))
+    spec = importlib.util.spec_from_file_location("bcw_handler", plugin_dir / "handler.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["bcw_handler"] = mod
+    spec.loader.exec_module(mod)
+    _BCW = mod.BCWPlugin
 
     ctx = MagicMock()
     ctx.node_id = "aa" * 32

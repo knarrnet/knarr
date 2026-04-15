@@ -8,3 +8,7 @@ description = "Punchhole Cache Backend — LAN-side. Reads internal DB, applies 
 schema_file = "exposure_schema.toml"
 # debug logging
 debug = false
+
+[config_schema]
+required = []
+optional = ["schema_file", "debug", "indexers"]

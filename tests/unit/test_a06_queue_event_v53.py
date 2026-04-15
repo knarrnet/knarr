@@ -45,7 +45,7 @@ class TestQueueEvent:
             node._write_queue.put_nowait((lambda: None, (), fut))
             node._write_event.set()  # This is what the updated _enqueue_write does
             assert node._write_event.is_set()
-        asyncio.get_event_loop().run_until_complete(run())
+        asyncio.run(run())
 
     def test_write_event_set_on_proto_enqueue(self):
         """_write_event is set when _enqueue_write_proto is called."""
@@ -56,7 +56,7 @@ class TestQueueEvent:
             node._write_queue_proto.put_nowait((lambda: None, (), fut))
             node._write_event.set()  # This is what _enqueue_write_proto does
             assert node._write_event.is_set()
-        asyncio.get_event_loop().run_until_complete(run())
+        asyncio.run(run())
 
     def test_wait_either_queue_returns_proto_first(self):
         """_wait_either_queue drains proto queue before app queue."""
@@ -81,7 +81,7 @@ class TestQueueEvent:
             item = await asyncio.wait_for(node._wait_either_queue(), timeout=2.0)
             op, args, fut = item
             assert op() == "proto"
-        asyncio.get_event_loop().run_until_complete(run())
+        asyncio.run(run())
 
     def test_wait_either_queue_returns_app_when_proto_empty(self):
         """_wait_either_queue returns app item when proto queue is empty."""
@@ -100,7 +100,7 @@ class TestQueueEvent:
             item = await asyncio.wait_for(node._wait_either_queue(), timeout=2.0)
             op, args, fut = item
             assert op() == "app"
-        asyncio.get_event_loop().run_until_complete(run())
+        asyncio.run(run())
 
     def test_wait_either_queue_wakes_on_event(self):
         """_wait_either_queue blocks until event is set, then returns item."""
@@ -122,7 +122,7 @@ class TestQueueEvent:
             assert elapsed < 0.5, f"Wait took {elapsed:.3f}s, too long"
             op, args, _ = item
             assert op() == "delayed"
-        asyncio.get_event_loop().run_until_complete(run())
+        asyncio.run(run())
 
     def test_write_event_in_node_source(self):
         """_write_event is declared in node.py source."""

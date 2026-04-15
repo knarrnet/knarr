@@ -2455,6 +2455,13 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
         if hasattr(self._node, "get_pool_metrics"):
             pool_metrics = self._node.get_pool_metrics()
 
+        node_metrics = {}
+        if hasattr(self._node, "get_dashboard_metrics"):
+            try:
+                node_metrics = self._node.get_dashboard_metrics()
+            except Exception:
+                node_metrics = {}
+
         # Cache stats (from storage proxy if available)
         cache_stats = {}
         storage = getattr(self._node, "storage", None)
@@ -2494,6 +2501,7 @@ rd.innerHTML='<div class="result result-err"><strong>Error</strong><pre>'+esc(j.
             "ts": _time.time(),
             "bus": bus_metrics,
             "pools": pool_metrics,
+            "node": node_metrics,
             "cache": cache_stats,
             "identities": identities,
         }

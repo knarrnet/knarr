@@ -12,6 +12,7 @@ build/
 *.db
 *.db-shm
 *.db-wal
+*.sqlite3
 venv/
 .venv/
 

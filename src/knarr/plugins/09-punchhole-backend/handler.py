@@ -199,6 +199,7 @@ class PunchholeBackendPlugin(PluginHooks):
         # PREREQ-01: punchhole_epoch — increments each time any cache object is staled.
         # Enables event-driven indexer re-crawl in future sprints.
         self._punchhole_epoch: int = 0
+        ctx.register_capability("heartbeat.punchhole_epoch", self.get_punchhole_epoch, 0)
 
         # PREREQ-03: indexer shorthand — maps indexer name -> node_id hex.
         # Populated from config section [exposure.indexers] or config key "indexers".
