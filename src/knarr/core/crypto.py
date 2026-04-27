@@ -19,6 +19,8 @@ import hashlib
 import json
 import logging
 import os
+import time
+from datetime import datetime, timezone
 
 # ── NaCl re-exports (all consumers import from here) ──────────────────────────
 from nacl.signing import SigningKey, VerifyKey                  # noqa: F401
@@ -31,6 +33,7 @@ from nacl.encoding import HexEncoder                            # noqa: F401
 from nacl.bindings import crypto_core_ed25519_is_valid_point    # noqa: F401
 
 logger = logging.getLogger(__name__)
+DEFAULT_SAMPLE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 
 
 # ── Convenience alias for nacl.utils.random ────────────────────────────────────
@@ -134,38 +137,61 @@ def verify_receipt(receipt_json: str, provider_public_key_hex: str) -> bool:
         return False
 
 
-def verify_skill_sample(sample: dict, rater_pubkey: bytes = None) -> bool:
-    """CR v0.56.0: Verify a skill sample's Ed25519 signature.
+def _sample_timestamp_seconds(value) -> float:
+    if isinstance(value, bool) or value is None:
+        raise ValueError("missing timestamp")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError("empty timestamp")
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    raise ValueError("invalid timestamp")
+
+
+def verify_skill_sample(
+    sample: dict,
+    rater_pubkey: bytes = None,
+    trusted_raters=None,
+    sample_max_age_seconds=None,
+    now=None,
+) -> bool:
+    """Verify a skill sample's Ed25519 signature and freshness.
 
     Used by discovery clients to validate quality-rating evidence embedded in
-    a SkillSheet's `samples` field. Validation policy per CR ruling: the node
-    receiving an Announce only checks schema shape (in validation.py); signature
-    + trust verification is the consumer's job, here.
+    a SkillSheet's `samples` field.
 
     The signed payload is the JSON canonicalization of the sample dict with the
     signature field removed. Canonicalization uses sorted keys and the same
     separators as verify_receipt (``sort_keys=True``, ``separators=(',', ':')``).
+    The sample must include a ``timestamp`` field in that signed payload.
 
     Args:
         sample: A single sample record dict from a SkillSheet's samples list.
                 Must contain at minimum: rater_pubkey (64-char hex),
-                signature (base64), and rater_node_id (64-char hex).
+                signature (base64), rater_node_id (64-char hex), and timestamp.
         rater_pubkey: Optional 32-byte Ed25519 verify key. If provided, the
                 verification uses this key and the sample's embedded rater_pubkey
                 is checked for consistency. If None, the sample's embedded
                 rater_pubkey is used (client-trust-list pattern).
+        trusted_raters: Optional set of trusted rater public keys or node IDs.
+                If None, any valid signer is accepted.
+        sample_max_age_seconds: Freshness window. Defaults to 7 days.
+        now: Optional epoch seconds override for deterministic tests.
 
     Returns:
-        True if the signature is valid against the rater pubkey.
+        True if the signature is valid, fresh, and from an allowed rater.
         False on any error (malformed sample, decoding failure, signature mismatch,
-        or rater_node_id ↔ sha256(rater_pubkey) consistency failure).
-
-    Note:
-        This function does NOT check whether the rater is trusted. Trust is a
-        client-side concern — the caller is responsible for confirming the
-        rater_pubkey appears in their rater trust list before acting on the
-        rating. A True return only confirms the sample is unmodified since the
-        rater signed it. Filed for v0.57.0: CR-rater-trust-list.
+        stale timestamp, untrusted rater, or rater_node_id ↔ sha256(rater_pubkey)
+        consistency failure).
     """
     try:
         if not isinstance(sample, dict):
@@ -173,6 +199,9 @@ def verify_skill_sample(sample: dict, rater_pubkey: bytes = None) -> bool:
         signature_b64 = sample.get("signature")
         embedded_pubkey_hex = sample.get("rater_pubkey")
         if not signature_b64 or not embedded_pubkey_hex:
+            return False
+        if "timestamp" not in sample:
+            logger.warning("CRYPTO_VERIFY_SAMPLE_MISSING_TIMESTAMP rater=%s", str(embedded_pubkey_hex)[:16])
             return False
 
         # Consistency: caller-provided pubkey (if any) must match the embedded one
@@ -184,6 +213,29 @@ def verify_skill_sample(sample: dict, rater_pubkey: bytes = None) -> bool:
                     provided_hex[:16], embedded_pubkey_hex[:16],
                 )
                 return False
+
+        rater_node_id = sample.get("rater_node_id", "")
+        if trusted_raters is not None:
+            trusted = {
+                (item.hex() if isinstance(item, (bytes, bytearray)) else str(item)).lower()
+                for item in trusted_raters
+            }
+            if embedded_pubkey_hex.lower() not in trusted and str(rater_node_id).lower() not in trusted:
+                logger.debug("CRYPTO_VERIFY_SAMPLE_UNTRUSTED rater=%s", embedded_pubkey_hex[:16])
+                return False
+
+        max_age = DEFAULT_SAMPLE_MAX_AGE_SECONDS if sample_max_age_seconds is None else float(sample_max_age_seconds)
+        timestamp_seconds = _sample_timestamp_seconds(sample.get("timestamp"))
+        current_time = time.time() if now is None else float(now)
+        if timestamp_seconds > current_time + 300:
+            logger.debug("CRYPTO_VERIFY_SAMPLE_FUTURE_TIMESTAMP rater=%s", str(embedded_pubkey_hex)[:16])
+            return False
+        if current_time - timestamp_seconds > max_age:
+            logger.debug(
+                "CRYPTO_VERIFY_SAMPLE_STALE age=%.3f max_age=%.3f rater=%s",
+                current_time - timestamp_seconds, max_age, embedded_pubkey_hex[:16],
+            )
+            return False
 
         # Canonicalize the sample without the signature field
         unsigned = {k: v for k, v in sample.items() if k != "signature"}
@@ -203,7 +255,6 @@ def verify_skill_sample(sample: dict, rater_pubkey: bytes = None) -> bool:
 
         # Consistency: rater_node_id MUST be sha256(rater_pubkey) — mirrors
         # verify_receipt's provider_node_id check
-        rater_node_id = sample.get("rater_node_id", "")
         expected_node_id = hashlib.sha256(bytes.fromhex(embedded_pubkey_hex)).hexdigest()
         if rater_node_id != expected_node_id:
             logger.debug(
@@ -331,7 +382,10 @@ def hybrid_encrypt(plaintext: bytes, recipient_x25519_pub_hexes: list,
         raise ValueError("At least one recipient required for hybrid encryption")
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-    recipient_x25519_pub_hexes = sorted({str(pub_hex) for pub_hex in recipient_x25519_pub_hexes if pub_hex})
+    recipient_x25519_pub_hexes = sorted({
+        (pub_hex.hex() if isinstance(pub_hex, (bytes, bytearray)) else str(pub_hex)).lower()
+        for pub_hex in recipient_x25519_pub_hexes if pub_hex
+    })
     session_key = os.urandom(32)
     nonce = os.urandom(12)
     aesgcm = AESGCM(session_key)

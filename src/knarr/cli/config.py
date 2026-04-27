@@ -529,12 +529,24 @@ def load_dynamic_skills(config_dir: Path) -> dict:
 
 
 def get_dynamic_policy(config: dict) -> dict:
-    """Extract dynamic skill policy from config, with defaults."""
+    """Extract dynamic skill policy from config, with defaults.
+
+    C-01 (v0.58.0): when dynamic_enabled=true and dynamic_allowed_handlers
+    is NOT explicitly set, the allowlist defaults to None (accept canonical
+    dynamic_*.py pattern) instead of the phantom default ["dynamic_facade.py"].
+    """
     policy = dict(_DYNAMIC_DEFAULTS)
     for key in _DYNAMIC_DEFAULTS:
         val = config.get("policy", {}).get(key)
         if val is not None:
             policy[key] = val
+
+    # Fix phantom-default: if operator enabled dynamic but didn't set
+    # the allowlist, default to None (canonical pattern accepted)
+    policy_cfg = config.get("policy", {})
+    if policy.get("dynamic_enabled") and "dynamic_allowed_handlers" not in policy_cfg:
+        policy["dynamic_allowed_handlers"] = None
+
     return policy
 
 
@@ -569,9 +581,17 @@ def validate_dynamic_skill(
         handler_file = handler
     handler_basename = os.path.basename(handler_file)
 
-    allowed = policy.get("dynamic_allowed_handlers", ["dynamic_facade.py"])
-    if handler_basename not in allowed:
+    allowed = policy.get("dynamic_allowed_handlers")
+    # C-01 (v0.58.0): when allowed is None, accept canonical dynamic handler pattern
+    if allowed is not None and handler_basename not in allowed:
         return False, f"handler {handler_basename!r} not in allowed list"
+    if allowed is None:
+        # No explicit allowlist — accept canonical pattern: <name>.py or dynamic_*.py
+        expected = f"{skill_name}.py"
+        if handler_basename != expected and not (
+            handler_basename.startswith("dynamic_") and handler_basename.endswith(".py")
+        ):
+            return False, f"handler {handler_basename!r} not a valid dynamic handler pattern"
 
     if not re.match(r'^[a-z0-9][a-z0-9-]*$', skill_name) or len(skill_name) > 64:
         return False, f"invalid skill name: {skill_name!r}"

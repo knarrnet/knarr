@@ -718,6 +718,8 @@ class CockpitServer:
                 elif method == "POST":
                     if path == "/api/execute":
                         await self._handle_api_execute(writer, body)
+                    elif path == "/api/skills/call":
+                        await self._handle_api_skills_call(writer, body)
                     elif path == "/api/messages/ack":
                         try:
                             data = json.loads(body)
@@ -762,6 +764,8 @@ class CockpitServer:
                         self._handle_asset_store(writer, body, headers)
                     elif path == "/api/skills/install":
                         await self._handle_skill_install(writer, body)
+                    elif path == "/api/skills/register":
+                        await self._handle_skill_register(writer, body)
                     elif path == "/api/exposures":
                         self._handle_exposure_create(writer, body)
                     elif path == "/api/pricing/discounts":
@@ -1096,6 +1100,142 @@ class CockpitServer:
 
         self._respond_404(writer)
 
+    async def _handle_api_skills_call(self, writer, body):
+        """C-06: POST /api/skills/call — programmatic skill invocation.
+
+        Accepts a JSON body of shape:
+          {"skill": "name", "provider": "<node_id>", "input": {...},
+           "wait": true|false, "timeout_ms": 30000}
+
+        ``input`` may contain ``{"@file": path}`` or ``{"@data": base64}``
+        values; those are uploaded to the provider's sidecar via
+        ``upload_inputs`` and rewritten to ``knarr-asset://`` URIs before
+        the task is submitted. If ``wait`` is true the handler blocks on
+        the task result and returns asset metadata (hash + size + URI) for
+        each asset-valued output so callers can fetch bytes via the
+        existing ``GET /api/assets/<hash>`` proxy; otherwise it returns
+        the accepted job_id.
+
+        The handler never writes files to disk — ``output_dir`` is not
+        accepted from the wire, so the cockpit surface introduces no new
+        server-side write primitive. CLI callers that need local files
+        can use ``fetch_outputs`` directly with a local ``output_dir``.
+
+        The skill-call wrapper is a thin adapter over the existing execute
+        path — it reuses ``submit_async_task`` and provider address lookup
+        via ``storage.get_address``. Keeping this as an adapter (not a new
+        execution path) preserves the admission / receipt / signing
+        guarantees of /api/execute.
+        """
+        if len(body) > 65536:
+            self._respond_error(writer, 413, "Request Too Large")
+            return
+
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            self._respond_error(writer, 400, "Invalid JSON")
+            return
+
+        skill = data.get("skill")
+        task_input = data.get("input") or {}
+        if not skill or not isinstance(task_input, dict):
+            self._respond_error(writer, 400, "Missing skill or invalid input")
+            return
+
+        provider_node_id = data.get("provider")
+        if not provider_node_id or not isinstance(provider_node_id, str):
+            self._respond_error(writer, 400, "Missing provider node_id")
+            return
+
+        wait = bool(data.get("wait", False))
+        timeout_ms = int(data.get("timeout_ms") or 30000)
+
+        addr = self._node.storage.get_address(provider_node_id)
+        if not addr or not addr.get("last_ip") or not addr.get("last_port"):
+            self._respond_error(writer, 404, f"Unknown provider address for {provider_node_id[:16]}")
+            return
+        host = addr["last_ip"]
+        port = int(addr["last_port"])
+        sidecar_port = int(addr.get("sidecar_port") or 0)
+
+        # F7: reject local-filesystem-read shapes in cockpit context.
+        # @file / "@path" would turn this handler into a server-side file
+        # reader for any authenticated cockpit caller. @data (inline base64)
+        # stays permitted since the bytes came over the wire already.
+        for _k, _v in task_input.items():
+            if isinstance(_v, str) and _v.startswith("@"):
+                self._respond_error(writer, 400, "@-prefixed path inputs not accepted via cockpit; pre-upload and pass knarr-asset:// URI")
+                return
+            if isinstance(_v, dict) and "@file" in _v:
+                self._respond_error(writer, 400, "@file inputs not accepted via cockpit; use @data (base64) or pre-upload and pass knarr-asset:// URI")
+                return
+
+        try:
+            from ..cli.main import upload_inputs
+            await upload_inputs(task_input, host, sidecar_port, self._node._signing_key)
+        except FileNotFoundError as e:
+            self._respond_error(writer, 400, str(e))
+            return
+        except Exception as e:
+            logger.error(f"skills/call upload_inputs failed: {type(e).__name__}: {e}")
+            self._respond_error(writer, 502, "asset upload failed")
+            return
+
+        import uuid as _uuid
+        job_id = str(_uuid.uuid4())
+
+        if not wait:
+            async def _submit_async():
+                try:
+                    await self._node.submit_async_task(
+                        provider_node_id, host, port,
+                        skill, task_input, timeout_ms=timeout_ms, task_id=job_id,
+                    )
+                except Exception as e:
+                    logger.error(f"skills/call async submit failed: {e}")
+            asyncio.create_task(_submit_async())
+            self._respond_json(writer, {"status": "accepted", "job_id": job_id})
+            return
+
+        try:
+            result = await self._node.request_task(
+                provider_node_id, host, port, skill, task_input,
+                timeout_ms=timeout_ms,
+            )
+        except Exception as e:
+            logger.error(f"skills/call request_task failed: {type(e).__name__}: {e}")
+            self._respond_error(writer, 502, "request_task failed")
+            return
+
+        # Scan output_data for asset references — metadata only, no file
+        # writes and no byte fetch. Callers pull bytes via the existing
+        # /api/assets proxy or download_asset helper.
+        asset_meta: list = []
+        if result.status == "completed" and isinstance(result.output_data, dict):
+            for key, value in result.output_data.items():
+                if not isinstance(value, str):
+                    continue
+                asset_hash = None
+                if value.startswith("knarr-asset://"):
+                    asset_hash = value[len("knarr-asset://"):]
+                elif len(value) == 64 and all(c in "0123456789abcdef" for c in value):
+                    asset_hash = value
+                if asset_hash:
+                    asset_meta.append({
+                        "key": key,
+                        "hash": asset_hash,
+                        "uri": f"knarr-asset://{asset_hash}",
+                    })
+
+        response = {
+            "status": result.status,
+            "output": result.output_data if result.status == "completed" else {},
+            "error": result.error,
+            "assets": asset_meta,
+        }
+        self._respond_json(writer, response)
+
     async def _handle_api_upload(self, writer, body, query):
         """POST /api/upload — Upload asset to local or remote sidecar."""
         host = query.get("host", [""])[0]
@@ -1138,12 +1278,115 @@ class CockpitServer:
         try:
             from ..cli.skill import cmd_skill_install
             config_dir = self._config_dir
+            _policy = (self._node._config if hasattr(self, "_node") else {}).get("policy", {})
             result = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: cmd_skill_install(source, config_dir, force=data.get("force", False),
-                                                upgrade=data.get("upgrade", False)))
+                                                upgrade=data.get("upgrade", False), policy=_policy))
             self._respond_json(writer, {"status": "ok", "message": result})
         except Exception as e:
             logger.error(f"Skill install failed: {type(e).__name__}: {e}")
+            self._respond(writer, "400 Bad Request", "application/json",
+                          json.dumps({"status": "error", "message": str(e)}).encode())
+
+    _MAX_SKILL_SOURCE_SIZE = 65536
+
+    async def _handle_skill_register(self, writer, body):
+        """C-01 (v0.58.0): POST /api/skills/register — Register a dynamic skill.
+
+        Accepts skill name + Python source, validates via ast.parse,
+        persists to dynamic skills config file, returns structured error
+        on failure without writing.
+        """
+        if body and len(body) > self._MAX_SKILL_SOURCE_SIZE:
+            self._respond_error(writer, 413, "Request body too large")
+            return
+        import ast
+        import re
+        try:
+            data = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            self._respond_error(writer, 400, "Invalid JSON body")
+            return
+
+        skill_name = data.get("name", "")
+        source = data.get("source", "")
+
+        # Validate skill name
+        if not skill_name or not re.match(r'^[a-z0-9][a-z0-9-]*$', skill_name):
+            self._respond_error(writer, 400, f"Invalid skill name: {skill_name!r}")
+            return
+
+        # Check for path traversal in name
+        if ".." in skill_name or "/" in skill_name or "\\" in skill_name:
+            self._respond_error(writer, 400, "Skill name must not contain path traversal")
+            return
+
+        # Validate Python source
+        if not source:
+            self._respond_error(writer, 400, "Python source is required")
+            return
+        try:
+            ast.parse(source)
+        except SyntaxError as e:
+            self._respond_error(writer, 400, f"Invalid Python source: {e}")
+            return
+
+        try:
+            from pathlib import Path as _Path
+            from ..cli.config import get_dynamic_policy, validate_dynamic_skill, write_dynamic_skill, load_dynamic_skills
+            config_dir = _Path(self._config_dir)
+
+            # Check if dynamic skills are enabled
+            policy = get_dynamic_policy(self._node._config if hasattr(self, '_node') else {})
+            if not policy.get("dynamic_enabled", False):
+                self._respond_error(writer, 400, "Dynamic skills are disabled (set policy.dynamic_enabled=true)")
+                return
+
+            # Determine handler file path
+            handler_file = f"dynamic_skills/{skill_name}.py"
+            handler_spec = f"{handler_file}:handle"
+
+            # Validate against guardrails (use actual count, not 0)
+            existing_count = len(load_dynamic_skills(config_dir))
+            skill_cfg = {
+                "handler": handler_spec,
+                "price": data.get("price", 1.0),
+                "description": data.get("description", ""),
+            }
+            ok, reason = validate_dynamic_skill(
+                skill_name, skill_cfg, policy, existing_count=existing_count,
+            )
+            if not ok:
+                self._respond_error(writer, 400, reason)
+                return
+
+            # Write source file
+            import os
+            skills_dir = os.path.join(config_dir, "dynamic_skills")
+            os.makedirs(skills_dir, exist_ok=True)
+            handler_path = os.path.join(skills_dir, f"{skill_name}.py")
+            with open(handler_path, "w") as f:
+                f.write(source)
+
+            # Persist to config
+            ok = write_dynamic_skill(config_dir, skill_name, skill_cfg)
+            if not ok:
+                # Clean up source file on failure
+                try:
+                    os.remove(handler_path)
+                except OSError:
+                    pass
+                self._respond_error(writer, 500, "Failed to persist skill config")
+                return
+
+            self._respond_json(writer, {
+                "status": "ok",
+                "message": f"Registered dynamic skill '{skill_name}'",
+                "name": skill_name,
+                "handler": handler_spec,
+            })
+        except Exception as e:
+            logger.error(f"Dynamic skill registration failed: {type(e).__name__}: {e}")
             self._respond(writer, "400 Bad Request", "application/json",
                           json.dumps({"status": "error", "message": str(e)}).encode())
 

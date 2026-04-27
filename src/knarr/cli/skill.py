@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import signal
 import shutil
@@ -8,8 +10,11 @@ import tomllib
 import zipfile
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, List, Dict, Any
-from .config import parse_skill_toml, _cleanup_handler_module
+from .config import parse_skill_toml, remove_dynamic_skill, _cleanup_handler_module
+from ..core.crypto import SigningKey, VerifyKey
+from ..core.proof import sign_document, verify_document
 
 EXCLUDE_PATTERNS = {"tests", "__pycache__", ".git", ".env", "data"}
 
@@ -48,10 +53,91 @@ output = {{result = "string"}}
   handler.py   Skill handler
 """
 
-def cmd_skill_install(source: str, config_dir: str, force: bool = False, upgrade: bool = False, parent_bundle: str = "", visited: Optional[set] = None) -> str:
-    """Install a skill from a local directory, .knarr archive, or git URL."""
+
+def _archive_sig_path(archive_path: str | os.PathLike) -> Path:
+    path = Path(archive_path)
+    return path.with_suffix(path.suffix + ".sig")
+
+
+def _sha256_file(path: str | os.PathLike) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _node_id_for_public_key(public_key_hex: str) -> str:
+    return hashlib.sha256(bytes.fromhex(public_key_hex)).hexdigest()
+
+
+def _verify_archive_signature(archive_path: str | os.PathLike, verify_signer: str) -> dict:
+    sig_path = _archive_sig_path(archive_path)
+    if not sig_path.is_file():
+        raise ValueError(f"Missing detached signature file: {sig_path}")
+    try:
+        signed = json.loads(sig_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Invalid detached signature file: {exc}") from exc
+
+    if signed.get("document_type") != "knarr_archive_signature":
+        raise ValueError("Invalid archive signature document")
+    expected_hash = _sha256_file(archive_path)
+    signed_hash = str(signed.get("archive_sha256", "") or "")
+    if signed_hash != expected_hash:
+        raise ValueError("Archive hash mismatch")
+
+    public_key_hex = str(signed.get("signer_public_key", "") or "")
+    try:
+        verify_key = VerifyKey(bytes.fromhex(public_key_hex))
+        derived_node_id = _node_id_for_public_key(public_key_hex)
+    except Exception as exc:
+        raise ValueError("Invalid signer public key in detached signature") from exc
+
+    signer = str(signed.get("signer", "") or "")
+    if signer and signer != derived_node_id:
+        raise ValueError("Signer node id does not match signer public key")
+    proof_vm = str((signed.get("proof") or {}).get("verificationMethod", "") or "")
+    if proof_vm != f"did:knarr:{derived_node_id}#key-1":
+        raise ValueError("Archive signature verification method mismatch")
+    if not verify_document(signed, verify_key):
+        raise ValueError("Archive signature verification failed")
+
+    wanted = str(verify_signer or "").strip()
+    if wanted.lower() not in {"any", "*"}:
+        accepted = {
+            derived_node_id,
+            public_key_hex,
+            f"did:knarr:{derived_node_id}",
+            f"did:knarr:{derived_node_id}#key-1",
+        }
+        if wanted.lower() not in accepted:
+            raise ValueError("Archive signer mismatch")
+    return signed
+
+
+def cmd_skill_install(source: str, config_dir: str, force: bool = False, upgrade: bool = False,
+                      parent_bundle: str = "", visited: Optional[set] = None,
+                      verify_signer: Optional[str] = None,
+                      policy: Optional[dict] = None) -> str:
+    """Install a skill from a local directory, .knarr archive, or git URL.
+
+    C-05 (v0.58.0): when verify_signer is provided, check detached .sig,
+    verify archive sha256 matches, verify signer. Missing sig → refuse.
+    Hash mismatch → refuse. Signer mismatch → refuse. Use "any" to accept
+    any valid signer.
+    """
     if visited is None:
         visited = set()
+
+    # C-05: policy-based require_signed_packages enforcement
+    _policy = policy or {}
+    if _policy.get("require_signed_packages", False) and verify_signer is None:
+        verify_signer = "any"
+
+    # C-05: verify signature if requested
+    if verify_signer is not None:
+        _verify_archive_signature(source, verify_signer)
 
     # 1. Resolve source to a directory
     source_dir, cleanup_fn = _resolve_source(source)
@@ -131,11 +217,64 @@ def cmd_skill_install(source: str, config_dir: str, force: bool = False, upgrade
             cleanup_fn()
 
 def cmd_skill_remove(name: str, config_dir: str, purge: bool = False) -> str:
-    """Remove an installed skill."""
+    """Remove an installed skill.
+
+    C-01 (v0.58.0): also recognizes flat dynamic-skill file layout.
+    Non-existent skill → no-op + log.
+    """
+    import logging
+    _remove_log = logging.getLogger("knarr.cli.skill")
+
+    # C-01: check for flat dynamic-skill layout first
+    skills_path = os.path.join(config_dir, "knarr.skills.toml")
+    is_dynamic = False
+    dynamic_skill_cfg: dict = {}
+    if os.path.isfile(skills_path):
+        try:
+            with open(skills_path, "rb") as f:
+                import tomllib as _tt
+                data = _tt.load(f)
+            skills = data.get("skills", {})
+            if name in skills:
+                is_dynamic = True
+                dynamic_skill_cfg = skills[name]
+        except Exception:
+            pass
+
     target_dir = os.path.join(config_dir, "skills", name)
 
-    if not os.path.exists(target_dir):
+    if not os.path.exists(target_dir) and not is_dynamic:
+        _remove_log.info("Skill '%s' is not installed (no-op)", name)
         return f"Skill '{name}' is not installed"
+
+    # C-01 (v0.58.0): handle flat dynamic-skill layout
+    if is_dynamic:
+        from pathlib import Path as _Path
+        ok = remove_dynamic_skill(_Path(config_dir), name)
+        if not ok:
+            return f"Failed to remove dynamic skill '{name}'"
+
+        # Remove the handler file if it exists and is within config_dir
+        handler = dynamic_skill_cfg.get("handler", "")
+        if handler and ":" in handler:
+            handler_file = handler.split(":")[0]
+            if not os.path.isabs(handler_file):
+                handler_file = os.path.join(config_dir, handler_file)
+            try:
+                resolved = Path(handler_file).resolve()
+                config_root = Path(config_dir).resolve()
+                confined = resolved.is_relative_to(config_root)
+            except Exception:
+                confined = False
+            if confined and os.path.isfile(handler_file):
+                try:
+                    os.remove(handler_file)
+                except OSError as exc:
+                    _remove_log.warning(f"Failed to remove handler file {handler_file}: {exc}")
+
+        _signal_reload(config_dir)
+        _remove_log.info("Removed dynamic skill: %s", name)
+        return f"Removed dynamic skill '{name}'"
 
     # Read manifest to find data_dir
     data_dir_name = "data"
@@ -401,7 +540,8 @@ def _toml_key(k: str) -> str:
     """Quote key if it contains special characters."""
     if re.match(r'^[A-Za-z0-9_-]+$', k):
         return k
-    return f'"{k.replace("\\", "\\\\").replace("\"", "\\\"")}"'
+    _escaped = k.replace("\\", "\\\\").replace("\"", "\\\"")
+    return f'"{_escaped}"'
 
 def _toml_val(v):
     if isinstance(v, str):
@@ -584,8 +724,21 @@ def _install_fetch_assets(manifest: dict, data_dir: str):
     # Not implemented fully in 8b (requires HTTP client), just ensure data_dir exists
     os.makedirs(data_dir, exist_ok=True)
 
-def cmd_skill_pack(directory: str) -> str:
-    """Create a .knarr archive from a skill directory."""
+def cmd_skill_pack(directory: str, sign: bool = False, node=None) -> str:
+    """Create a .knarr archive from a skill directory.
+
+    C-05 (v0.58.0): when sign=True, sign the archive sha256 using sign_document
+    from core/proof.py (eddsa-jcs-2022). Write detached .sig alongside the
+    archive. Requires live node; refuse with clear error if unreachable.
+    """
+    # C-05: check node availability before any I/O
+    if sign and node is None:
+        raise ValueError("--sign requires a live node (use 'knarr skill pack --sign' from node CLI)")
+    if sign:
+        signing_key = getattr(node, "_signing_key", None)
+        if signing_key is None:
+            raise ValueError("Node signing key unavailable — cannot sign archive")
+
     directory = os.path.abspath(directory)
     toml_path = os.path.join(directory, "skill.toml")
     if not os.path.exists(toml_path):
@@ -608,7 +761,44 @@ def cmd_skill_pack(directory: str) -> str:
                 rel_path = os.path.relpath(abs_path, directory)
                 zf.write(abs_path, root_prefix + rel_path)
 
-    return f"Created {archive_name}"
+    result = f"Created {archive_name}"
+
+    # C-05: sign the archive if requested
+    if sign:
+        # Read archive sha256
+        with open(archive_name, "rb") as f:
+            archive_hash = hashlib.sha256(f.read()).hexdigest()
+
+        # Sign using node's signing key (#key-1 convention)
+        from knarr.core.proof import sign_document
+
+        node_id = node.node_info.node_id if hasattr(node, "node_info") else "unknown"
+        verification_method = f"did:knarr:{node_id}#key-1"
+
+        signer_pubkey_hex = signing_key.verify_key.encode().hex()
+        sig_doc = sign_document(
+            document={
+                "document_type": "knarr_archive_signature",
+                "archive": archive_name,
+                "archive_sha256": archive_hash,
+                "skill_name": name,
+                "skill_version": version,
+                "signer": node_id,
+                "signer_public_key": signer_pubkey_hex,
+            },
+            private_key=signing_key,
+            verification_method=verification_method,
+        )
+
+        # Write detached .sig
+        import json as _json
+        sig_path = f"{archive_name}.sig"
+        with open(sig_path, "w") as f:
+            _json.dump(sig_doc, f, indent=2, sort_keys=True)
+
+        result += f"\nSigned → {sig_path} (sha256: {archive_hash[:16]}...)"
+
+    return result
 
 def cmd_skill_export(name: str, config_dir: str, bundle: bool = False) -> str:
     """Export an installed skill as a .knarr archive."""

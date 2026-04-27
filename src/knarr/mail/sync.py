@@ -1003,18 +1003,22 @@ class SyncEngine:
             self._log.info(f"MAIL_PULL_ACK requester={msg.requester_node_id[:16]} confirmed={len(msg.item_ids)}")
 
     async def pull_from_correspondents(self):
-        """Pull pending mail from known correspondents. Exponential backoff."""
+        """Pull pending mail from known correspondents.
+
+        B-02: the previous exponential backoff (0,2,4,8,16s between
+        correspondents) pushed the worst-case run to ~30s on top of per-peer
+        send time, which regularly exceeded the 5s deadline in the loop and
+        caused PULL_TIMEOUT spam. Pulls are independent per peer — there is
+        no thundering-herd shared resource to protect — so we run them
+        without inter-peer sleep and let the loop's deadline govern.
+        """
         correspondents = self._node.storage.get_correspondents(limit=10)
-        delay = 0.0
         pulled = 0
         for i, corr in enumerate(correspondents):
             if i >= 5:
-                break  # pull storm mitigation: max 5 correspondents
-            if delay > 0:
-                await asyncio.sleep(delay)
+                break  # pull storm mitigation: max 5 correspondents per sweep
             count = await self._pull_from_peer(corr["node_id"])
             pulled += count
-            delay = min(delay * 2 if delay > 0 else 2.0, 16.0)  # 0, 2, 4, 8, 16
         if pulled and self._debug:
             self._log.info(f"MAIL_PULL_SWEEP total={pulled}")
 

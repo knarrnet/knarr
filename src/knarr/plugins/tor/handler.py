@@ -279,6 +279,12 @@ class TorPlugin(PluginHooks):
         self._proxy_cache: Dict[str, Any] = {}
         self._proxy_cache_max: int = 256
 
+        # B-05: pre-override advertise host snapshot for clean restoration on
+        # shutdown. Set the first time `_maybe_override_advertise_host` rewrites
+        # node_info.host, cleared after restoration. Prevents the onion address
+        # from lingering in node_info after the plugin stops.
+        self._pre_override_host: Optional[str] = None
+
     # ------------------------------------------------------------------
     # Static helpers (API contract)
     # ------------------------------------------------------------------
@@ -1157,6 +1163,12 @@ class TorPlugin(PluginHooks):
             )
             return
         try:
+            # B-05: snapshot the pre-override host once, on first override.
+            # Skip if already populated so re-override (after a bus-event
+            # reapplied branch) doesn't overwrite the true original with an
+            # onion.
+            if self._pre_override_host is None:
+                self._pre_override_host = previous_host
             node.node_info = NodeInfo(
                 node_id=current.node_id,
                 host=own_onion,
@@ -1280,3 +1292,25 @@ class TorPlugin(PluginHooks):
                 pass
         # Clear proxy cache so a subsequent reload starts fresh (§8 bug #2).
         self._proxy_cache.clear()
+
+        # B-05: restore advertise_host if we overrode it. Only revert when
+        # node_info still shows the onion we set — if some other layer has
+        # rewritten host since, leave it alone.
+        if self._pre_override_host is not None:
+            try:
+                node = getattr(self._ctx, "_node", None) if self._ctx is not None else None
+                if node is not None and hasattr(node, "node_info"):
+                    current = node.node_info
+                    if getattr(current, "host", "") == self._own_onion:
+                        node.node_info = NodeInfo(
+                            node_id=current.node_id,
+                            host=self._pre_override_host,
+                            port=current.port,
+                        )
+                        log.info(
+                            "TOR_ADVERTISE_HOST_RESTORED host=%s",
+                            self._pre_override_host,
+                        )
+            except Exception as e:
+                log.debug("TOR_ADVERTISE_HOST_RESTORE_FAIL err=%s", e)
+            self._pre_override_host = None

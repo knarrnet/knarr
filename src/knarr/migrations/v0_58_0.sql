@@ -1,0 +1,1 @@
+ALTER TABLE peers ADD COLUMN failed_count INTEGER DEFAULT 0;
