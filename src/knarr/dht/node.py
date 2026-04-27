@@ -19,7 +19,13 @@ from datetime import datetime, timezone
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Set, Callable
-from ..core.crypto import SigningKey, VerifyKey, get_tls_peer_cert_fingerprint
+from ..core.crypto import (
+    DEFAULT_SAMPLE_MAX_AGE_SECONDS,
+    SigningKey,
+    VerifyKey,
+    get_tls_peer_cert_fingerprint,
+    verify_skill_sample,
+)
 
 from .. import __version__
 from ..core.models import NodeInfo, SkillSheet, Task, Policy, GroupPolicy, SkillPolicy
@@ -245,6 +251,10 @@ class DHTNode:
         self.policy = policy or Policy(initial_credit=_soft, min_balance=_hard)
         self._config = config or {}
         self._ephemeral = ephemeral
+        # A-05 (v0.58.0): lock tls_pin_certs at node start — reloads cannot change it
+        self._tls_pin_certs_locked = bool(
+            (self._config.get("node", {}) or {}).get("tls_pin_certs", True)
+        )
         
         self._write_queue: asyncio.Queue = asyncio.Queue()
         self._write_queue_proto: asyncio.Queue = asyncio.Queue()  # priority: heartbeat, peer upserts
@@ -768,14 +778,8 @@ class DHTNode:
         # For async jobs, msg.task_id is the generated job_id (sent in TaskStatus)
         job_id = msg.input_data.get("_job_id") or msg.task_id
 
-        # v0.33.0 C-track: configurable default timeout
-        _default_timeout_s = float(self._config.get("skills", {}).get("default_timeout", 30))
-        max_timeout = self._config.get("node", {}).get("max_task_timeout", 3600)
-        _req_timeout_s = msg.timeout_ms / 1000.0 if msg.timeout_ms else _default_timeout_s
-        if max_timeout > 0:
-            handler_timeout = min(_req_timeout_s, max_timeout)
-        else:
-            handler_timeout = _req_timeout_s
+        # A-10: unified handler-timeout resolution (msg → skill_cfg → default).
+        handler_timeout = self._resolve_handler_timeout(msg, skill_cfg)
 
         input_hash = None  # M-6: ensure defined for exception handlers
         try:
@@ -1261,11 +1265,10 @@ class DHTNode:
         start_time = time.time()
         input_size = len(json.dumps(msg.input_data)) if msg.input_data else 0
 
-        # v0.33.0 C-track: configurable default timeout
-        _default_timeout_s = float(self._config.get("skills", {}).get("default_timeout", 30))
-        max_timeout = self._config.get("node", {}).get("max_task_timeout", 3600)
-        _req_timeout_s = msg.timeout_ms / 1000.0 if msg.timeout_ms else _default_timeout_s
-        handler_timeout = min(_req_timeout_s, max_timeout) if max_timeout > 0 else _req_timeout_s
+        # A-10: unified handler-timeout resolution. Fast path did not previously
+        # honour skill_cfg["timeout"]; the helper fixes that.
+        skill_cfg = self._get_skill_runtime_config(skill_name) or {}
+        handler_timeout = self._resolve_handler_timeout(msg, skill_cfg)
 
         # Emit task.started and write order_executing receipt (parity with async path)
         if self.bus:
@@ -3738,7 +3741,7 @@ class DHTNode:
         transport: Optional[TransportMetadata] = None,
     ) -> None:
         """Apply TOFU TLS certificate pinning after message authentication succeeds."""
-        if not self._config.get("node", {}).get("tls_pin_certs", True):
+        if not self._tls_pin_certs_locked:  # A-05 (v0.58.0): use locked value
             return
         metadata = self._transport_metadata_for(msg, transport)
 
@@ -3757,7 +3760,7 @@ class DHTNode:
         host: str,
         port: int,
     ) -> None:
-        if not self._config.get("node", {}).get("tls_pin_certs", True):
+        if not self._tls_pin_certs_locked:  # A-05 (v0.58.0): use locked value
             return
         if not fingerprint or not node_id:
             return
@@ -3833,6 +3836,47 @@ class DHTNode:
             f"TLS cert fingerprint mismatch for {node_id[:16]}: stored={stored} got={fingerprint}"
         )
 
+    def _on_config_reload(self, new_config: dict) -> None:
+        """Apply a hot-reload config update. tls_pin_certs is locked and never updated."""
+        new_pin = bool(new_config.get("node", {}).get("tls_pin_certs", True))
+        if new_pin != self._tls_pin_certs_locked:
+            logger.warning(
+                "CONFIG_RELOAD_TLS_PIN_IGNORED tls_pin_certs=%s locked=%s — "
+                "restart node to change TLS pinning behavior",
+                new_pin, self._tls_pin_certs_locked,
+            )
+        self._config = new_config
+
+    def _sample_max_age_seconds(self) -> float:
+        try:
+            return float(
+                self._config.get("policy", {}).get(
+                    "sample_max_age_seconds",
+                    DEFAULT_SAMPLE_MAX_AGE_SECONDS,
+                )
+            )
+        except (TypeError, ValueError):
+            return float(DEFAULT_SAMPLE_MAX_AGE_SECONDS)
+
+    def _merge_peer_samples(self, samples: list[dict]) -> list[dict]:
+        if not samples:
+            return []
+        max_age = self._sample_max_age_seconds()
+        retained = []
+        dropped = 0
+        trusted_raters = self._config.get("reputation", {}).get("trusted_raters") or None
+        for sample in samples:
+            if verify_skill_sample(sample, sample_max_age_seconds=max_age, trusted_raters=trusted_raters):
+                retained.append(sample)
+            else:
+                dropped += 1
+        if dropped:
+            logger.warning(
+                "SAMPLE_INGEST_DROPPED dropped_count=%d retained_count=%d",
+                dropped, len(retained),
+            )
+        return retained
+
     async def _process_message(self, msg: Message, peer_ip: str = "") -> Optional[Message]:
         """Processes a received message and returns a signed response."""
         # L-06: reject messages with malformed public_key (odd-length hex crashes bytes.fromhex)
@@ -3889,6 +3933,8 @@ class DHTNode:
                             )
                             continue
                         bound_samples.append(s)
+                    # A-01: drop stale samples at merge-path ingest
+                    bound_samples = self._merge_peer_samples(bound_samples)
                     # Rebuild sheet with only the correctly-bound samples
                     # (frozen dataclass — use dataclasses.replace)
                     if len(bound_samples) != len(raw_samples):
@@ -4705,14 +4751,8 @@ class DHTNode:
                 )
                 return self._sign(TaskResult(task_id=msg.task_id, status="failed", error=err))
 
-        # v0.33.0 C-track: configurable default timeout
-        _default_timeout_s = float(self._config.get("skills", {}).get("default_timeout", 30))
-        max_timeout = self._config.get("node", {}).get("max_task_timeout", 3600)
-        _req_timeout_s = msg.timeout_ms / 1000.0 if msg.timeout_ms else _default_timeout_s
-        if max_timeout > 0:
-            handler_timeout = min(_req_timeout_s, max_timeout)
-        else:
-            handler_timeout = _req_timeout_s
+        # A-10: unified handler-timeout resolution (msg → skill_cfg → default).
+        handler_timeout = self._resolve_handler_timeout(msg, skill_cfg)
 
         input_size = len(json.dumps(msg.input_data)) if msg.input_data else 0
         start_time = time.time()
@@ -5986,6 +6026,46 @@ class DHTNode:
         skill_cfg = skills_cfg.get(skill_name, {})
         return dict(skill_cfg) if isinstance(skill_cfg, dict) else {}
 
+    def _resolve_handler_timeout(
+        self,
+        msg: "TaskRequest",
+        skill_cfg: Optional[Dict[str, Any]],
+    ) -> float:
+        """A-10: single source of truth for handler-timeout resolution.
+
+        Precedence (first wins):
+          1. ``msg.timeout_ms`` — caller-supplied, converted from ms to s.
+          2. ``skill_cfg["timeout"]`` — per-skill default from
+             ``[skills."name"]``.
+          3. ``[skills] default_timeout`` — cluster-wide default (30s).
+
+        The resolved value is then capped at ``[node] max_task_timeout``
+        (default 3600s). A zero or negative cap disables capping.
+
+        Prior to this helper the same precedence block was copied into three
+        dispatch sites; two of them ignored ``skill_cfg["timeout"]``, so the
+        per-skill knob was silently a no-op except on the slow-queue path.
+        """
+        skills_cfg = self._config.get("skills", {}) if isinstance(self._config, dict) else {}
+        default_timeout = float(skills_cfg.get("default_timeout", 30))
+        node_cfg = self._config.get("node", {}) if isinstance(self._config, dict) else {}
+        max_timeout = float(node_cfg.get("max_task_timeout", 3600))
+
+        if getattr(msg, "timeout_ms", 0):
+            requested = msg.timeout_ms / 1000.0
+        else:
+            skill_timeout = None
+            if skill_cfg and "timeout" in skill_cfg:
+                try:
+                    skill_timeout = float(skill_cfg["timeout"])
+                except (TypeError, ValueError):
+                    skill_timeout = None
+            requested = skill_timeout if skill_timeout and skill_timeout > 0 else default_timeout
+
+        if max_timeout > 0:
+            return min(requested, max_timeout)
+        return requested
+
     def _get_skill_min_price(self, skill_name: str) -> Optional[float]:
         skill_cfg = self._get_skill_runtime_config(skill_name)
         if "min_price" not in skill_cfg:
@@ -6302,6 +6382,7 @@ class DHTNode:
             send_mail_fn=_send_confirmation_mail,
             bus=self.bus,
             config=self._config,
+            enqueue_write=self._enqueue_write,  # A-06 (v0.58.0): serialize writes
         )
         if self.bus:
             self.bus.emit(
@@ -6633,14 +6714,29 @@ class DHTNode:
                 logger.warning(f"FLUSH_OUTBOX_FAIL: {e}")
 
     async def _pull_from_correspondents_loop(self):
-        """Independent background loop for pulling mail from correspondents."""
-        interval = max(1.0, float(self._config.get("mail", {}).get("pull_interval", 300)))
+        """Independent background loop for pulling mail from correspondents.
+
+        B-02: pull_timeout is configurable via [mail] pull_timeout (default
+        60s). The previous hard-coded 5s deadline was shorter than the
+        per-peer exponential backoff inside pull_from_correspondents
+        (0+2+4+8+16 ≈ 30s of sleeps alone), so every sweep with more than
+        one correspondent tripped PULL_TIMEOUT. The backoff has been removed
+        in sync.py; this deadline now only needs to cover per-peer RPC.
+        """
+        mail_cfg = self._config.get("mail", {}) if isinstance(self._config, dict) else {}
+        interval = max(1.0, float(mail_cfg.get("pull_interval", 300)))
+        pull_timeout = max(1.0, float(mail_cfg.get("pull_timeout", 60)))
         while self._running:
             await asyncio.sleep(interval)
             try:
-                await asyncio.wait_for(self._sync.pull_from_correspondents(), timeout=5.0)
+                await asyncio.wait_for(
+                    self._sync.pull_from_correspondents(), timeout=pull_timeout
+                )
             except asyncio.TimeoutError:
-                logger.warning("PULL_TIMEOUT pull_from_correspondents exceeded 5s deadline")
+                logger.warning(
+                    "PULL_TIMEOUT pull_from_correspondents exceeded %ss deadline",
+                    pull_timeout,
+                )
             except Exception as e:
                 logger.warning(f"PULL_FROM_CORRESPONDENTS_FAIL: {e}")
 

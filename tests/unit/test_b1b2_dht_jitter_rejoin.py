@@ -150,6 +150,10 @@ async def test_sweep_loop_triggers_rejoin_on_single_peer_after_timeout():
 
     node.storage = MagicMock()
     node.storage.get_peers = MagicMock(return_value=[mock_peer])
+    # D-02.1: delegate to_protocol_thread to the wrapped callable so the sweep
+    # loop sees the mocked storage return value instead of hanging on the real
+    # protocol-pool dispatch.
+    node.to_protocol_thread = AsyncMock(side_effect=lambda fn, *a, **kw: fn(*a, **kw))
 
     with patch("asyncio.sleep", new=AsyncMock()), \
          patch.object(node, "_peer_heartbeat_sweep", new=AsyncMock()):
@@ -193,6 +197,8 @@ async def test_sweep_loop_does_not_rejoin_immediately_on_single_peer():
 
     node.storage = MagicMock()
     node.storage.get_peers = MagicMock(return_value=[mock_peer])
+    # D-02.1: delegate to_protocol_thread so the sweep loop sees mocked peers.
+    node.to_protocol_thread = AsyncMock(side_effect=lambda fn, *a, **kw: fn(*a, **kw))
 
     loop_count = [0]
 
@@ -237,6 +243,8 @@ async def test_sweep_loop_still_rebootstraps_on_zero_peers():
     node.join = fake_join
     node.storage = MagicMock()
     node.storage.get_peers = MagicMock(return_value=[])  # zero peers
+    # D-02.1: delegate to_protocol_thread so the sweep loop sees mocked peers.
+    node.to_protocol_thread = AsyncMock(side_effect=lambda fn, *a, **kw: fn(*a, **kw))
 
     with patch("asyncio.sleep", new=AsyncMock()):
         try:

@@ -226,6 +226,10 @@ class PunchholeBackendPlugin(PluginHooks):
                 "skill.registered",
                 "skill.removed",
                 "configuration.order",
+                "peer.connected",
+                "peer.connect_failed",
+                "peer.connection_failed",
+                "peer.failed",
             )
             asyncio.ensure_future(self._miss_loop())
             asyncio.ensure_future(self._stale_loop())
@@ -966,12 +970,54 @@ class PunchholeBackendPlugin(PluginHooks):
         "configuration.order": [],  # handled below — stales card + affected objects
     }
 
+    def record_outbound_failure(self, node_id: str) -> None:
+        node_id = str(node_id or "")
+        if not node_id or not self._ctx.storage_path:
+            return
+        try:
+            conn = sqlite3.connect(self._ctx.storage_path, timeout=5)
+            conn.execute(
+                """
+                UPDATE peers
+                SET failed_count = COALESCE(failed_count, 0) + 1
+                WHERE node_id = ?
+                """,
+                (node_id,),
+            )
+            conn.commit()
+            conn.close()
+            if self._debug:
+                log.info(f"PUNCHHOLE_FAILED_COUNT_INC node_id={node_id[:16]}")
+        except Exception as exc:
+            log.warning(f"punchhole-backend: failed_count increment failed: {exc}")
+
+    def record_outbound_success(self, node_id: str) -> None:
+        node_id = str(node_id or "")
+        if not node_id or not self._ctx.storage_path:
+            return
+        try:
+            conn = sqlite3.connect(self._ctx.storage_path, timeout=5)
+            conn.execute("UPDATE peers SET failed_count = 0 WHERE node_id = ?", (node_id,))
+            conn.commit()
+            conn.close()
+            if self._debug:
+                log.info(f"PUNCHHOLE_FAILED_COUNT_RESET node_id={node_id[:16]}")
+        except Exception as exc:
+            log.warning(f"punchhole-backend: failed_count reset failed: {exc}")
+
     async def _stale_loop(self):
         """Watch internal events and emit cache.stale.* for affected objects."""
         while True:
             try:
                 event = await self._internal_sub.next()
                 etype = event.get("event", "")
+
+                if etype == "peer.connected":
+                    self.record_outbound_success(event.get("node_id", ""))
+                    continue
+                if etype in {"peer.connect_failed", "peer.connection_failed", "peer.failed"}:
+                    self.record_outbound_failure(event.get("node_id", ""))
+                    continue
 
                 stale_keys = self._STALE_MAP.get(etype, [])
 

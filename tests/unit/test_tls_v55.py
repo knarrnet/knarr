@@ -140,6 +140,48 @@ class TestConnectionPoolTLS:
             await server.wait_closed()
 
 
+class TestTLSCertStability:
+    def test_serial_stable_across_regeneration(self, tmp_path):
+        """Same node_id must yield same serial on forced regeneration (TOFU guarantee)."""
+        from knarr.mail.tls import generate_tls_cert
+        from cryptography.x509 import load_pem_x509_certificate
+
+        sk = SigningKey.generate()
+        node_id = hashlib.sha256(sk.verify_key.encode()).hexdigest()
+
+        cert_path, _ = generate_tls_cert(sk.encode(), node_id, str(tmp_path))
+        with open(cert_path, "rb") as f:
+            serial1 = load_pem_x509_certificate(f.read()).serial_number
+
+        generate_tls_cert(sk.encode(), node_id, str(tmp_path), force=True)
+        with open(cert_path, "rb") as f:
+            serial2 = load_pem_x509_certificate(f.read()).serial_number
+
+        assert serial1 == serial2
+
+    def test_different_node_ids_yield_different_serials(self, tmp_path):
+        from knarr.mail.tls import generate_tls_cert
+        from cryptography.x509 import load_pem_x509_certificate
+
+        sk1 = SigningKey.generate()
+        sk2 = SigningKey.generate()
+        id1 = hashlib.sha256(sk1.verify_key.encode()).hexdigest()
+        id2 = hashlib.sha256(sk2.verify_key.encode()).hexdigest()
+
+        d1, d2 = tmp_path / "n1", tmp_path / "n2"
+        d1.mkdir(); d2.mkdir()
+
+        cert1, _ = generate_tls_cert(sk1.encode(), id1, str(d1))
+        cert2, _ = generate_tls_cert(sk2.encode(), id2, str(d2))
+
+        with open(cert1, "rb") as f:
+            s1 = load_pem_x509_certificate(f.read()).serial_number
+        with open(cert2, "rb") as f:
+            s2 = load_pem_x509_certificate(f.read()).serial_number
+
+        assert s1 != s2
+
+
 class TestNodeTLSConfig:
     """Test that node.py reads TLS config correctly."""
 

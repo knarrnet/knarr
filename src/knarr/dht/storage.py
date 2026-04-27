@@ -148,7 +148,8 @@ class Storage:
                 node_id TEXT PRIMARY KEY,
                 host TEXT NOT NULL,
                 port INTEGER NOT NULL,
-                last_seen REAL NOT NULL
+                last_seen REAL NOT NULL,
+                failed_count INTEGER DEFAULT 0
             )
         """)
         cursor.execute("""
@@ -230,6 +231,7 @@ class Storage:
         for col, col_type, default in [
             ("load", "INTEGER", "DEFAULT -1"),
             ("wallet", "TEXT", "DEFAULT ''"),
+            ("failed_count", "INTEGER", "DEFAULT 0"),
         ]:
             if col not in peer_columns:
                 try:
@@ -648,6 +650,26 @@ class Storage:
     def remove_peer(self, node_id: str):
         conn = self._get_conn()
         conn.execute("DELETE FROM peers WHERE node_id = ?", (node_id,))
+        conn.commit()
+
+    def increment_peer_failed_count(self, node_id: str):
+        conn = self._get_conn()
+        conn.execute(
+            """
+            UPDATE peers
+            SET failed_count = COALESCE(failed_count, 0) + 1
+            WHERE node_id = ?
+            """,
+            (node_id,),
+        )
+        conn.commit()
+
+    def reset_peer_failed_count(self, node_id: str):
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE peers SET failed_count = 0 WHERE node_id = ?",
+            (node_id,),
+        )
         conn.commit()
 
     def upsert_skill(self, skill_key: str, provider_node_id: str, skill_sheet: SkillSheet,
@@ -1348,61 +1370,37 @@ class Storage:
     def get_or_create_ledger_entry(self, peer_public_key: str = "", initial_balance: float = 0.0, initial_trust: float = 0.3) -> LedgerEntry:
         """Gets or creates a ledger entry. New entries get initial_balance and initial_trust."""
         conn = self._get_conn()
-        cursor = conn.execute(
-            "SELECT peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated, held_balance, "
-            "prepaid, hard_limit "
-            "FROM ledger WHERE peer_public_key = ?", (peer_public_key,)
-        )
-        row = cursor.fetchone()
-        if row:
-            if peer_public_key:
-                try:
-                    node_id = hashlib.sha256(bytes.fromhex(peer_public_key)).hexdigest()
-                    conn.execute("""
-                        INSERT INTO peer_keys (node_id, public_key)
-                        VALUES (?, ?)
-                        ON CONFLICT(node_id) DO UPDATE SET public_key=excluded.public_key
-                    """, (node_id, peer_public_key))
-                    conn.commit()
-                except Exception:
-                    pass
-            return LedgerEntry(
-                peer_public_key=row[0], balance=row[1],
-                tasks_provided=row[2], tasks_consumed=row[3],
-                first_seen=row[4], last_updated=row[5],
-                held_balance=row[6] if row[6] is not None else 0.0,
-                prepaid=row[7] if row[7] is not None else 0.0,
-                hard_limit=row[8] if row[8] is not None else -10.0,
-            )
-        # Create new entry
         now = time.time()
-        # Cap ledger size
-        count = conn.execute("SELECT COUNT(*) FROM ledger").fetchone()[0]
-        if count >= MAX_LEDGER_ENTRIES:
-            # Evict oldest
-            conn.execute("""
-                DELETE FROM ledger WHERE peer_public_key = (
-                    SELECT peer_public_key FROM ledger ORDER BY last_updated ASC LIMIT 1
-                )
-            """)
         # A1.2: New entries always start at balance=0.0 (security rule — prevents
         # callers from inflating peer balances at creation time via initial_balance).
         # soft_limit and hard_limit use the intended migration defaults (-5.0/-10.0)
         # rather than the column DEFAULT (0.0 from v0.31.0, a migration artefact).
         try:
-            conn.execute(
-                "INSERT INTO ledger (peer_public_key, balance, tasks_provided, tasks_consumed, "
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO ledger (peer_public_key, balance, tasks_provided, tasks_consumed, "
                 "first_seen, last_updated, trust, held_balance, soft_limit, hard_limit) "
                 "VALUES (?, 0.0, 0, 0, ?, ?, ?, ?, -5.0, -10.0)",
                 (peer_public_key, now, now, initial_trust, 0.0)
             )
         except Exception:
             # soft_limit/hard_limit columns may not exist on pre-migration DBs
-            conn.execute(
-                "INSERT INTO ledger (peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated, trust, held_balance) "
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO ledger (peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated, trust, held_balance) "
                 "VALUES (?, 0.0, 0, 0, ?, ?, ?, ?)",
                 (peer_public_key, now, now, initial_trust, 0.0)
             )
+        if cur.rowcount > 0:
+            count = conn.execute("SELECT COUNT(*) FROM ledger").fetchone()[0]
+            if count > MAX_LEDGER_ENTRIES:
+                conn.execute("""
+                    DELETE FROM ledger WHERE peer_public_key = (
+                        SELECT peer_public_key
+                        FROM ledger
+                        WHERE peer_public_key != ?
+                        ORDER BY last_updated ASC
+                        LIMIT 1
+                    )
+                """, (peer_public_key,))
         if peer_public_key:
             try:
                 node_id = hashlib.sha256(bytes.fromhex(peer_public_key)).hexdigest()
@@ -1414,6 +1412,21 @@ class Storage:
             except Exception:
                 pass
         conn.commit()
+        cursor = conn.execute(
+            "SELECT peer_public_key, balance, tasks_provided, tasks_consumed, first_seen, last_updated, held_balance, "
+            "prepaid, hard_limit "
+            "FROM ledger WHERE peer_public_key = ?", (peer_public_key,)
+        )
+        row = cursor.fetchone()
+        if row:
+            return LedgerEntry(
+                peer_public_key=row[0], balance=row[1],
+                tasks_provided=row[2], tasks_consumed=row[3],
+                first_seen=row[4], last_updated=row[5],
+                held_balance=row[6] if row[6] is not None else 0.0,
+                prepaid=row[7] if row[7] is not None else 0.0,
+                hard_limit=row[8] if row[8] is not None else -10.0,
+            )
         return LedgerEntry(
             peer_public_key=peer_public_key, balance=0.0,  # TEST-03: always 0.0 — matches DB INSERT
             tasks_provided=0, tasks_consumed=0, first_seen=now, last_updated=now,

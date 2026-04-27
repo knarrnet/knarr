@@ -994,6 +994,16 @@ class BCWPlugin(PluginHooks):
         )
 
     def _process_transfer(self, transfer: TransferEvent, correlation_id: Optional[str] = None) -> None:
+        if transfer.mint_address and transfer.mint_address != self._knarr_mint():
+            if getattr(self, "_debug", False):
+                logger = getattr(self._ctx, "log", None)
+                if logger and hasattr(logger, "info"):
+                    logger.info(
+                        f"BCW_MINT_DROP chain_id={transfer.chain_id} "
+                        f"tx_hash={transfer.tx_hash} tx_index={transfer.tx_index}"
+                    )
+            return
+
         receipt_type = self._classify_transfer(transfer)
         if not receipt_type:
             return

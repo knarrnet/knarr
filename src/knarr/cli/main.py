@@ -8,6 +8,7 @@ import shlex
 import signal
 import sys
 import os
+import re
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 from dataclasses import asdict
@@ -107,11 +108,197 @@ def _log_operator_backup_instruction(data_dir: str) -> None:
         os.path.join(data_dir, "plugin_state", "06-thrall", "thrall_identity.key"),
     )
 
+async def _sidecar_has_asset(
+    host: str, port: int, content_hash: str, signing_key: SigningKey
+) -> bool:
+    """B-08: signed HEAD probe against /assets/<hash>.
+
+    Returns True only on a clean 200 response. Any transport error, 404,
+    auth failure, or unexpected status returns False so the caller falls
+    back to the normal PUT path — the probe is a best-effort optimisation,
+    never a silent skip.
+    """
+    import time
+    from ..mail.tls import create_client_ssl_context
+
+    timestamp = str(int(time.time()))
+    pub_key_hex = signing_key.verify_key.encode().hex()
+    payload = f"HEAD:/assets/{content_hash}:{timestamp}:empty".encode("utf-8")
+    signature = signing_key.sign(payload).signature.hex()
+
+    ssl_ctx = create_client_ssl_context()
+    try:
+        reader, writer = await asyncio.open_connection(host, port, ssl=ssl_ctx)
+    except (ConnectionRefusedError, OSError):
+        return False
+    try:
+        req = (
+            f"HEAD /assets/{content_hash} HTTP/1.1\r\n"
+            f"x-knarr-publickey: {pub_key_hex}\r\n"
+            f"x-knarr-signature: {signature}\r\n"
+            f"x-knarr-timestamp: {timestamp}\r\n\r\n"
+        ).encode()
+        writer.write(req)
+        await writer.drain()
+        line = await reader.readline()
+        return b"200 OK" in line
+    except Exception:
+        return False
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def upload_inputs(
+    input_data: dict,
+    host: str,
+    sidecar_port: int,
+    signing_key: SigningKey,
+) -> dict:
+    """C-06: rewrite ``@file`` / ``@data`` references in ``input_data`` to
+    ``knarr-asset://<hash>`` URIs after uploading the bytes to the provider's
+    sidecar.
+
+    Accepted shapes:
+      * ``"@path/to/file"`` (CLI legacy shape — string starting with ``@``)
+      * ``{"@file": "path"}`` (explicit dict form for programmatic callers)
+      * ``{"@data": "<base64>"}`` (inline bytes for programmatic callers)
+
+    Returns the mutated dict (same identity as input). If sidecar_port is
+    not set the mapping is left untouched — the provider cannot accept
+    side-channel assets.
+    """
+    import base64
+
+    if not sidecar_port or sidecar_port <= 0:
+        return input_data
+
+    for key, value in list(input_data.items()):
+        data_bytes: Optional[bytes] = None
+        if isinstance(value, str) and value.startswith("@"):
+            path = value[1:]
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"input '{key}': file not found: {path}")
+            with open(path, "rb") as f:
+                data_bytes = f.read()
+        elif isinstance(value, dict) and "@file" in value:
+            path = str(value["@file"])
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"input '{key}': file not found: {path}")
+            with open(path, "rb") as f:
+                data_bytes = f.read()
+        elif isinstance(value, dict) and "@data" in value:
+            try:
+                data_bytes = base64.b64decode(str(value["@data"]), validate=True)
+            except Exception as e:
+                raise ValueError(f"input '{key}': invalid base64 for @data: {e}")
+
+        if data_bytes is not None:
+            content_hash = await upload_asset(host, sidecar_port, data_bytes, signing_key)
+            input_data[key] = f"knarr-asset://{content_hash}"
+
+    return input_data
+
+
+_SAFE_KEY_RE = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def _safe_output_filename(key: str, asset_hash: str) -> str:
+    """Sanitize a provider-supplied output key for use as a local filename.
+
+    The output key comes from a remote provider's ``TaskResult.output_data``
+    and is untrusted. We strip everything that isn't alphanumeric / ``_ -``,
+    collapse any remaining ``..`` sequences, and take only the basename —
+    so neither absolute paths nor ``..`` segments can escape the caller's
+    chosen directory. An empty sanitized key falls back to the hash prefix.
+    """
+    scrubbed = _SAFE_KEY_RE.sub("_", key)[:64]
+    scrubbed = os.path.basename(scrubbed).strip(".")
+    # Collapse any residual "..": even after stripping separators, a value
+    # like "../.." with `.` whitelisted could leave them in-place.
+    while ".." in scrubbed:
+        scrubbed = scrubbed.replace("..", "_")
+    scrubbed = scrubbed or "asset"
+    return f"{scrubbed}_{asset_hash[:12]}"
+
+
+async def fetch_outputs(
+    output_data: dict,
+    host: str,
+    sidecar_port: int,
+    signing_key: SigningKey,
+    output_dir: Optional[str] = None,
+) -> list:
+    """C-06: download asset-valued output fields from a provider's sidecar.
+
+    Scans string values for ``knarr-asset://<hash>`` or bare 64-char hex
+    hashes. Returns a list of dicts: ``{"key", "hash", "bytes", "path"}``.
+    If ``output_dir`` is given, each asset is written to a sanitized
+    ``<dir>/<safe_key>_<hash[:12]>`` filename; otherwise ``path`` is None
+    and the bytes are held in-memory in an added ``data`` key.
+
+    The output key is untrusted (it comes from a remote provider), so the
+    filename portion is sanitised via ``_safe_output_filename`` before
+    joining with ``output_dir``. No caller is allowed to write outside
+    ``output_dir``.
+    """
+    results: list = []
+    if not sidecar_port or sidecar_port <= 0:
+        return results
+
+    resolved_dir = None
+    if output_dir:
+        resolved_dir = os.path.realpath(output_dir)
+        os.makedirs(resolved_dir, exist_ok=True)
+
+    for key, value in output_data.items():
+        if not isinstance(value, str):
+            continue
+        asset_hash = None
+        if value.startswith("knarr-asset://"):
+            asset_hash = value[len("knarr-asset://"):]
+        elif len(value) == 64 and all(c in "0123456789abcdef" for c in value):
+            asset_hash = value
+        if not asset_hash:
+            continue
+
+        data = await download_asset(host, sidecar_port, asset_hash, signing_key)
+        entry = {"key": key, "hash": asset_hash, "bytes": len(data), "path": None}
+        if resolved_dir:
+            fname = _safe_output_filename(str(key), asset_hash)
+            out_path = os.path.realpath(os.path.join(resolved_dir, fname))
+            # Defence in depth: if realpath would escape resolved_dir, skip.
+            if not out_path.startswith(resolved_dir + os.sep) and out_path != resolved_dir:
+                continue
+            with open(out_path, "wb") as f:
+                f.write(data)
+            entry["path"] = out_path
+        else:
+            entry["data"] = data
+        results.append(entry)
+
+    return results
+
+
 async def upload_asset(host: str, port: int, data: bytes, signing_key: SigningKey) -> str:
-    """Uploads data to sidecar and returns content hash."""
+    """Uploads data to sidecar and returns content hash.
+
+    B-08: skip the PUT if the sidecar already has the asset. Identical
+    bytes always hash to the same content address, so a prior-upload hit
+    means the bytes are already on disk — re-uploading costs bandwidth
+    and serializes behind the sidecar write path for no gain. Only skip
+    on an affirmative 200; any ambiguity falls through to PUT.
+    """
     import time
     from ..mail.tls import create_client_ssl_context
     content_hash = hashlib.sha256(data).hexdigest()
+
+    if await _sidecar_has_asset(host, port, content_hash, signing_key):
+        return content_hash
+
     timestamp = str(int(time.time()))
     pub_key_hex = signing_key.verify_key.encode().hex()
 
@@ -134,17 +321,17 @@ async def upload_asset(host: str, port: int, data: bytes, signing_key: SigningKe
         ).encode()
         writer.write(headers + data)
         await writer.drain()
-        
+
         # Read status line
         line = await reader.readline()
         if b"200 OK" not in line:
             raise Exception(f"Upload failed: {line.decode().strip()}")
-            
+
         # Skip headers
         while True:
             line = await reader.readline()
             if line == b"\r\n": break
-            
+
         return content_hash
     finally:
         writer.close()
@@ -695,7 +882,7 @@ async def cmd_serve(args):
             node._skill_policies = new_skill_policies
 
             # v0.22.0: Reinitialize GroupEngine with fresh config
-            node._config = fresh_config
+            node._on_config_reload(fresh_config)
             node._init_group_engine()
             # Propagate engine + fresh config to groups plugin (mirrors start() pattern)
             config_dir = fresh_config.get("_config_dir", os.getcwd())
@@ -1034,28 +1221,18 @@ async def cmd_request(args):
             
             if res.status == "completed":
                 if args.output_dir:
-                    os.makedirs(args.output_dir, exist_ok=True)
                     sidecar_port = provider.get("sidecar_port", 0)
                     if sidecar_port > 0:
-                        for key, value in res.output_data.items():
-                            if not isinstance(value, str):
-                                continue
-                            # Accept both "knarr-asset://<hash>" and bare 64-char hex hashes
-                            asset_hash = None
-                            if value.startswith("knarr-asset://"):
-                                asset_hash = value[len("knarr-asset://"):]
-                            elif len(value) == 64 and all(c in '0123456789abcdef' for c in value):
-                                asset_hash = value
-                            if not asset_hash:
-                                continue
-                            try:
-                                file_bytes = await download_asset(provider["host"], sidecar_port, asset_hash, node._signing_key)
-                                output_path = os.path.join(args.output_dir, f"{key}_{asset_hash[:12]}")
-                                with open(output_path, "wb") as f:
-                                    f.write(file_bytes)
-                                print(f"Downloaded: {key} -> {output_path} ({len(file_bytes)} bytes)")
-                            except Exception as e:
-                                print(f"Error downloading asset {key}: {e}", file=sys.stderr)
+                        try:
+                            downloaded = await fetch_outputs(
+                                res.output_data, provider["host"], sidecar_port,
+                                node._signing_key, output_dir=args.output_dir,
+                            )
+                            for item in downloaded:
+                                if item.get("path"):
+                                    print(f"Downloaded: {item['key']} -> {item['path']} ({item['bytes']} bytes)")
+                        except Exception as e:
+                            print(f"Error downloading assets: {e}", file=sys.stderr)
 
                 if args.json:
                     print(json.dumps(res.to_dict(), indent=2))

@@ -56,6 +56,10 @@ def guard_payload(
             size, limit, len(records),
         )
 
+    # A-03: shallow-copy dict records before mutating so the caller's input
+    # is not modified in place. List is already reassignable below for truncation.
+    records = [dict(r) if isinstance(r, dict) else r for r in records]
+
     # Iteratively strip fields to reduce size
     for field_name in skip_fields:
         for record in records:

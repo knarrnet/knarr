@@ -203,6 +203,7 @@ async def execute_settlement(
     bus=None,
     config: Optional[dict] = None,
     provider_wallet: str = "",
+    enqueue_write: Optional[Callable] = None,
 ) -> str:
     """Validate dual signatures, write accepted receipt, send settle_request mail.
 
@@ -270,10 +271,24 @@ async def execute_settlement(
     signature = signed_accepted["proof"]["proofValue"]
 
     # Write settlement_accepted receipt
-    # F-04 (v0.57.0): storage calls are blocking SQLite I/O — dispatch to thread pool
     loop = asyncio.get_running_loop()
-    try:
-        await loop.run_in_executor(None, lambda: storage.write_receipt(
+
+    async def _storage_write(op, *args):
+        if enqueue_write is not None:
+            return await enqueue_write(op, *args)
+        return await loop.run_in_executor(None, lambda: op(*args))
+
+    async def _storage_read(op, *args):
+        return await loop.run_in_executor(None, lambda: op(*args))
+
+    # Dedup guard: skip if this receipt was already written (concurrent submission)
+    existing = await _storage_read(storage.get_receipt, receipt_id)
+    if existing is not None:
+        logger.warning(f"SETTLEMENT_DUPLICATE_RECEIPT id={receipt_id[:16]} — skipping")
+        return receipt_id
+
+    def _write_accepted_receipt() -> None:
+        storage.write_receipt(
             receipt_id=receipt_id,
             document_type="settlement_accepted",
             timestamp=doc["timestamp"],
@@ -283,7 +298,10 @@ async def execute_settlement(
             proof_purpose="assertionMethod",
             payload_json=payload_json_str,
             signature=signature,
-        ))
+        )
+
+    try:
+        await _storage_write(_write_accepted_receipt)
     except Exception as exc:
         logger.warning(f"SETTLEMENT_ACCEPTED_RECEIPT_FAIL id={receipt_id}: {exc}")
 
@@ -300,7 +318,7 @@ async def execute_settlement(
 
     # Send settle_request mail to counterparty
     # Resolve peer_key (public key hex) → node_id for mail routing
-    to_node = await loop.run_in_executor(None, storage.get_node_id_by_pubkey, peer_key)
+    to_node = await _storage_read(storage.get_node_id_by_pubkey, peer_key)
     if not to_node:
         raise ValueError(
             f"execute_settlement: cannot resolve peer_key to node_id — "
@@ -308,8 +326,8 @@ async def execute_settlement(
         )
 
     # Resolve balance and credit_limit for settle_request body
-    current_balance = await loop.run_in_executor(None, storage.get_ledger_balance, peer_key) or 0.0
-    ledger_entry = await loop.run_in_executor(None, storage.get_or_create_ledger_entry, peer_key)
+    current_balance = await _storage_read(storage.get_ledger_balance, peer_key) or 0.0
+    ledger_entry = await _storage_write(storage.get_or_create_ledger_entry, peer_key)
     credit_limit = ledger_entry.hard_limit
 
     settle_body = {

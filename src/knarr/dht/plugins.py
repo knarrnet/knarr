@@ -24,6 +24,27 @@ _PROTOCOL_EVENT_PREFIXES = ("peer.", "node.", "security.", "cache.")
 _PROTOCOL_EVENT_NAMES = {"skill.registered", "skill.removed"}
 
 
+def _is_relative_to(path: Path, prefix: Path) -> bool:
+    try:
+        path.relative_to(prefix)
+        return True
+    except ValueError:
+        return False
+
+
+def _knarr_install_prefix() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    try:
+        import knarr
+        package_file = getattr(knarr, "__file__", "")
+        if package_file:
+            return Path(package_file).resolve().parent
+    except Exception:
+        pass
+    return Path(__file__).resolve().parents[1]
+
+
 def is_protocol_event(event_type: str) -> bool:
     """A-02: Classify event topic as protocol (shared) vs identity (scoped)."""
     event_type = str(event_type or "")
@@ -438,6 +459,11 @@ class PluginLoader:
         seen: set = set()
         if root is None or not root.is_dir():
             return entries, seen
+        source_prefix = (
+            _knarr_install_prefix()
+            if source_label == "package"
+            else root.parent.resolve()
+        )
         # Adversary #4 fix (v0.56.0): case-insensitive seen_names comparison
         # prevents dual loading when the same plugin appears with different
         # casing in two sources (e.g., `MyPlugin` in node-local and `myplugin`
@@ -446,6 +472,13 @@ class PluginLoader:
         skip = {s.lower() for s in (skip_names or set())}
         for plugin_path in root.iterdir():
             if not plugin_path.is_dir():
+                continue
+            resolved_plugin_path = plugin_path.resolve()
+            if not _is_relative_to(resolved_plugin_path, source_prefix):
+                log.warning(
+                    "PLUGIN_ROOT_REJECTED source=%s nominal=%s resolved=%s",
+                    source_label, plugin_path, resolved_plugin_path,
+                )
                 continue
             toml_path = plugin_path / "plugin.toml"
             if not toml_path.is_file():
@@ -487,6 +520,61 @@ class PluginLoader:
             entries.append((priority, plugin_path.name.lower(), plugin_path, plugin_config))
         return entries, seen
 
+    def _check_plugin_drift(
+        self,
+        plugin_name: str,
+        local_path: Path,
+        package_path: Path,
+        local_config: Path,
+        package_config: Path,
+    ) -> None:
+        """B-06 (v0.58.0): compare handler source between local and package.
+
+        If the handler source bytes differ, emit one WARNING with the plugin
+        name and short hash prefixes of both sources. Load behavior is
+        unchanged — local still wins.
+        """
+        def _handler_file(plugin_dir: Path) -> Optional[Path]:
+            toml = plugin_dir / "plugin.toml"
+            if not toml.is_file():
+                return None
+            try:
+                import tomllib as _t
+                cfg = _t.loads(toml.read_text())
+                handler = cfg.get("handler", "")
+                if ":" in handler:
+                    mod_name = handler.split(":")[0]
+                    return plugin_dir / f"{mod_name}.py"
+            except Exception:
+                pass
+            return None
+
+        local_handler = _handler_file(local_path)
+        pkg_handler = _handler_file(package_path)
+
+        if local_handler is None or pkg_handler is None:
+            return
+        if not local_handler.is_file() or not pkg_handler.is_file():
+            return
+
+        try:
+            local_bytes = local_handler.read_bytes()
+            pkg_bytes = pkg_handler.read_bytes()
+        except OSError:
+            return
+
+        if local_bytes == pkg_bytes:
+            return
+
+        import hashlib
+        local_hash = hashlib.sha256(local_bytes).hexdigest()[:8]
+        pkg_hash = hashlib.sha256(pkg_bytes).hexdigest()[:8]
+
+        log.warning(
+            "PLUGIN_DRIFT name=%s local_hash=%s package_hash=%s (local wins)",
+            plugin_name, local_hash, pkg_hash,
+        )
+
     def load_plugins(self) -> None:
         """
         Scans for and loads plugins. Logs warnings for failures but continues startup.
@@ -511,9 +599,37 @@ class PluginLoader:
         # 2. Package fallback — shipped plugins under src/knarr/plugins/
         pkg_root = self._find_package_plugin_root()
         if pkg_root is not None and pkg_root != self._plugin_root:
-            pkg_entries, _ = self._scan_plugin_source(
-                pkg_root, source_label="package", skip_names=seen_names,
+            pkg_entries_all, _ = self._scan_plugin_source(
+                pkg_root, source_label="package",
             )
+            # B-06: drift detection — compare handler source when both exist
+            local_by_name: dict[str, Path] = {}
+            for _, _, ppath, _ in local_entries:
+                toml_path = ppath / "plugin.toml"
+                if toml_path.is_file():
+                    try:
+                        import tomllib as _tomllib
+                        cfg = _tomllib.loads(toml_path.read_text())
+                        pname = str(cfg.get("name", ppath.name))
+                    except Exception:
+                        pname = ppath.name
+                    local_by_name[pname.lower()] = ppath
+
+            for _, _, ppath, pcfg in pkg_entries_all:
+                pname = str(pcfg.get("name", ppath.name))
+                if pname.lower() in local_by_name:
+                    self._check_plugin_drift(
+                        plugin_name=pname,
+                        local_path=local_by_name[pname.lower()],
+                        package_path=ppath,
+                        local_config=local_by_name[pname.lower()].parent / "plugin.toml",
+                        package_config=ppath / "plugin.toml",
+                    )
+
+            pkg_entries = [
+                entry for entry in pkg_entries_all
+                if str(entry[3].get("name", entry[2].name)).lower() not in seen_names
+            ]
             plugin_entries.extend(pkg_entries)
 
         if not plugin_entries:

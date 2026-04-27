@@ -52,7 +52,7 @@ def generate_tls_cert(signing_key_bytes: bytes, node_id: str, config_dir: str,
         .subject_name(subject)
         .issuer_name(issuer)
         .public_key(private_key.public_key())
-        .serial_number(x509.random_serial_number())
+        .serial_number(int.from_bytes(bytes.fromhex(node_id)[:16], "big") or 1)
         .not_valid_before(now)
         .not_valid_after(now + datetime.timedelta(days=days))
         .sign(private_key, algorithm=None)
