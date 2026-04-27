@@ -236,6 +236,30 @@ async def main():
 asyncio.run(main())
 ```
 
+## Dynamic Skill Registration
+
+Skills can be registered at runtime via the cockpit API without restarting the node. Controlled by policy flags in `knarr.toml`:
+
+```toml
+[policy]
+dynamic_enabled = true          # allow runtime skill registration (default: false)
+max_dynamic_skills = 10         # cap on concurrently registered dynamic skills (default: 10)
+require_signed_packages = false # if true, all installs require a valid .sig (default: false)
+```
+
+Register a skill via the cockpit API:
+
+```bash
+curl -X POST http://127.0.0.1:8085/api/skill/register \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-skill", "handler": "skills/my_skill.py:handle", "description": "...", "tags": ["example"]}'
+```
+
+Returns `200` on success, `400` if `dynamic_enabled=false` or the limit is reached.
+
+---
+
 ## Bridging MCP Servers
 
 Expose existing Model Context Protocol (MCP) servers as Knarr skills:
@@ -392,11 +416,16 @@ output_schema = {translated = "string"}
   - `sidecar_port`: HTTP port for binary asset transfer (default: port + 1; set to 0 to disable)
   - `max_asset_size`: Maximum upload size in bytes (default: 104857600 = 100MB)
   - `max_task_timeout`: Maximum handler execution time in seconds (default: 3600, 0 = unlimited)
+  - `tls_pin_certs`: Pin peer TLS certificates at startup using TOFU (default: true). Cannot be changed via hot-reload — requires node restart.
 - `[network]`
   - `bootstrap`: List of `"host:port"` strings to join the network
   - `upnp`: Attempt UPnP NAT port mapping on startup (default: true)
 - `[sidecar]`
   - `asset_dir`: Directory for binary asset storage (default: "assets", relative to config dir)
+- `[policy]`
+  - `dynamic_enabled`: Allow runtime skill registration via cockpit API (default: false)
+  - `max_dynamic_skills`: Maximum concurrently registered dynamic skills (default: 10)
+  - `require_signed_packages`: Require a valid `.sig` for all skill installs (default: false)
 - `[skills.<name>]` — one section per skill, where `<name>` is the skill name (lowercase, hyphens ok)
   - `handler`: `"path/to/file.py:function_name"` — relative to config directory
   - `description`: Human-readable description (max 256 chars)
@@ -464,6 +493,36 @@ Execute a task on the network.
 | `--json` | `false` | Output raw JSON result |
 | `--log-level` | `WARNING` | Logging level |
 
+### `knarr skill`
+
+Manage skill packages installed on a node.
+
+**`knarr skill init <name>`** — create a new skill package skeleton.
+
+**`knarr skill install <source>`** — install from a local directory, `.knarr` archive, or `git+https://` URL.
+
+| Flag | Description |
+|------|-------------|
+| `--force` | Overwrite if already installed |
+| `--upgrade` | Upgrade, preserving the skill's data directory |
+| `--verify-signer <node_id>` | Require a valid `.sig` file signed by this node_id. Use `any` to accept any valid signer. |
+
+**`knarr skill pack <directory>`** — create a `.knarr` archive from a skill directory.
+
+| Flag | Description |
+|------|-------------|
+| `--sign` | Sign the archive with the node identity key (requires a running node) |
+
+Produces `<name>-<version>.knarr` and (with `--sign`) `<name>-<version>.knarr.sig`.
+
+**`knarr skill list`** — list installed skills. Add `--json` for machine-readable output.
+
+**`knarr skill remove <name>`** — remove an installed skill. Add `--purge` to also delete its data directory.
+
+**`knarr skill export <name>`** — export an installed skill as a `.knarr` archive. Add `--bundle` to include dependencies.
+
+---
+
 ### `knarr demand`
 
 Show unmet skill demand (skills requested but not found on the network).
@@ -507,13 +566,13 @@ This single command:
 ```
 Python: python3
 Creating virtual environment...
-Installed knarr 0.51.1
+Installed knarr 0.58.0
 Checking identity...
 ============================================================
 Node initialized successfully!
   Node ID:   a1b2c3d4...
   Wallet:    7Xk9...
-  Version:   0.51.1
+  Version:   0.58.0
   Data dir:  /var/lib/knarr
 
 WARNING: Back up node.db and vault.db — these contain your

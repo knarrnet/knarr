@@ -1470,6 +1470,8 @@ def main():
     skill_install_parser.add_argument("source", help="Local dir, .knarr file, or git+https://... URL")
     skill_install_parser.add_argument("--force", action="store_true", help="Overwrite existing skill")
     skill_install_parser.add_argument("--upgrade", action="store_true", help="Upgrade (preserve data_dir)")
+    skill_install_parser.add_argument("--verify-signer", metavar="NODE_ID",
+                                      help="Verify .sig against this node_id; use 'any' to accept any valid signer")
 
     # skill remove
     skill_remove_parser = skill_subparsers.add_parser("remove", help="Remove an installed skill")
@@ -1483,6 +1485,8 @@ def main():
     # skill pack
     skill_pack_parser = skill_subparsers.add_parser("pack", help="Create .knarr archive from directory")
     skill_pack_parser.add_argument("directory", help="Skill directory to pack")
+    skill_pack_parser.add_argument("--sign", action="store_true",
+                                   help="Sign the archive using the node identity key (requires running node)")
 
     # skill export
     skill_export_parser = skill_subparsers.add_parser("export", help="Export installed skill as .knarr")
@@ -1571,14 +1575,15 @@ def main():
             if args.skill_command == "init":
                 print(cmd_skill_init(args.name))
             elif args.skill_command == "install":
-                result = cmd_skill_install(args.source, config_dir, force=args.force, upgrade=args.upgrade)
+                result = cmd_skill_install(args.source, config_dir, force=args.force, upgrade=args.upgrade,
+                                           verify_signer=getattr(args, "verify_signer", None))
                 print(result)
             elif args.skill_command == "remove":
                 print(cmd_skill_remove(args.name, config_dir, purge=args.purge))
             elif args.skill_command == "list":
                 print(cmd_skill_list(config_dir, json_output=args.json))
             elif args.skill_command == "pack":
-                print(cmd_skill_pack(args.directory))
+                print(cmd_skill_pack(args.directory, sign=getattr(args, "sign", False)))
             elif args.skill_command == "export":
                 print(cmd_skill_export(args.name, config_dir, bundle=args.bundle))
         elif args.command == "group":
