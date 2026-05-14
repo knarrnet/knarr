@@ -8,18 +8,17 @@ import pytest
 from knarr.core.constants import KNARR_MINT, KNARR_DECIMALS, KNARR_SYMBOL
 
 
-def test_knarr_mint_is_mainnet_address():
-    # Canonical mainnet $KNARR mint, Token-2022. Immutable once set.
-    assert KNARR_MINT == "HgMcrNXKkvJb4KGVdW1yMYhPQsUUPY5mdobgzwkrZrW4"
-    assert len(KNARR_MINT) == 44  # base58 Solana pubkey
+def test_knarr_mint_mainnet_pending():
+    # Mainnet KNR mint address is pending — empty until new mint is executed.
+    assert KNARR_MINT == ""
 
 
 def test_knarr_decimals_is_9():
     assert KNARR_DECIMALS == 9
 
 
-def test_knarr_symbol_is_knarr():
-    assert KNARR_SYMBOL == "KNARR"
+def test_knarr_symbol_is_knr():
+    assert KNARR_SYMBOL == "KNR"
 
 
 # ---- A-08: cluster-aware mint resolution ----
@@ -29,23 +28,20 @@ def _reimport_constants():
     return importlib.import_module("knarr.core.constants")
 
 
-def test_default_cluster_is_mainnet(monkeypatch):
+def test_default_cluster_is_devnet(monkeypatch):
     monkeypatch.delenv("KNARR_CLUSTER", raising=False)
     mod = _reimport_constants()
-    assert mod.KNARR_CLUSTER == "mainnet"
-    assert mod.KNARR_MINT == mod.KNARR_MINT_MAINNET
+    assert mod.KNARR_CLUSTER == "devnet"
+    assert mod.KNARR_MINT == mod.KNARR_MINT_DEVNET
 
 
 def test_devnet_cluster_selects_devnet_mint(monkeypatch):
     monkeypatch.setenv("KNARR_CLUSTER", "devnet")
     mod = _reimport_constants()
     assert mod.KNARR_CLUSTER == "devnet"
-    # Devnet has no canonical mint — empty matches chain.py's token_mint=""
-    # convention so downstream callers fail closed instead of using a
-    # placeholder address as authoritative.
+    # Both clusters have no canonical KNR mint yet — empty is correct.
     assert mod.KNARR_MINT == ""
     assert mod.KNARR_MINT_DEVNET == ""
-    assert mod.KNARR_MINT != mod.KNARR_MINT_MAINNET
 
 
 def test_unknown_cluster_fails_loud(monkeypatch):
